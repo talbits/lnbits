@@ -29,6 +29,14 @@ type ProofVtxo = {
   spentBy?: string
 }
 
+type Receive = {
+  walletId: 'wallet-a' | 'wallet-b'
+  address: string
+  script: string
+}
+
+type RegtestMode = 'start' | 'after-first' | 'final' | 'dispose' | 'restore'
+
 const requireText = (name: string, value: string): string => {
   if (typeof value !== 'string' || !value.trim()) {
     throw new Error(`${name} must be non-empty`)
@@ -137,6 +145,58 @@ const runProof = async ({
   }
 }
 
+type LiveWallet = {
+  wallet: Awaited<ReturnType<typeof Wallet.create>>
+  walletRepository: IndexedDBWalletRepository
+  contractRepository: IndexedDBContractRepository
+  repositoryName: string
+  identity: MnemonicIdentity
+  receives: Receive[]
+}
+
+let liveWallet: LiveWallet | undefined
+
+const snapshotRegtestWallet = async (
+  state: LiveWallet,
+  receives: Receive[]
+) => {
+  const vtxos = (await state.wallet.getVtxos()).map(
+    ({
+      txid,
+      vout,
+      value,
+      script,
+      isPreconfirmed,
+      isSpent,
+      isSwept,
+      settledBy,
+      spentBy
+    }): ProofVtxo => ({
+      txid,
+      vout,
+      value,
+      script,
+      isPreconfirmed,
+      isSpent,
+      isSwept,
+      settledBy,
+      spentBy
+    })
+  )
+  return {
+    repositoryName: state.repositoryName,
+    identityDescriptor: state.identity.descriptor,
+    address: await state.wallet.getAddress(),
+    boardingAddress: await state.wallet.getBoardingAddress(),
+    balance: await state.wallet.getBalance(),
+    recipientScript: state.wallet.defaultContractScript,
+    receives,
+    vtxos,
+    persistedState: await state.walletRepository.getWalletState(),
+    contracts: await state.contractRepository.getContracts()
+  }
+}
+
 const runRegtestProof = async ({
   mnemonic,
   installationId,
@@ -145,12 +205,16 @@ const runRegtestProof = async ({
   schemaVersion = '1',
   arkServerUrl,
   esploraUrl,
-  restore = false
+  restore = false,
+  mode = restore ? 'restore' : 'start',
+  receives = []
 }: RepositoryInputs & {
   mnemonic: string
   arkServerUrl: string
   esploraUrl: string
   restore?: boolean
+  mode?: RegtestMode
+  receives?: Receive[]
 }) => {
   const repositoryName = repositoryNameFor({
     installationId,
@@ -158,6 +222,75 @@ const runRegtestProof = async ({
     networkName,
     schemaVersion
   })
+  if (mode === 'start') {
+    if (liveWallet) {
+      throw new Error('a live Arkade wallet is already active')
+    }
+    const identity = MnemonicIdentity.fromMnemonic(mnemonic, {isMainnet: false})
+    const walletRepository = new IndexedDBWalletRepository(repositoryName)
+    const contractRepository = new IndexedDBContractRepository(repositoryName)
+    const wallet = await Wallet.create({
+      identity,
+      arkServerUrl,
+      esploraUrl,
+      storage: {
+        walletRepository,
+        contractRepository
+      },
+      walletMode: 'hd',
+      settlementConfig: false
+    })
+    const first: Receive = {
+      walletId: 'wallet-a',
+      address: await wallet.getAddress(),
+      script: wallet.defaultContractScript
+    }
+    liveWallet = {
+      wallet,
+      walletRepository,
+      contractRepository,
+      repositoryName,
+      identity,
+      receives: [first]
+    }
+    return snapshotRegtestWallet(liveWallet, liveWallet.receives)
+  }
+
+  if (mode === 'after-first' || mode === 'final' || mode === 'dispose') {
+    if (!liveWallet) {
+      throw new Error(`${mode} requires the live Arkade wallet`)
+    }
+    if (mode === 'after-first') {
+      const first = liveWallet.receives[0]
+      const deadline = Date.now() + 30_000
+      while ((await liveWallet.wallet.getAddress()) === first.address) {
+        if (Date.now() >= deadline) {
+          throw new Error('Arkade receive rotation did not produce wallet-b')
+        }
+        await new Promise(resolve => setTimeout(resolve, 250))
+      }
+      const second: Receive = {
+        walletId: 'wallet-b',
+        address: await liveWallet.wallet.getAddress(),
+        script: liveWallet.wallet.defaultContractScript
+      }
+      if (second.script === first.script) {
+        throw new Error('Arkade receive rotation reused wallet-a script')
+      }
+      liveWallet.receives = [first, second]
+    }
+    const result = await snapshotRegtestWallet(liveWallet, liveWallet.receives)
+    if (mode === 'dispose') {
+      await liveWallet.wallet.dispose()
+      liveWallet = undefined
+    }
+    return result
+  }
+
+  if (mode !== 'restore') {
+    throw new Error(`unknown Arkade proof mode: ${mode}`)
+  }
+
   const walletRepository = new IndexedDBWalletRepository(repositoryName)
   const contractRepository = new IndexedDBContractRepository(repositoryName)
   const identity = MnemonicIdentity.fromMnemonic(mnemonic, {isMainnet: false})
@@ -169,45 +302,19 @@ const runRegtestProof = async ({
     walletMode: 'hd',
     settlementConfig: false
   })
-
   try {
-    if (restore) {
-      await wallet.restore({gapLimit: 5})
-    }
-    const vtxos = (await wallet.getVtxos()).map(
-      ({
-        txid,
-        vout,
-        value,
-        script,
-        isPreconfirmed,
-        isSpent,
-        isSwept,
-        settledBy,
-        spentBy
-      }): ProofVtxo => ({
-        txid,
-        vout,
-        value,
-        script,
-        isPreconfirmed,
-        isSpent,
-        isSwept,
-        settledBy,
-        spentBy
-      })
+    await wallet.restore({gapLimit: 5})
+    return snapshotRegtestWallet(
+      {
+        wallet,
+        walletRepository,
+        contractRepository,
+        repositoryName,
+        identity,
+        receives
+      },
+      receives
     )
-    return {
-      repositoryName,
-      identityDescriptor: identity.descriptor,
-      address: await wallet.getAddress(),
-      boardingAddress: await wallet.getBoardingAddress(),
-      balance: await wallet.getBalance(),
-      recipientScript: wallet.defaultContractScript,
-      vtxos,
-      persistedState: await walletRepository.getWalletState(),
-      contracts: await contractRepository.getContracts()
-    }
   } finally {
     await wallet.dispose()
   }

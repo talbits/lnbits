@@ -4,7 +4,7 @@ import {tmpdir} from 'node:os'
 import {join, resolve} from 'node:path'
 import {promisify} from 'node:util'
 
-import {expect, test, type Page} from '@playwright/test'
+import {expect, test, type BrowserContext, type Page} from '@playwright/test'
 import {build} from 'esbuild'
 
 const execFileAsync = promisify(execFile)
@@ -15,7 +15,7 @@ const regtestRoot = resolve(
 )
 const mnemonic =
   'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about'
-const amount = 100_000
+const amounts = {walletA: 80_000, walletB: 120_000}
 const adminUrl = 'http://localhost:7071'
 const arkServerUrl = 'http://localhost:7070'
 const zeroIntentFees = {
@@ -61,6 +61,11 @@ type ProofResult = {
   boardingAddress: string
   balance: Balance
   recipientScript: string
+  receives: Array<{
+    walletId: 'wallet-a' | 'wallet-b'
+    address: string
+    script: string
+  }>
   vtxos: Array<{
     txid: string
     vout: number
@@ -85,6 +90,8 @@ type ProofInput = {
   arkServerUrl: string
   esploraUrl: string
   restore?: boolean
+  mode?: 'start' | 'after-first' | 'final' | 'dispose' | 'restore'
+  receives?: ProofResult['receives']
 }
 
 declare global {
@@ -97,24 +104,70 @@ const loadProof = async (
   page: Page,
   bundlePath: string,
   input: ProofInput,
-  reload = false
+  reload = false,
+  reuse = false
 ): Promise<ProofResult> => {
   if (reload) {
     await page.reload()
-  } else {
+  } else if (!reuse) {
     await page.goto('/')
   }
-  await page.addScriptTag({path: bundlePath})
+  if (!reuse) {
+    await page.addScriptTag({path: bundlePath})
+  }
   return page.evaluate(input => window.runArkadeRegtestProof(input), input)
+}
+
+type IndexedVtxo = ProofResult['vtxos'][number] & {
+  commitmentTxids?: string[]
+}
+
+type IndexedVtxoResponse = {
+  outpoint: {txid: string; vout: number}
+  amount: string
+  script: string
+  commitmentTxids?: string[]
+  isPreconfirmed?: boolean
+  isSpent?: boolean
+  isSwept?: boolean
+  settledBy?: string
+  spentBy?: string
+}
+
+type AttributionLedger = {
+  owners: Map<string, 'wallet-a' | 'wallet-b'>
+  receipts: Map<string, {walletId: 'wallet-a' | 'wallet-b'; value: number}>
+  credits: Map<'wallet-a' | 'wallet-b', number>
+}
+
+const applyReceipt = (
+  ledger: AttributionLedger,
+  walletId: 'wallet-a' | 'wallet-b',
+  vtxo: IndexedVtxo
+): void => {
+  if (ledger.owners.get(vtxo.script) !== walletId) {
+    throw new Error(`script is not owned by ${walletId}`)
+  }
+  const receiptId = `${vtxo.txid}:${vtxo.vout}`
+  const existing = ledger.receipts.get(receiptId)
+  if (existing) {
+    if (existing.walletId !== walletId || existing.value !== vtxo.value) {
+      throw new Error(`receipt ${receiptId} changed attribution`)
+    }
+    return
+  }
+  ledger.receipts.set(receiptId, {walletId, value: vtxo.value})
+  ledger.credits.set(walletId, ledger.credits.get(walletId)! + vtxo.value)
 }
 
 test('receives and restores native regtest Arkade funds from the mnemonic', async ({
   browser
 }) => {
+  const accountId = `account-${Date.now()}`
   const input: ProofInput = {
     mnemonic,
     installationId: 'installation-regtest',
-    accountId: `account-${Date.now()}`,
+    accountId,
     networkName: 'regtest',
     schemaVersion: '1',
     arkServerUrl,
@@ -124,6 +177,10 @@ test('receives and restores native regtest Arkade funds from the mnemonic', asyn
     join(tmpdir(), 'lnbits-arkade-regtest-')
   )
   const bundlePath = join(outputDirectory, 'arkade-regtest.js')
+  let context: BrowserContext | undefined
+  let page: Page | undefined
+  let freshContext: BrowserContext | undefined
+  let walletDisposed = false
 
   try {
     await build({
@@ -138,16 +195,26 @@ test('receives and restores native regtest Arkade funds from the mnemonic', asyn
     expect(await readFile(bundlePath, 'utf8')).not.toContain(mnemonic)
 
     const requests: string[] = []
-    const context = await browser.newContext()
-    const page = await context.newPage()
+    context = await browser.newContext()
+    page = await context.newPage()
     page.on('request', request =>
       requests.push(`${request.url()} ${request.postData() || ''}`)
     )
-    const initial = await loadProof(page, bundlePath, input)
+    const initial = await loadProof(page, bundlePath, {
+      ...input,
+      mode: 'start'
+    })
     expect(initial.address).toMatch(/^tark1/)
     expect(initial.boardingAddress).toMatch(/^bcrt1/)
     expect(initial.persistedState).not.toBeNull()
     expect(initial.contracts.length).toBeGreaterThan(0)
+    expect(initial.receives).toHaveLength(1)
+    const firstReceive = initial.receives[0]
+    expect(firstReceive).toMatchObject({
+      walletId: 'wallet-a',
+      address: initial.address,
+      script: initial.recipientScript
+    })
     const initialOutpoints = new Set(
       initial.vtxos.map(vtxo => `${vtxo.txid}:${vtxo.vout}`)
     )
@@ -166,7 +233,35 @@ test('receives and restores native regtest Arkade funds from the mnemonic', asyn
         join(regtestRoot, 'regtest.mjs'),
         ...args
       ])
+    const readIndexedVtxos = async (script: string): Promise<IndexedVtxo[]> => {
+      const response = await fetch(
+        `${arkServerUrl}/v1/indexer/vtxos?scripts=${encodeURIComponent(script)}`
+      )
+      if (!response.ok) return []
+      const body = (await response.json()) as {
+        vtxos?: IndexedVtxoResponse[]
+      }
+      return (body.vtxos || []).map(vtxo => ({
+        txid: vtxo.outpoint.txid,
+        vout: vtxo.outpoint.vout,
+        value: Number(vtxo.amount),
+        script: vtxo.script,
+        commitmentTxids: vtxo.commitmentTxids,
+        isPreconfirmed: vtxo.isPreconfirmed,
+        isSpent: vtxo.isSpent,
+        isSwept: vtxo.isSwept,
+        settledBy: vtxo.settledBy,
+        spentBy: vtxo.spentBy
+      }))
+    }
+    const initialIndexedOutpoints = new Set(
+      (await readIndexedVtxos(firstReceive.script)).map(
+        vtxo => `${vtxo.txid}:${vtxo.vout}`
+      )
+    )
 
+    let originalIntentFees: IntentFees | undefined
+    let proofReceives: ProofResult['receives'] | undefined
     try {
       await runSender([
         'init',
@@ -180,7 +275,7 @@ test('receives and restores native regtest Arkade funds from the mnemonic', asyn
         'http://mempool_web/api'
       ])
 
-      const originalIntentFees = await readIntentFees()
+      originalIntentFees = await readIntentFees()
       let feesChanged = false
       try {
         feesChanged = true
@@ -196,7 +291,7 @@ test('receives and restores native regtest Arkade funds from the mnemonic', asyn
           'arkd',
           'note',
           '--amount',
-          '200000'
+          '300000'
         ])
         const note = noteOutput.trim().split(/\s+/).pop()
         if (!note?.startsWith('arknote')) {
@@ -225,13 +320,264 @@ test('receives and restores native regtest Arkade funds from the mnemonic', asyn
       await runSender([
         'send',
         '--to',
-        initial.address,
+        firstReceive.address,
         '--amount',
-        String(amount),
+        String(amounts.walletA),
         '--password',
         'proof-password'
       ])
+
+      let firstIndexed: IndexedVtxo | undefined
+      await expect
+        .poll(
+          async () => {
+            firstIndexed = (await readIndexedVtxos(firstReceive.script)).find(
+              vtxo =>
+                vtxo.value === amounts.walletA &&
+                !initialIndexedOutpoints.has(`${vtxo.txid}:${vtxo.vout}`) &&
+                !initialOutpoints.has(`${vtxo.txid}:${vtxo.vout}`) &&
+                !vtxo.isSpent &&
+                !vtxo.isSwept
+            )
+            return firstIndexed?.value
+          },
+          {timeout: 30_000}
+        )
+        .toBe(amounts.walletA)
+      expect(firstIndexed?.script).toBe(firstReceive.script)
+      expect(firstIndexed?.isPreconfirmed).toBe(true)
+      expect(firstIndexed?.commitmentTxids?.length).toBeGreaterThan(0)
+
+      const rotated = await loadProof(
+        page,
+        bundlePath,
+        {...input, mode: 'after-first'},
+        false,
+        true
+      )
+      proofReceives = rotated.receives
+      expect(rotated.receives).toHaveLength(2)
+      const [walletA, walletB] = rotated.receives
+      expect(walletA).toEqual(firstReceive)
+      expect(walletB.walletId).toBe('wallet-b')
+      expect(walletB.address).toMatch(/^tark1/)
+      expect(walletB.script).not.toBe(walletA.script)
+      expect(walletB.address).not.toBe(walletA.address)
+      expect(rotated.address).toBe(walletB.address)
+      expect(rotated.recipientScript).toBe(walletB.script)
+
+      const secondInitialIndexedOutpoints = new Set(
+        (await readIndexedVtxos(walletB.script)).map(
+          vtxo => `${vtxo.txid}:${vtxo.vout}`
+        )
+      )
+      await runSender([
+        'send',
+        '--to',
+        walletB.address,
+        '--amount',
+        String(amounts.walletB),
+        '--password',
+        'proof-password'
+      ])
+      let secondIndexed: IndexedVtxo | undefined
+      await expect
+        .poll(
+          async () => {
+            secondIndexed = (await readIndexedVtxos(walletB.script)).find(
+              vtxo =>
+                vtxo.value === amounts.walletB &&
+                !secondInitialIndexedOutpoints.has(
+                  `${vtxo.txid}:${vtxo.vout}`
+                ) &&
+                !vtxo.isSpent &&
+                !vtxo.isSwept
+            )
+            return secondIndexed?.value
+          },
+          {timeout: 30_000}
+        )
+        .toBe(amounts.walletB)
+      expect(secondIndexed?.script).toBe(walletB.script)
+      expect(secondIndexed?.isPreconfirmed).toBe(true)
+      expect(secondIndexed?.commitmentTxids?.length).toBeGreaterThan(0)
+
+      let finalProof: ProofResult | undefined
+      await expect
+        .poll(
+          async () => {
+            finalProof = await loadProof(
+              page,
+              bundlePath,
+              {...input, mode: 'final'},
+              false,
+              true
+            )
+            return finalProof.vtxos.filter(vtxo =>
+              rotated.receives.some(receive => receive.script === vtxo.script)
+            ).length
+          },
+          {timeout: 30_000}
+        )
+        .toBeGreaterThanOrEqual(2)
+      expect(finalProof).toBeDefined()
+
+      const ledger: AttributionLedger = {
+        owners: new Map(
+          rotated.receives.map(receive => [receive.script, receive.walletId])
+        ),
+        receipts: new Map(),
+        credits: new Map([
+          ['wallet-a', 0],
+          ['wallet-b', 0]
+        ])
+      }
+      expect(ledger.owners.size).toBe(2)
+      applyReceipt(ledger, 'wallet-a', firstIndexed!)
+      applyReceipt(ledger, 'wallet-b', secondIndexed!)
+      expect(
+        [...ledger.credits.values()].reduce((sum, value) => sum + value, 0)
+      ).toBe(amounts.walletA + amounts.walletB)
+      expect(ledger.credits.get('wallet-a')).toBe(amounts.walletA)
+      expect(ledger.credits.get('wallet-b')).toBe(amounts.walletB)
+      const replayedCredits = new Map(ledger.credits)
+      applyReceipt(ledger, 'wallet-a', firstIndexed!)
+      applyReceipt(ledger, 'wallet-b', secondIndexed!)
+      expect(ledger.credits).toEqual(replayedCredits)
+      const wrongWalletCredits = new Map(ledger.credits)
+      expect(() => applyReceipt(ledger, 'wallet-b', firstIndexed!)).toThrow(
+        'script is not owned by wallet-b'
+      )
+      expect(ledger.credits).toEqual(wrongWalletCredits)
+
+      expect(finalProof!.vtxos).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            txid: firstIndexed!.txid,
+            vout: firstIndexed!.vout,
+            value: amounts.walletA,
+            script: walletA.script,
+            isPreconfirmed: true
+          }),
+          expect.objectContaining({
+            txid: secondIndexed!.txid,
+            vout: secondIndexed!.vout,
+            value: amounts.walletB,
+            script: walletB.script,
+            isPreconfirmed: true
+          })
+        ])
+      )
+      expect(finalProof!.balance.available).toBe(
+        initial.balance.available + amounts.walletA + amounts.walletB
+      )
+      expect(
+        finalProof!.balance.settled + finalProof!.balance.preconfirmed
+      ).toBe(
+        initial.balance.settled +
+          initial.balance.preconfirmed +
+          amounts.walletA +
+          amounts.walletB
+      )
+      expect(finalProof!.balance.total).toBe(
+        initial.balance.total + amounts.walletA + amounts.walletB
+      )
+
+      for (const [script, indexed] of [
+        [walletA.script, firstIndexed!],
+        [walletB.script, secondIndexed!]
+      ] as const) {
+        const refreshed = (await readIndexedVtxos(script)).find(
+          vtxo => vtxo.txid === indexed.txid && vtxo.vout === indexed.vout
+        )
+        expect(refreshed).toMatchObject({
+          value: indexed.value,
+          script,
+          isSpent: false,
+          isSwept: false,
+          isPreconfirmed: true
+        })
+        expect(refreshed?.commitmentTxids?.length).toBeGreaterThan(0)
+      }
+
+      expect(JSON.stringify(finalProof!.persistedState)).not.toMatch(
+        /(?:mnemonic|private.?key|secret|seed)/i
+      )
+      expect(JSON.stringify(finalProof!.contracts)).not.toMatch(
+        /(?:mnemonic|private.?key|secret|seed)/i
+      )
+      expect(requests.join('\n')).not.toContain(mnemonic)
+      await loadProof(
+        page,
+        bundlePath,
+        {...input, mode: 'dispose'},
+        false,
+        true
+      )
+      walletDisposed = true
+
+      const restoreInput: ProofInput = {
+        ...input,
+        accountId,
+        mode: 'restore',
+        restore: true,
+        receives: proofReceives
+      }
+      const restored = await loadProof(page, bundlePath, restoreInput, true)
+      expect(restored.repositoryName).toBe(initial.repositoryName)
+      expect(restored.identityDescriptor).toBe(initial.identityDescriptor)
+      expect(restored.receives).toEqual(proofReceives)
+      expect(restored.vtxos).toEqual(
+        expect.arrayContaining(
+          proofReceives!.map((receive, index) =>
+            expect.objectContaining({
+              txid: index === 0 ? firstIndexed!.txid : secondIndexed!.txid,
+              vout: index === 0 ? firstIndexed!.vout : secondIndexed!.vout,
+              value: index === 0 ? amounts.walletA : amounts.walletB,
+              script: receive.script
+            })
+          )
+        )
+      )
+      expect(restored.balance.available).toBe(
+        initial.balance.available + amounts.walletA + amounts.walletB
+      )
+      expect(restored.balance.settled + restored.balance.preconfirmed).toBe(
+        initial.balance.settled +
+          initial.balance.preconfirmed +
+          amounts.walletA +
+          amounts.walletB
+      )
+      expect(restored.balance.total).toBe(
+        initial.balance.total + amounts.walletA + amounts.walletB
+      )
+      expect(requests.join('\n')).not.toContain(mnemonic)
+      await context.close()
+      context = undefined
+
+      freshContext = await browser.newContext()
+      const freshPage = await freshContext.newPage()
+      freshPage.on('request', request =>
+        requests.push(`${request.url()} ${request.postData() || ''}`)
+      )
+      const freshRestored = await loadProof(freshPage, bundlePath, restoreInput)
+      expect(freshRestored.vtxos).toEqual(restored.vtxos)
+      expect(freshRestored.balance).toEqual(restored.balance)
+      expect(requests.join('\n')).not.toContain(mnemonic)
+      await freshContext.close()
+      freshContext = undefined
     } finally {
+      if (!walletDisposed && context && page) {
+        await loadProof(
+          page,
+          bundlePath,
+          {...input, mode: 'dispose'},
+          false,
+          true
+        ).catch(() => undefined)
+      }
+      await freshContext?.close().catch(() => undefined)
+      await context?.close().catch(() => undefined)
       await execFileAsync('docker', [
         'exec',
         'arkd',
@@ -242,150 +588,12 @@ test('receives and restores native regtest Arkade funds from the mnemonic', asyn
       ]).catch(() => undefined)
     }
 
-    type IndexedVtxo = ProofResult['vtxos'][number] & {
-      commitmentTxids?: string[]
+    if (originalIntentFees) {
+      expect(await readIntentFees()).toEqual(originalIntentFees)
     }
-    type IndexedVtxoResponse = {
-      outpoint: {txid: string; vout: number}
-      amount: string
-      script: string
-      commitmentTxids?: string[]
-      isPreconfirmed?: boolean
-      isSpent?: boolean
-      isSwept?: boolean
-      settledBy?: string
-      spentBy?: string
-    }
-    const readIndexedVtxos = async (): Promise<IndexedVtxo[]> => {
-      const response = await fetch(
-        `${arkServerUrl}/v1/indexer/vtxos?scripts=${encodeURIComponent(
-          initial.recipientScript
-        )}`
-      )
-      if (!response.ok) {
-        return []
-      }
-      const body = (await response.json()) as {
-        vtxos?: IndexedVtxoResponse[]
-      }
-      return (body.vtxos || []).map(vtxo => ({
-        txid: vtxo.outpoint.txid,
-        vout: vtxo.outpoint.vout,
-        value: Number(vtxo.amount),
-        script: vtxo.script,
-        commitmentTxids: vtxo.commitmentTxids,
-        isPreconfirmed: vtxo.isPreconfirmed,
-        isSpent: vtxo.isSpent,
-        isSwept: vtxo.isSwept,
-        settledBy: vtxo.settledBy,
-        spentBy: vtxo.spentBy
-      }))
-    }
-    let indexedRecipient: IndexedVtxo | undefined
-    await expect
-      .poll(
-        async () => {
-          indexedRecipient = (await readIndexedVtxos()).find(
-            vtxo =>
-              vtxo.script === initial.recipientScript &&
-              vtxo.value === amount &&
-              !initialOutpoints.has(`${vtxo.txid}:${vtxo.vout}`) &&
-              !vtxo.isSpent &&
-              !vtxo.isSwept
-          )
-          return indexedRecipient?.value
-        },
-        {timeout: 30_000}
-      )
-      .toBe(amount)
-    expect(indexedRecipient).toBeDefined()
-    expect(indexedRecipient?.commitmentTxids?.length).toBeGreaterThan(0)
-
-    let reloaded: ProofResult | undefined
-    await expect
-      .poll(
-        async () => {
-          reloaded = await loadProof(
-            page,
-            bundlePath,
-            {...input, restore: true},
-            true
-          )
-          const restoredRecipient = reloaded.vtxos.find(
-            vtxo =>
-              vtxo.script === initial.recipientScript &&
-              vtxo.value === amount &&
-              !initialOutpoints.has(`${vtxo.txid}:${vtxo.vout}`) &&
-              !vtxo.isSpent &&
-              !vtxo.isSwept
-          )
-          return restoredRecipient?.value
-        },
-        {timeout: 30_000}
-      )
-      .toBe(amount)
-    expect(reloaded).toBeDefined()
-    const reloadedProof = reloaded!
-    expect(reloadedProof.repositoryName).toBe(initial.repositoryName)
-    expect(reloadedProof.identityDescriptor).toBe(initial.identityDescriptor)
-    expect(
-      reloadedProof.balance.settled + reloadedProof.balance.preconfirmed
-    ).toBe(initial.balance.settled + initial.balance.preconfirmed + amount)
-    expect(reloadedProof.balance.available).toBe(
-      initial.balance.available + amount
-    )
-    expect(reloadedProof.balance.total).toBe(initial.balance.total + amount)
-    const recipientVtxos = reloadedProof.vtxos.filter(
-      vtxo =>
-        vtxo.script === initial.recipientScript &&
-        vtxo.value === amount &&
-        !initialOutpoints.has(`${vtxo.txid}:${vtxo.vout}`) &&
-        !vtxo.isSpent &&
-        !vtxo.isSwept
-    )
-    expect(recipientVtxos).toHaveLength(1)
-    const recipientVtxo = recipientVtxos[0]
-    expect(recipientVtxo.isPreconfirmed).toBe(true)
-
-    const refreshedIndexedRecipient = (await readIndexedVtxos()).find(
-      vtxo =>
-        vtxo.txid === recipientVtxo.txid && vtxo.vout === recipientVtxo.vout
-    )
-    expect(refreshedIndexedRecipient).toMatchObject({
-      value: amount,
-      script: initial.recipientScript,
-      isSpent: false,
-      isSwept: false
-    })
-    expect(refreshedIndexedRecipient?.isPreconfirmed).toBe(true)
-    expect(refreshedIndexedRecipient?.commitmentTxids?.length).toBeGreaterThan(
-      0
-    )
-    expect(JSON.stringify(reloadedProof.persistedState)).not.toMatch(
-      /(?:mnemonic|private.?key|secret|seed)/i
-    )
-    expect(JSON.stringify(reloadedProof.contracts)).not.toMatch(
-      /(?:mnemonic|private.?key|secret|seed)/i
-    )
-    expect(requests.join('\n')).not.toContain(mnemonic)
-    await context.close()
-
-    const restoredContext = await browser.newContext()
-    const restoredPage = await restoredContext.newPage()
-    restoredPage.on('request', request =>
-      requests.push(`${request.url()} ${request.postData() || ''}`)
-    )
-    const restored = await loadProof(restoredPage, bundlePath, {
-      ...input,
-      restore: true
-    })
-    expect(restored.repositoryName).toBe(initial.repositoryName)
-    expect(restored.identityDescriptor).toBe(initial.identityDescriptor)
-    expect(restored.balance).toEqual(reloadedProof.balance)
-    expect(restored.vtxos).toEqual(reloadedProof.vtxos)
-    expect(requests.join('\n')).not.toContain(mnemonic)
-    await restoredContext.close()
   } finally {
+    await freshContext?.close().catch(() => undefined)
+    await context?.close().catch(() => undefined)
     await rm(outputDirectory, {force: true, recursive: true})
   }
 })
