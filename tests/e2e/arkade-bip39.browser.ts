@@ -1,8 +1,10 @@
 import {
   getNetwork,
   HDDescriptorProvider,
+  IndexedDBContractRepository,
   IndexedDBWalletRepository,
-  MnemonicIdentity
+  MnemonicIdentity,
+  Wallet
 } from '@arkade-os/sdk'
 
 const toHex = (bytes: Uint8Array): string =>
@@ -123,7 +125,59 @@ const runProof = async ({
   }
 }
 
+const runRegtestProof = async ({
+  mnemonic,
+  installationId,
+  accountId,
+  networkName = 'regtest',
+  schemaVersion = '1',
+  arkServerUrl,
+  esploraUrl,
+  restore = false
+}: RepositoryInputs & {
+  mnemonic: string
+  arkServerUrl: string
+  esploraUrl: string
+  restore?: boolean
+}) => {
+  const repositoryName = repositoryNameFor({
+    installationId,
+    accountId,
+    networkName,
+    schemaVersion
+  })
+  const walletRepository = new IndexedDBWalletRepository(repositoryName)
+  const contractRepository = new IndexedDBContractRepository(repositoryName)
+  const identity = MnemonicIdentity.fromMnemonic(mnemonic, {isMainnet: false})
+  const wallet = await Wallet.create({
+    identity,
+    arkServerUrl,
+    esploraUrl,
+    storage: {walletRepository, contractRepository},
+    walletMode: 'hd',
+    settlementConfig: false
+  })
+
+  try {
+    if (restore) {
+      await wallet.restore({gapLimit: 5})
+    }
+    return {
+      repositoryName,
+      identityDescriptor: identity.descriptor,
+      address: await wallet.getAddress(),
+      boardingAddress: await wallet.getBoardingAddress(),
+      balance: await wallet.getBalance(),
+      persistedState: await walletRepository.getWalletState(),
+      contracts: await contractRepository.getContracts()
+    }
+  } finally {
+    await wallet.dispose()
+  }
+}
+
 Object.assign(window, {
   arkadeRepositoryName: repositoryNameFor,
-  runArkadeBip39Proof: runProof
+  runArkadeBip39Proof: runProof,
+  runArkadeRegtestProof: runRegtestProof
 })
