@@ -38,7 +38,7 @@ type Receive = {
   signingDescriptor: string
 }
 
-type RegtestMode = 'start' | 'final' | 'dispose' | 'restore'
+type RegtestMode = 'start' | 'final' | 'send' | 'dispose' | 'restore'
 
 const requireText = (name: string, value: string): string => {
   if (typeof value !== 'string' || !value.trim()) {
@@ -222,6 +222,7 @@ const snapshotRegtestWallet = async (
 
 const runRegtestProof = async ({
   mnemonic,
+  passphrase,
   installationId,
   accountId,
   networkName = 'regtest',
@@ -230,14 +231,19 @@ const runRegtestProof = async ({
   esploraUrl,
   restore = false,
   mode = restore ? 'restore' : 'start',
-  receives = []
+  receives = [],
+  sendRecipientAddress,
+  sendAmount
 }: RepositoryInputs & {
   mnemonic: string
+  passphrase?: string
   arkServerUrl: string
   esploraUrl: string
   restore?: boolean
   mode?: RegtestMode
   receives?: Receive[]
+  sendRecipientAddress?: string
+  sendAmount?: number
 }) => {
   const repositoryName = repositoryNameFor({
     installationId,
@@ -249,7 +255,10 @@ const runRegtestProof = async ({
     if (liveWallet) {
       throw new Error('a live Arkade wallet is already active')
     }
-    const identity = MnemonicIdentity.fromMnemonic(mnemonic, {isMainnet: false})
+    const identity = MnemonicIdentity.fromMnemonic(mnemonic, {
+      isMainnet: false,
+      passphrase
+    })
     const walletRepository = new IndexedDBWalletRepository(repositoryName)
     const contractRepository = new IndexedDBContractRepository(repositoryName)
     const wallet = await Wallet.create({
@@ -287,6 +296,23 @@ const runRegtestProof = async ({
     return snapshotRegtestWallet(liveWallet, liveWallet.receives)
   }
 
+  if (mode === 'send') {
+    if (!liveWallet) {
+      throw new Error('send requires the live Arkade wallet')
+    }
+    if (!sendRecipientAddress || !sendAmount) {
+      throw new Error('send requires a recipient address and positive amount')
+    }
+    const sendTxid = await liveWallet.wallet.send({
+      address: sendRecipientAddress,
+      amount: sendAmount
+    })
+    return {
+      ...(await snapshotRegtestWallet(liveWallet, liveWallet.receives)),
+      sendTxid
+    }
+  }
+
   if (mode === 'final' || mode === 'dispose') {
     if (!liveWallet) {
       throw new Error(`${mode} requires the live Arkade wallet`)
@@ -305,7 +331,10 @@ const runRegtestProof = async ({
 
   const walletRepository = new IndexedDBWalletRepository(repositoryName)
   const contractRepository = new IndexedDBContractRepository(repositoryName)
-  const identity = MnemonicIdentity.fromMnemonic(mnemonic, {isMainnet: false})
+  const identity = MnemonicIdentity.fromMnemonic(mnemonic, {
+    isMainnet: false,
+    passphrase
+  })
   const wallet = await Wallet.create({
     identity,
     arkServerUrl,

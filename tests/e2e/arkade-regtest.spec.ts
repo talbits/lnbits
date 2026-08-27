@@ -5,6 +5,7 @@ import {join, resolve} from 'node:path'
 import {promisify} from 'node:util'
 
 import {expect, test, type BrowserContext, type Page} from '@playwright/test'
+import {ArkAddress} from '@arkade-os/sdk'
 import {build} from 'esbuild'
 
 const execFileAsync = promisify(execFile)
@@ -16,6 +17,7 @@ const regtestRoot = resolve(
 const mnemonic =
   'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about'
 const amounts = {walletA: 80_000, walletB: 120_000}
+const sendAmount = 50_000
 const adminUrl = 'http://localhost:7071'
 const arkServerUrl = 'http://localhost:7070'
 const zeroIntentFees = {
@@ -24,6 +26,9 @@ const zeroIntentFees = {
   offchainOutputFee: '0.0',
   onchainOutputFee: '0.0'
 }
+
+const toHex = (bytes: Uint8Array): string =>
+  Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('')
 
 type IntentFees = Record<string, string>
 
@@ -80,10 +85,12 @@ type ProofResult = {
   }>
   persistedState: unknown
   contracts: unknown[]
+  sendTxid?: string
 }
 
 type ProofInput = {
   mnemonic: string
+  passphrase?: string
   installationId: string
   accountId: string
   networkName: 'regtest'
@@ -91,8 +98,10 @@ type ProofInput = {
   arkServerUrl: string
   esploraUrl: string
   restore?: boolean
-  mode?: 'start' | 'final' | 'dispose' | 'restore'
+  mode?: 'start' | 'final' | 'send' | 'dispose' | 'restore'
   receives?: ProofResult['receives']
+  sendRecipientAddress?: string
+  sendAmount?: number
 }
 
 declare global {
@@ -161,12 +170,14 @@ const applyReceipt = (
   ledger.credits.set(walletId, ledger.credits.get(walletId)! + vtxo.value)
 }
 
-test('receives and restores native regtest Arkade funds from the mnemonic', async ({
+test('receives, sends, and restores native regtest Arkade funds', async ({
   browser
 }) => {
   const accountId = `account-${Date.now()}`
   const input: ProofInput = {
     mnemonic,
+    // Isolate each run from persistent regtest wallet history.
+    passphrase: accountId,
     installationId: 'installation-regtest',
     accountId,
     networkName: 'regtest',
@@ -231,12 +242,21 @@ test('receives and restores native regtest Arkade funds from the mnemonic', asyn
     )
 
     const senderDataDir = `/tmp/lnbits-arkade-regtest-sender-${process.pid}-${Date.now()}`
+    const recipientDataDir = `/tmp/lnbits-arkade-regtest-recipient-${process.pid}-${Date.now()}`
     const runSender = (args: string[]) =>
       execFileAsync(process.execPath, [
         join(regtestRoot, 'regtest.mjs'),
         'ark',
         '--datadir',
         senderDataDir,
+        ...args
+      ])
+    const runRecipient = (args: string[]) =>
+      execFileAsync(process.execPath, [
+        join(regtestRoot, 'regtest.mjs'),
+        'ark',
+        '--datadir',
+        recipientDataDir,
         ...args
       ])
     const runRegtest = (args: string[]) =>
@@ -509,6 +529,112 @@ test('receives and restores native regtest Arkade funds from the mnemonic', asyn
         expect(refreshed?.commitmentTxids?.length).toBeGreaterThan(0)
       }
 
+      await runRecipient([
+        'init',
+        '--password',
+        'recipient-password',
+        '--prvkey',
+        '2222222222222222222222222222222222222222222222222222222222222222',
+        '--server-url',
+        arkServerUrl,
+        '--explorer',
+        'http://mempool_web/api'
+      ])
+      const {stdout: recipientOutput} = await runRecipient(['receive'])
+      const recipientAddress = recipientOutput.match(/tark1[0-9a-z]+/)?.[0]
+      if (!recipientAddress) {
+        throw new Error('arkade recipient CLI did not return a tark1 address')
+      }
+      const recipientScript = toHex(
+        ArkAddress.decode(recipientAddress).pkScript
+      )
+      const recipientInitialOutpoints = new Set(
+        (await readIndexedVtxos(recipientScript)).map(
+          vtxo => `${vtxo.txid}:${vtxo.vout}`
+        )
+      )
+      const beforeSend = finalProof!
+      const sent = await loadProof(
+        page,
+        bundlePath,
+        {
+          ...input,
+          mode: 'send',
+          sendRecipientAddress: recipientAddress,
+          sendAmount
+        },
+        false,
+        true
+      )
+      expect(sent.sendTxid).toMatch(/^[0-9a-f]{64}$/)
+      expect(sent.balance.total).toBe(beforeSend.balance.total - sendAmount)
+
+      let spentInput: IndexedVtxo | undefined
+      await expect
+        .poll(
+          async () => {
+            for (const [script, indexed] of [
+              [walletA.script, firstIndexed!],
+              [walletB.script, secondIndexed!]
+            ] as const) {
+              const candidate = (await readIndexedVtxos(script)).find(
+                vtxo => vtxo.txid === indexed.txid && vtxo.vout === indexed.vout
+              )
+              if (candidate?.isSpent) spentInput = candidate
+            }
+            return spentInput?.isSpent === true
+          },
+          {timeout: 30_000}
+        )
+        .toBe(true)
+      expect(spentInput).toBeDefined()
+      expect(spentInput?.spentBy).toMatch(/^[0-9a-f]{64}$/)
+
+      let afterSend: ProofResult | undefined
+      await expect
+        .poll(
+          async () => {
+            afterSend = await loadProof(
+              page,
+              bundlePath,
+              {...input, mode: 'final'},
+              false,
+              true
+            )
+            return afterSend.balance.total
+          },
+          {timeout: 30_000}
+        )
+        .toBe(beforeSend.balance.total - sendAmount)
+      expect(afterSend!.balance.total).toBe(
+        beforeSend.balance.total - sendAmount
+      )
+      let recipientVtxos: IndexedVtxo[] = []
+      await expect
+        .poll(
+          async () => {
+            recipientVtxos = (await readIndexedVtxos(recipientScript)).filter(
+              vtxo =>
+                vtxo.value === sendAmount &&
+                !recipientInitialOutpoints.has(`${vtxo.txid}:${vtxo.vout}`) &&
+                !vtxo.isSpent &&
+                !vtxo.isSwept
+            )
+            return recipientVtxos.length
+          },
+          {timeout: 30_000}
+        )
+        .toBe(1)
+      expect(recipientVtxos[0]).toMatchObject({
+        value: sendAmount,
+        script: recipientScript,
+        isPreconfirmed: true
+      })
+      expect(recipientVtxos[0].txid).toBe(sent.sendTxid)
+      expect(
+        new Set(recipientVtxos.map(vtxo => `${vtxo.txid}:${vtxo.vout}`)).size
+      ).toBe(1)
+
       expect(JSON.stringify(finalProof!.persistedState)).not.toMatch(
         /(?:mnemonic|private.?key|secret|seed)/i
       )
@@ -538,28 +664,35 @@ test('receives and restores native regtest Arkade funds from the mnemonic', asyn
       expect(restored.receives).toEqual(proofReceives)
       expect(restored.vtxos).toEqual(
         expect.arrayContaining(
-          proofReceives!.map((receive, index) =>
-            expect.objectContaining({
-              txid: index === 0 ? firstIndexed!.txid : secondIndexed!.txid,
-              vout: index === 0 ? firstIndexed!.vout : secondIndexed!.vout,
-              value: index === 0 ? amounts.walletA : amounts.walletB,
-              script: receive.script
-            })
-          )
+          proofReceives!
+            .map((receive, index) => ({
+              indexed: index === 0 ? firstIndexed! : secondIndexed!,
+              receive
+            }))
+            .filter(
+              ({indexed}) =>
+                indexed.txid !== spentInput?.txid ||
+                indexed.vout !== spentInput?.vout
+            )
+            .map(({indexed, receive}) =>
+              expect.objectContaining({
+                txid: indexed.txid,
+                vout: indexed.vout,
+                value: indexed.value,
+                script: receive.script
+              })
+            )
         )
       )
       expect(restored.balance.available).toBe(
-        initial.balance.available + amounts.walletA + amounts.walletB
+        beforeSend.balance.available - sendAmount
       )
       expect(restored.balance.settled + restored.balance.preconfirmed).toBe(
-        initial.balance.settled +
-          initial.balance.preconfirmed +
-          amounts.walletA +
-          amounts.walletB
+        beforeSend.balance.settled +
+          beforeSend.balance.preconfirmed -
+          sendAmount
       )
-      expect(restored.balance.total).toBe(
-        initial.balance.total + amounts.walletA + amounts.walletB
-      )
+      expect(restored.balance.total).toBe(beforeSend.balance.total - sendAmount)
       expect(requests.join('\n')).not.toContain(mnemonic)
       await context.close()
       context = undefined
@@ -594,6 +727,14 @@ test('receives and restores native regtest Arkade funds from the mnemonic', asyn
         '-rf',
         '--',
         senderDataDir
+      ]).catch(() => undefined)
+      await execFileAsync('docker', [
+        'exec',
+        'arkd',
+        'rm',
+        '-rf',
+        '--',
+        recipientDataDir
       ]).catch(() => undefined)
     }
 
