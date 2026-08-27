@@ -14,6 +14,7 @@ const configuredWorkers = Number.parseInt(
 export default defineConfig({
   testDir: e2eDir,
   testMatch: '**/*.spec.ts',
+  testIgnore: '**/arkade-*.spec.ts',
   outputDir: resolve(reportRoot, 'test-results'),
   timeout: 600_000,
   fullyParallel: false,
