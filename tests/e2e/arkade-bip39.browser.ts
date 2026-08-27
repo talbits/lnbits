@@ -17,6 +17,18 @@ type RepositoryInputs = {
   schemaVersion: string
 }
 
+type ProofVtxo = {
+  txid: string
+  vout: number
+  value: number
+  script: string
+  isPreconfirmed?: boolean
+  isSpent?: boolean
+  isSwept?: boolean
+  settledBy?: string
+  spentBy?: string
+}
+
 const requireText = (name: string, value: string): string => {
   if (typeof value !== 'string' || !value.trim()) {
     throw new Error(`${name} must be non-empty`)
@@ -162,12 +174,37 @@ const runRegtestProof = async ({
     if (restore) {
       await wallet.restore({gapLimit: 5})
     }
+    const vtxos = (await wallet.getVtxos()).map(
+      ({
+        txid,
+        vout,
+        value,
+        script,
+        isPreconfirmed,
+        isSpent,
+        isSwept,
+        settledBy,
+        spentBy
+      }): ProofVtxo => ({
+        txid,
+        vout,
+        value,
+        script,
+        isPreconfirmed,
+        isSpent,
+        isSwept,
+        settledBy,
+        spentBy
+      })
+    )
     return {
       repositoryName,
       identityDescriptor: identity.descriptor,
       address: await wallet.getAddress(),
       boardingAddress: await wallet.getBoardingAddress(),
       balance: await wallet.getBalance(),
+      recipientScript: wallet.defaultContractScript,
+      vtxos,
       persistedState: await walletRepository.getWalletState(),
       contracts: await contractRepository.getContracts()
     }
