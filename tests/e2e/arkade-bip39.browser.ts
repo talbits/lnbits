@@ -1,4 +1,6 @@
 import {
+  DefaultVtxo,
+  deriveDescriptorLeafPubKey,
   getNetwork,
   HDDescriptorProvider,
   IndexedDBContractRepository,
@@ -33,9 +35,10 @@ type Receive = {
   walletId: 'wallet-a' | 'wallet-b'
   address: string
   script: string
+  signingDescriptor: string
 }
 
-type RegtestMode = 'start' | 'after-first' | 'final' | 'dispose' | 'restore'
+type RegtestMode = 'start' | 'final' | 'dispose' | 'restore'
 
 const requireText = (name: string, value: string): string => {
   if (typeof value !== 'string' || !value.trim()) {
@@ -156,6 +159,26 @@ type LiveWallet = {
 
 let liveWallet: LiveWallet | undefined
 
+const receiveForDescriptor = (
+  wallet: Awaited<ReturnType<typeof Wallet.create>>,
+  walletId: Receive['walletId'],
+  signingDescriptor: string
+): Receive => {
+  const current = wallet.offchainTapscript
+  const tapscript = new DefaultVtxo.Script({
+    ...current.options,
+    pubKey: deriveDescriptorLeafPubKey(signingDescriptor)
+  })
+  return {
+    walletId,
+    address: tapscript
+      .address(wallet.network.hrp, tapscript.options.serverPubKey)
+      .encode(),
+    script: toHex(tapscript.pkScript),
+    signingDescriptor
+  }
+}
+
 const snapshotRegtestWallet = async (
   state: LiveWallet,
   receives: Receive[]
@@ -240,44 +263,33 @@ const runRegtestProof = async ({
       walletMode: 'hd',
       settlementConfig: false
     })
-    const first: Receive = {
-      walletId: 'wallet-a',
-      address: await wallet.getAddress(),
-      script: wallet.defaultContractScript
+    const manager = await wallet.getContractManager()
+    const descriptors = [
+      await wallet.getNextSigningDescriptor(),
+      await wallet.getNextSigningDescriptor()
+    ]
+    if (!descriptors[0] || !descriptors[1]) {
+      throw new Error('Arkade HD wallet did not allocate receive descriptors')
     }
+    await manager.refillLookAhead()
+    const receives = [
+      receiveForDescriptor(wallet, 'wallet-a', descriptors[0]),
+      receiveForDescriptor(wallet, 'wallet-b', descriptors[1])
+    ]
     liveWallet = {
       wallet,
       walletRepository,
       contractRepository,
       repositoryName,
       identity,
-      receives: [first]
+      receives
     }
     return snapshotRegtestWallet(liveWallet, liveWallet.receives)
   }
 
-  if (mode === 'after-first' || mode === 'final' || mode === 'dispose') {
+  if (mode === 'final' || mode === 'dispose') {
     if (!liveWallet) {
       throw new Error(`${mode} requires the live Arkade wallet`)
-    }
-    if (mode === 'after-first') {
-      const first = liveWallet.receives[0]
-      const deadline = Date.now() + 30_000
-      while ((await liveWallet.wallet.getAddress()) === first.address) {
-        if (Date.now() >= deadline) {
-          throw new Error('Arkade receive rotation did not produce wallet-b')
-        }
-        await new Promise(resolve => setTimeout(resolve, 250))
-      }
-      const second: Receive = {
-        walletId: 'wallet-b',
-        address: await liveWallet.wallet.getAddress(),
-        script: liveWallet.wallet.defaultContractScript
-      }
-      if (second.script === first.script) {
-        throw new Error('Arkade receive rotation reused wallet-a script')
-      }
-      liveWallet.receives = [first, second]
     }
     const result = await snapshotRegtestWallet(liveWallet, liveWallet.receives)
     if (mode === 'dispose') {

@@ -65,6 +65,7 @@ type ProofResult = {
     walletId: 'wallet-a' | 'wallet-b'
     address: string
     script: string
+    signingDescriptor: string
   }>
   vtxos: Array<{
     txid: string
@@ -90,7 +91,7 @@ type ProofInput = {
   arkServerUrl: string
   esploraUrl: string
   restore?: boolean
-  mode?: 'start' | 'after-first' | 'final' | 'dispose' | 'restore'
+  mode?: 'start' | 'final' | 'dispose' | 'restore'
   receives?: ProofResult['receives']
 }
 
@@ -208,13 +209,23 @@ test('receives and restores native regtest Arkade funds from the mnemonic', asyn
     expect(initial.boardingAddress).toMatch(/^bcrt1/)
     expect(initial.persistedState).not.toBeNull()
     expect(initial.contracts.length).toBeGreaterThan(0)
-    expect(initial.receives).toHaveLength(1)
-    const firstReceive = initial.receives[0]
-    expect(firstReceive).toMatchObject({
-      walletId: 'wallet-a',
-      address: initial.address,
-      script: initial.recipientScript
-    })
+    expect(initial.receives).toHaveLength(2)
+    const [walletA, walletB] = initial.receives
+    expect(walletA).toMatchObject({walletId: 'wallet-a'})
+    expect(walletB).toMatchObject({walletId: 'wallet-b'})
+    expect(walletA.address).toMatch(/^tark1/)
+    expect(walletB.address).toMatch(/^tark1/)
+    expect(walletA.script).not.toBe(walletB.script)
+    expect(walletA.address).not.toBe(walletB.address)
+    expect(walletA.signingDescriptor).not.toBe(walletB.signingDescriptor)
+    for (const receive of initial.receives) {
+      expect(
+        initial.contracts.some(
+          (contract: {script?: string}) => contract.script === receive.script
+        )
+      ).toBe(false)
+    }
+    const firstReceive = walletA
     const initialOutpoints = new Set(
       initial.vtxos.map(vtxo => `${vtxo.txid}:${vtxo.vout}`)
     )
@@ -254,11 +265,17 @@ test('receives and restores native regtest Arkade funds from the mnemonic', asyn
         spentBy: vtxo.spentBy
       }))
     }
-    const initialIndexedOutpoints = new Set(
-      (await readIndexedVtxos(firstReceive.script)).map(
-        vtxo => `${vtxo.txid}:${vtxo.vout}`
+    const initialScriptOutpoints = new Map<string, Set<string>>()
+    for (const receive of initial.receives) {
+      initialScriptOutpoints.set(
+        receive.script,
+        new Set(
+          (await readIndexedVtxos(receive.script)).map(
+            vtxo => `${vtxo.txid}:${vtxo.vout}`
+          )
+        )
       )
-    )
+    }
 
     let originalIntentFees: IntentFees | undefined
     let proofReceives: ProofResult['receives'] | undefined
@@ -317,16 +334,46 @@ test('receives and restores native regtest Arkade funds from the mnemonic', asyn
         }
       }
 
-      await runSender([
-        'send',
-        '--to',
-        firstReceive.address,
-        '--amount',
-        String(amounts.walletA),
-        '--password',
-        'proof-password'
-      ])
+      const sendReceive = async (
+        receive: (typeof initial.receives)[number],
+        amount: number
+      ) => {
+        await runSender([
+          'send',
+          '--to',
+          receive.address,
+          '--amount',
+          String(amount),
+          '--password',
+          'proof-password'
+        ])
+      }
 
+      await sendReceive(walletB, amounts.walletB)
+      let secondIndexed: IndexedVtxo | undefined
+      await expect
+        .poll(
+          async () => {
+            secondIndexed = (await readIndexedVtxos(walletB.script)).find(
+              vtxo =>
+                vtxo.value === amounts.walletB &&
+                !initialScriptOutpoints
+                  .get(walletB.script)!
+                  .has(`${vtxo.txid}:${vtxo.vout}`) &&
+                !initialOutpoints.has(`${vtxo.txid}:${vtxo.vout}`) &&
+                !vtxo.isSpent &&
+                !vtxo.isSwept
+            )
+            return secondIndexed?.value
+          },
+          {timeout: 30_000}
+        )
+        .toBe(amounts.walletB)
+      expect(secondIndexed?.script).toBe(walletB.script)
+      expect(secondIndexed?.isPreconfirmed).toBe(true)
+      expect(secondIndexed?.commitmentTxids?.length).toBeGreaterThan(0)
+
+      await sendReceive(firstReceive, amounts.walletA)
       let firstIndexed: IndexedVtxo | undefined
       await expect
         .poll(
@@ -334,7 +381,9 @@ test('receives and restores native regtest Arkade funds from the mnemonic', asyn
             firstIndexed = (await readIndexedVtxos(firstReceive.script)).find(
               vtxo =>
                 vtxo.value === amounts.walletA &&
-                !initialIndexedOutpoints.has(`${vtxo.txid}:${vtxo.vout}`) &&
+                !initialScriptOutpoints
+                  .get(firstReceive.script)!
+                  .has(`${vtxo.txid}:${vtxo.vout}`) &&
                 !initialOutpoints.has(`${vtxo.txid}:${vtxo.vout}`) &&
                 !vtxo.isSpent &&
                 !vtxo.isSwept
@@ -348,59 +397,7 @@ test('receives and restores native regtest Arkade funds from the mnemonic', asyn
       expect(firstIndexed?.isPreconfirmed).toBe(true)
       expect(firstIndexed?.commitmentTxids?.length).toBeGreaterThan(0)
 
-      const rotated = await loadProof(
-        page,
-        bundlePath,
-        {...input, mode: 'after-first'},
-        false,
-        true
-      )
-      proofReceives = rotated.receives
-      expect(rotated.receives).toHaveLength(2)
-      const [walletA, walletB] = rotated.receives
-      expect(walletA).toEqual(firstReceive)
-      expect(walletB.walletId).toBe('wallet-b')
-      expect(walletB.address).toMatch(/^tark1/)
-      expect(walletB.script).not.toBe(walletA.script)
-      expect(walletB.address).not.toBe(walletA.address)
-      expect(rotated.address).toBe(walletB.address)
-      expect(rotated.recipientScript).toBe(walletB.script)
-
-      const secondInitialIndexedOutpoints = new Set(
-        (await readIndexedVtxos(walletB.script)).map(
-          vtxo => `${vtxo.txid}:${vtxo.vout}`
-        )
-      )
-      await runSender([
-        'send',
-        '--to',
-        walletB.address,
-        '--amount',
-        String(amounts.walletB),
-        '--password',
-        'proof-password'
-      ])
-      let secondIndexed: IndexedVtxo | undefined
-      await expect
-        .poll(
-          async () => {
-            secondIndexed = (await readIndexedVtxos(walletB.script)).find(
-              vtxo =>
-                vtxo.value === amounts.walletB &&
-                !secondInitialIndexedOutpoints.has(
-                  `${vtxo.txid}:${vtxo.vout}`
-                ) &&
-                !vtxo.isSpent &&
-                !vtxo.isSwept
-            )
-            return secondIndexed?.value
-          },
-          {timeout: 30_000}
-        )
-        .toBe(amounts.walletB)
-      expect(secondIndexed?.script).toBe(walletB.script)
-      expect(secondIndexed?.isPreconfirmed).toBe(true)
-      expect(secondIndexed?.commitmentTxids?.length).toBeGreaterThan(0)
+      proofReceives = initial.receives
 
       let finalProof: ProofResult | undefined
       await expect
@@ -414,17 +411,29 @@ test('receives and restores native regtest Arkade funds from the mnemonic', asyn
               true
             )
             return finalProof.vtxos.filter(vtxo =>
-              rotated.receives.some(receive => receive.script === vtxo.script)
+              initial.receives.some(receive => receive.script === vtxo.script)
             ).length
           },
           {timeout: 30_000}
         )
         .toBeGreaterThanOrEqual(2)
       expect(finalProof).toBeDefined()
+      for (const receive of initial.receives) {
+        expect(finalProof!.contracts).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              script: receive.script,
+              metadata: expect.objectContaining({
+                signingDescriptor: receive.signingDescriptor
+              })
+            })
+          ])
+        )
+      }
 
       const ledger: AttributionLedger = {
         owners: new Map(
-          rotated.receives.map(receive => [receive.script, receive.walletId])
+          initial.receives.map(receive => [receive.script, receive.walletId])
         ),
         receipts: new Map(),
         credits: new Map([
