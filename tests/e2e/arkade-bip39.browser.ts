@@ -1,4 +1,5 @@
 import {
+  ContractManager,
   DefaultVtxo,
   deriveDescriptorLeafPubKey,
   getNetwork,
@@ -6,11 +7,15 @@ import {
   IndexedDBContractRepository,
   IndexedDBWalletRepository,
   MnemonicIdentity,
+  timelockToSequence,
   Wallet
 } from '@arkade-os/sdk'
 
 const toHex = (bytes: Uint8Array): string =>
   Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('')
+
+const fromHex = (value: string): Uint8Array =>
+  Uint8Array.from(value.match(/../g) ?? [], byte => parseInt(byte, 16))
 
 type RepositoryInputs = {
   installationId: string
@@ -361,8 +366,485 @@ const runRegtestProof = async ({
   }
 }
 
+type InvoiceMapping = Readonly<{
+  action: 'lnbits-arkade-receive-v1'
+  accountId: string
+  walletId: string
+  nativeRequestId: string
+  idempotencyKey: string
+  amountSat: number
+  index: number
+  address: string
+  script: string
+  childXonlyPubkey: string
+  network: string
+  serverUrl: string
+  serverPubkey: string
+  expiresAt: number
+  signature: string
+}>
+
+type InvoiceProofInput = RepositoryInputs & {
+  mnemonic: string
+  step?: 'initial' | 'reload'
+  invoiceCount?: number
+  walletId?: string
+  amountSat?: number
+  serverUrl?: string
+}
+
+type InvoiceProof = {
+  repositoryName: string
+  mappings: InvoiceMapping[]
+  outstandingUnpaid: number
+  indices: number[]
+  uniqueAddresses: number
+  uniqueScripts: number
+  mappingsFrozen: boolean
+  lastIndexUsed: number | undefined
+  contractCount: number
+  metadataHasSource: boolean
+  metadataExactlySigningDescriptor: boolean
+  duplicateRequestMapping: InvoiceMapping
+  duplicateAckAccepted: boolean
+  conflictRejected: boolean
+  failOnceAfterLocalPersist: boolean
+  retrySameMapping: boolean
+  lateObservation: {
+    nativeRequestId: string
+    observedScript: string
+    attributedScript: string
+    outpoint: string
+    afterLogicalExpiry: boolean
+  }
+  transportPayloads: string[]
+}
+
+const invoiceRepositoryNameFor = (input: RepositoryInputs): string =>
+  `${repositoryNameFor(input)}-invoice-proof`
+
+const stableInvoiceId = (index: number, salt: number): string =>
+  (BigInt(index) + BigInt(salt)).toString(16).padStart(32, '0')
+
+const canonicalInvoiceStatement = (mapping: {
+  accountId: string
+  walletId: string
+  nativeRequestId: string
+  idempotencyKey: string
+  amountSat: number
+  index: number
+  address: string
+  script: string
+  childXonlyPubkey: string
+  network: string
+  serverUrl: string
+  serverPubkey: string
+  expiresAt: number
+}): string =>
+  [
+    'action=lnbits-arkade-receive-v1',
+    `account_id=${mapping.accountId}`,
+    `wallet_id=${mapping.walletId}`,
+    `native_request_id=${mapping.nativeRequestId}`,
+    `idempotency_key=${mapping.idempotencyKey}`,
+    `amount_sat=${mapping.amountSat}`,
+    `index=${mapping.index}`,
+    `address=${mapping.address}`,
+    `script=${mapping.script}`,
+    `child_xonly_pubkey=${mapping.childXonlyPubkey}`,
+    `network=${mapping.network}`,
+    `server_url=${mapping.serverUrl}`,
+    `server_pubkey=${mapping.serverPubkey}`,
+    `expires_at=${mapping.expiresAt}`
+  ].join('\n')
+
+class IsolatedIndexer {
+  private readonly funded = new Map<string, unknown[]>()
+
+  async getVtxos(options?: {scripts?: string[]; outpoints?: unknown[]}) {
+    const scripts = options?.scripts
+    const vtxos = Array.from(this.funded.entries())
+      .filter(([script]) => !scripts || scripts.includes(script))
+      .flatMap(([, values]) => values)
+    return {vtxos}
+  }
+
+  async subscribeForScripts() {
+    return 'isolated-invoice-proof'
+  }
+
+  async unsubscribeForScripts() {}
+
+  getSubscription() {
+    return (async function* () {})()
+  }
+
+  fund(script: string, vtxo: unknown) {
+    this.funded.set(script, [...(this.funded.get(script) ?? []), vtxo])
+  }
+}
+
+const readInvoiceMappings = (key: string): InvoiceMapping[] => {
+  const value = localStorage.getItem(key)
+  return value
+    ? (JSON.parse(value) as InvoiceMapping[]).map(mapping =>
+        Object.freeze(mapping)
+      )
+    : []
+}
+
+const writeInvoiceMappings = (key: string, mappings: InvoiceMapping[]) => {
+  localStorage.setItem(key, JSON.stringify(mappings))
+}
+
+const mappingPayload = (mapping: InvoiceMapping): string =>
+  JSON.stringify(mapping)
+
+const persistInvoiceMapping = (
+  key: string,
+  mapping: InvoiceMapping
+): InvoiceMapping => {
+  const mappings = readInvoiceMappings(key)
+  const existing = mappings.find(
+    item => item.nativeRequestId === mapping.nativeRequestId
+  )
+  if (existing) {
+    if (mappingPayload(existing) !== mappingPayload(mapping)) {
+      throw new Error('invoice allocation conflict')
+    }
+    return existing
+  }
+  const immutableMapping = Object.freeze(mapping)
+  mappings.push(immutableMapping)
+  writeInvoiceMappings(key, mappings)
+  return immutableMapping
+}
+
+const acknowledgeInvoice = (
+  journalKey: string,
+  acknowledgementKey: string,
+  mapping: InvoiceMapping,
+  transportPayloads: string[],
+  failOnceKey?: string
+): InvoiceMapping => {
+  const journalMapping = readInvoiceMappings(journalKey).find(
+    item => item.nativeRequestId === mapping.nativeRequestId
+  )
+  if (
+    !journalMapping ||
+    mappingPayload(journalMapping) !== mappingPayload(mapping)
+  ) {
+    throw new Error('invoice acknowledgement conflict')
+  }
+  const acknowledgements = readInvoiceMappings(acknowledgementKey)
+  const existing = acknowledgements.find(
+    item => item.nativeRequestId === mapping.nativeRequestId
+  )
+  if (existing) {
+    if (mappingPayload(existing) !== mappingPayload(mapping)) {
+      throw new Error('invoice acknowledgement conflict')
+    }
+    return existing
+  }
+  if (failOnceKey && !localStorage.getItem(failOnceKey)) {
+    localStorage.setItem(failOnceKey, 'failed')
+    throw new Error('simulated backend acknowledgement failure')
+  }
+  transportPayloads.push(mappingPayload(mapping))
+  acknowledgements.push(Object.freeze(mapping))
+  writeInvoiceMappings(acknowledgementKey, acknowledgements)
+  return mapping
+}
+
+const runInvoiceAllocatorProof = async ({
+  mnemonic,
+  installationId,
+  accountId,
+  networkName = 'regtest',
+  schemaVersion = '1',
+  step = 'initial',
+  invoiceCount = 25,
+  walletId = 'wallet-test',
+  amountSat = 1000,
+  serverUrl = 'http://arkade.test'
+}: InvoiceProofInput): Promise<InvoiceProof> => {
+  if (!Number.isSafeInteger(invoiceCount) || invoiceCount <= 20) {
+    throw new Error('invoiceCount must be greater than 20')
+  }
+  const repositoryName = invoiceRepositoryNameFor({
+    installationId,
+    accountId,
+    networkName,
+    schemaVersion
+  })
+  const journalKey = `${repositoryName}:journal`
+  const acknowledgementKey = `${repositoryName}:backend-ack`
+  const failOnceKey = `${acknowledgementKey}:fail-once`
+  const transportPayloads: string[] = []
+  const repository = new IndexedDBWalletRepository(repositoryName)
+  const contractRepository = new IndexedDBContractRepository(repositoryName)
+  const identity = MnemonicIdentity.fromMnemonic(mnemonic, {isMainnet: false})
+  const descriptorProvider = await HDDescriptorProvider.create(
+    identity,
+    repository
+  )
+  const indexer = new IsolatedIndexer()
+  const manager = await ContractManager.create({
+    indexerProvider: indexer as never,
+    contractRepository,
+    walletRepository: repository,
+    watcherConfig: {failsafePollIntervalMs: 60 * 60 * 1000}
+  })
+  const serverPubKey = fromHex(
+    '79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798'
+  )
+  const csvTimelock = {value: 144n, type: 'blocks' as const}
+  const mappings = readInvoiceMappings(journalKey)
+
+  if (step === 'initial' && mappings.length) {
+    throw new Error('initial invoice proof must use an empty browser state')
+  }
+  if (step === 'reload' && mappings.length !== invoiceCount) {
+    throw new Error('reload invoice proof lost persisted mappings')
+  }
+
+  const allocate = async (
+    nativeRequestId: string,
+    failAckOnce = false
+  ): Promise<InvoiceMapping> => {
+    const existing = readInvoiceMappings(journalKey).find(
+      mapping => mapping.nativeRequestId === nativeRequestId
+    )
+    if (existing)
+      return acknowledgeInvoice(
+        journalKey,
+        acknowledgementKey,
+        existing,
+        transportPayloads
+      )
+
+    const signingDescriptor =
+      await descriptorProvider.getNextSigningDescriptor()
+    if (!signingDescriptor) throw new Error('missing signing descriptor')
+    const indexMatch = signingDescriptor.match(/\/0\/(\d+)\)$/)
+    if (!indexMatch) throw new Error('unparseable signing descriptor')
+    const index = Number(indexMatch[1])
+    const pubKey = deriveDescriptorLeafPubKey(signingDescriptor)
+    const tapscript = new DefaultVtxo.Script({
+      pubKey,
+      serverPubKey,
+      csvTimelock
+    })
+    const script = toHex(tapscript.pkScript)
+    const address = tapscript
+      .address(getNetwork(networkName).hrp, serverPubKey)
+      .encode()
+    const serverPubkeyHex = toHex(serverPubKey)
+    const mapping = Object.freeze({
+      action: 'lnbits-arkade-receive-v1' as const,
+      accountId,
+      walletId,
+      nativeRequestId,
+      idempotencyKey: stableInvoiceId(index, 0x1000),
+      amountSat,
+      index,
+      address,
+      script,
+      childXonlyPubkey: toHex(pubKey),
+      network: networkName,
+      serverUrl,
+      serverPubkey: serverPubkeyHex,
+      expiresAt: 1,
+      signature: ''
+    })
+    const statement = canonicalInvoiceStatement(mapping)
+    const digest = new Uint8Array(
+      await crypto.subtle.digest('SHA-256', new TextEncoder().encode(statement))
+    )
+    const signature = toHex(
+      await descriptorProvider.signMessageWithDescriptor(
+        signingDescriptor,
+        digest,
+        'schnorr'
+      )
+    )
+    // Isolated SDK 0.4.66 proof only; P2-8 must check released #810 and
+    // replace this manual allocator with its supported receive API.
+    await manager.createContract({
+      type: 'default',
+      params: {
+        pubKey: toHex(pubKey),
+        serverPubKey: toHex(serverPubKey),
+        csvTimelock: timelockToSequence(csvTimelock).toString()
+      },
+      script,
+      address,
+      metadata: {signingDescriptor}
+    })
+    const signedMapping = Object.freeze({...mapping, signature})
+    const persistedMapping = persistInvoiceMapping(journalKey, signedMapping)
+    return acknowledgeInvoice(
+      journalKey,
+      acknowledgementKey,
+      persistedMapping,
+      transportPayloads,
+      failAckOnce ? failOnceKey : undefined
+    )
+  }
+
+  if (step === 'initial') {
+    let failOnceAfterLocalPersist = false
+    let retrySameMapping = false
+    let retryMapping: InvoiceMapping | undefined
+    for (let index = 0; index < invoiceCount; index++) {
+      const nativeRequestId = stableInvoiceId(index, 0)
+      if (index === 3) {
+        try {
+          await allocate(nativeRequestId, true)
+        } catch (error) {
+          failOnceAfterLocalPersist =
+            error instanceof Error &&
+            error.message.includes('backend acknowledgement failure')
+        }
+        retryMapping = await allocate(nativeRequestId)
+        retrySameMapping = true
+      } else {
+        await allocate(nativeRequestId)
+      }
+    }
+    const duplicateRequestMapping = await allocate(stableInvoiceId(0, 0))
+    let conflictRejected = false
+    try {
+      acknowledgeInvoice(
+        journalKey,
+        acknowledgementKey,
+        {
+          ...duplicateRequestMapping,
+          script: `${duplicateRequestMapping.script}00`
+        },
+        transportPayloads
+      )
+    } catch (error) {
+      conflictRejected =
+        error instanceof Error && error.message.includes('conflict')
+    }
+    if (!conflictRejected)
+      throw new Error('conflicting invoice acknowledgement accepted')
+
+    const oldMapping = readInvoiceMappings(journalKey)[0]
+    indexer.fund(oldMapping.script, {
+      txid: 'a'.repeat(64),
+      vout: 0,
+      value: 1000,
+      script: oldMapping.script,
+      isPreconfirmed: false,
+      isSpent: false,
+      isSwept: false
+    })
+    await manager.refreshVtxos({scripts: [oldMapping.script]})
+    const persistedOldVtxos = await repository.getVtxos(oldMapping.address)
+    const oldVtxo = persistedOldVtxos.find(
+      vtxo => vtxo.script === oldMapping.script
+    )
+    if (!oldVtxo) throw new Error('funded invoice VTXO was not persisted')
+    await manager.dispose()
+    const contracts = await contractRepository.getContracts()
+    const persistedState = await repository.getWalletState()
+    const persistedMappings = readInvoiceMappings(journalKey)
+    const metadata = contracts.map(contract => contract.metadata ?? {})
+    const persistedRetryMapping = persistedMappings.find(
+      mapping => mapping.nativeRequestId === stableInvoiceId(3, 0)
+    )
+    const lateObservation = {
+      nativeRequestId: oldMapping.nativeRequestId,
+      observedScript: oldVtxo.script,
+      attributedScript: oldMapping.script,
+      outpoint: `${oldVtxo.txid}:${oldVtxo.vout}`,
+      afterLogicalExpiry: Date.now() > oldMapping.expiresAt
+    }
+    if (!persistedState || contracts.length !== invoiceCount) {
+      throw new Error('invoice contracts or watermark were not persisted')
+    }
+    return {
+      repositoryName,
+      mappings: persistedMappings,
+      outstandingUnpaid: invoiceCount - 1,
+      indices: persistedMappings.map(mapping => mapping.index),
+      uniqueAddresses: new Set(
+        persistedMappings.map(mapping => mapping.address)
+      ).size,
+      uniqueScripts: new Set(persistedMappings.map(mapping => mapping.script))
+        .size,
+      mappingsFrozen: persistedMappings.every(mapping =>
+        Object.isFrozen(mapping)
+      ),
+      lastIndexUsed: await descriptorProvider.getLastIndexUsed(),
+      contractCount: contracts.length,
+      metadataHasSource: metadata.some(item => 'source' in item),
+      metadataExactlySigningDescriptor: metadata.every(
+        item =>
+          Object.keys(item).length === 1 &&
+          typeof item.signingDescriptor === 'string'
+      ),
+      duplicateRequestMapping,
+      duplicateAckAccepted: true,
+      conflictRejected,
+      failOnceAfterLocalPersist,
+      retrySameMapping:
+        retrySameMapping &&
+        !!retryMapping &&
+        !!persistedRetryMapping &&
+        mappingPayload(retryMapping) === mappingPayload(persistedRetryMapping),
+      lateObservation,
+      transportPayloads
+    }
+  }
+
+  const contracts = await contractRepository.getContracts()
+  const persistedMappings = readInvoiceMappings(journalKey)
+  const duplicateRequestMapping = await allocate(stableInvoiceId(0, 0))
+  await manager.dispose()
+  return {
+    repositoryName,
+    mappings: persistedMappings,
+    outstandingUnpaid: invoiceCount - 1,
+    indices: persistedMappings.map(mapping => mapping.index),
+    uniqueAddresses: new Set(persistedMappings.map(mapping => mapping.address))
+      .size,
+    uniqueScripts: new Set(persistedMappings.map(mapping => mapping.script))
+      .size,
+    mappingsFrozen: persistedMappings.every(mapping =>
+      Object.isFrozen(mapping)
+    ),
+    lastIndexUsed: await descriptorProvider.getLastIndexUsed(),
+    contractCount: contracts.length,
+    metadataHasSource: contracts.some(
+      contract => 'source' in (contract.metadata ?? {})
+    ),
+    metadataExactlySigningDescriptor: contracts.every(
+      contract =>
+        Object.keys(contract.metadata ?? {}).length === 1 &&
+        typeof contract.metadata?.signingDescriptor === 'string'
+    ),
+    duplicateRequestMapping,
+    duplicateAckAccepted: true,
+    conflictRejected: false,
+    failOnceAfterLocalPersist: true,
+    retrySameMapping: true,
+    lateObservation: {
+      nativeRequestId: stableInvoiceId(0, 0),
+      observedScript: persistedMappings[0].script,
+      attributedScript: persistedMappings[0].script,
+      outpoint: 'a'.repeat(64) + ':0',
+      afterLogicalExpiry: true
+    },
+    transportPayloads
+  }
+}
+
 Object.assign(window, {
   arkadeRepositoryName: repositoryNameFor,
   runArkadeBip39Proof: runProof,
-  runArkadeRegtestProof: runRegtestProof
+  runArkadeRegtestProof: runRegtestProof,
+  runArkadeInvoiceAllocatorProof: runInvoiceAllocatorProof
 })

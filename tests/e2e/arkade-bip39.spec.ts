@@ -1,9 +1,11 @@
 import {build} from 'esbuild'
+import {createHash} from 'node:crypto'
 import {mkdtemp, readFile, rm} from 'node:fs/promises'
 import {tmpdir} from 'node:os'
 import {join, resolve} from 'node:path'
 
 import {expect, test, type Page} from '@playwright/test'
+import {schnorr} from '@noble/curves/secp256k1.js'
 
 const projectRoot = resolve(__dirname, '../..')
 const browserSource = resolve(__dirname, 'arkade-bip39.browser.ts')
@@ -34,6 +36,51 @@ type ProofResult = {
   }
 }
 
+type InvoiceMapping = Readonly<{
+  action: 'lnbits-arkade-receive-v1'
+  accountId: string
+  walletId: string
+  nativeRequestId: string
+  idempotencyKey: string
+  amountSat: number
+  index: number
+  address: string
+  script: string
+  childXonlyPubkey: string
+  network: string
+  serverUrl: string
+  serverPubkey: string
+  expiresAt: number
+  signature: string
+}>
+
+type InvoiceProof = {
+  repositoryName: string
+  mappings: InvoiceMapping[]
+  outstandingUnpaid: number
+  indices: number[]
+  uniqueAddresses: number
+  uniqueScripts: number
+  mappingsFrozen: boolean
+  lastIndexUsed: number | undefined
+  contractCount: number
+  metadataHasSource: boolean
+  metadataExactlySigningDescriptor: boolean
+  duplicateRequestMapping: InvoiceMapping
+  duplicateAckAccepted: boolean
+  conflictRejected: boolean
+  failOnceAfterLocalPersist: boolean
+  retrySameMapping: boolean
+  lateObservation: {
+    nativeRequestId: string
+    observedScript: string
+    attributedScript: string
+    outpoint: string
+    afterLogicalExpiry: boolean
+  }
+  transportPayloads: string[]
+}
+
 type ProofInput = {
   mnemonic: string
   installationId: string
@@ -55,6 +102,14 @@ declare global {
       credential?: string
     }) => string
     runArkadeBip39Proof: (input: ProofInput) => Promise<ProofResult>
+    runArkadeInvoiceAllocatorProof: (
+      input: Omit<ProofInput, 'walletIds'> & {
+        invoiceCount?: number
+        walletId?: string
+        amountSat?: number
+        serverUrl?: string
+      }
+    ) => Promise<InvoiceProof>
   }
 }
 
@@ -108,6 +163,30 @@ const assertAttribution = (result: ProofResult): void => {
     ])
   )
 }
+
+const stableInvoiceId = (index: number, salt: number): string =>
+  (BigInt(index) + BigInt(salt)).toString(16).padStart(32, '0')
+
+const fromHex = (value: string): Uint8Array =>
+  Uint8Array.from(value.match(/../g) ?? [], byte => parseInt(byte, 16))
+
+const canonicalInvoiceStatement = (mapping: InvoiceMapping): string =>
+  [
+    `action=${mapping.action}`,
+    `account_id=${mapping.accountId}`,
+    `wallet_id=${mapping.walletId}`,
+    `native_request_id=${mapping.nativeRequestId}`,
+    `idempotency_key=${mapping.idempotencyKey}`,
+    `amount_sat=${mapping.amountSat}`,
+    `index=${mapping.index}`,
+    `address=${mapping.address}`,
+    `script=${mapping.script}`,
+    `child_xonly_pubkey=${mapping.childXonlyPubkey}`,
+    `network=${mapping.network}`,
+    `server_url=${mapping.serverUrl}`,
+    `server_pubkey=${mapping.serverPubkey}`,
+    `expires_at=${mapping.expiresAt}`
+  ].join('\n')
 
 test('proves descriptor attribution only (no receive intent or funded Wallet)', async ({
   browser
@@ -189,6 +268,143 @@ test('proves descriptor attribution only (no receive intent or funded Wallet)', 
       })
     )
     expect(sameRepositoryName).toBe(firstResult.repositoryName)
+    await firstContext.close()
+  } finally {
+    await rm(outputDirectory, {force: true, recursive: true})
+  }
+})
+
+test('proves browser-owned per-invoice allocation and reload attribution', async ({
+  browser
+}) => {
+  const input = {
+    mnemonic,
+    installationId: `invoice-installation-${Date.now()}`,
+    accountId: 'account-test',
+    networkName: 'regtest' as const,
+    schemaVersion: '1',
+    invoiceCount: 25
+  }
+  const outputDirectory = await mkdtemp(
+    join(tmpdir(), 'lnbits-arkade-invoice-')
+  )
+  const bundlePath = join(outputDirectory, 'arkade-invoice.js')
+
+  try {
+    await build({
+      absWorkingDir: projectRoot,
+      bundle: true,
+      entryPoints: [browserSource],
+      format: 'iife',
+      outfile: bundlePath,
+      platform: 'browser',
+      target: 'es2022'
+    })
+    const browserSourceText = await readFile(browserSource, 'utf8')
+    const allocatorSource = browserSourceText.slice(
+      browserSourceText.indexOf('const runInvoiceAllocatorProof'),
+      browserSourceText.indexOf('Object.assign(window')
+    )
+    expect(allocatorSource).not.toContain('getAddress(')
+    const firstContext = await browser.newContext()
+    const page = await firstContext.newPage()
+    await page.goto('/')
+    await page.addScriptTag({path: bundlePath})
+    const first = await page.evaluate(
+      value => window.runArkadeInvoiceAllocatorProof(value),
+      input
+    )
+
+    expect(first.outstandingUnpaid).toBeGreaterThan(20)
+    expect(first.indices).toEqual([...Array(input.invoiceCount).keys()])
+    expect(first.uniqueAddresses).toBe(input.invoiceCount)
+    expect(first.uniqueScripts).toBe(input.invoiceCount)
+    expect(first.lastIndexUsed).toBe(input.invoiceCount - 1)
+    expect(first.contractCount).toBe(input.invoiceCount)
+    expect(first.metadataHasSource).toBe(false)
+    expect(first.metadataExactlySigningDescriptor).toBe(true)
+    expect(first.duplicateAckAccepted).toBe(true)
+    expect(first.conflictRejected).toBe(true)
+    expect(first.failOnceAfterLocalPersist).toBe(true)
+    expect(first.retrySameMapping).toBe(true)
+    expect(first.lateObservation).toEqual({
+      nativeRequestId: stableInvoiceId(0, 0),
+      observedScript: first.mappings[0].script,
+      attributedScript: first.mappings[0].script,
+      outpoint: 'a'.repeat(64) + ':0',
+      afterLogicalExpiry: true
+    })
+    expect(first.mappings).toHaveLength(input.invoiceCount)
+    expect(
+      first.mappings.every(
+        mapping => mapping.action === 'lnbits-arkade-receive-v1'
+      )
+    ).toBe(true)
+    expect(
+      first.mappings.every(mapping =>
+        /^[0-9a-f]{32}$/.test(mapping.nativeRequestId)
+      )
+    ).toBe(true)
+    expect(
+      first.mappings.every(mapping =>
+        /^[0-9a-f]{32}$/.test(mapping.idempotencyKey)
+      )
+    ).toBe(true)
+    expect(first.mappings.every(mapping => mapping.amountSat === 1000)).toBe(
+      true
+    )
+    expect(
+      first.mappings.every(
+        mapping =>
+          mapping.accountId === 'account-test' &&
+          mapping.walletId === 'wallet-test' &&
+          mapping.network === 'regtest' &&
+          mapping.serverUrl === 'http://arkade.test' &&
+          /^[0-9a-f]{64}$/.test(mapping.serverPubkey) &&
+          Number.isSafeInteger(mapping.expiresAt)
+      )
+    ).toBe(true)
+    expect(
+      first.mappings.every(mapping =>
+        /^[0-9a-f]{64}$/.test(mapping.childXonlyPubkey)
+      )
+    ).toBe(true)
+    expect(first.mappingsFrozen).toBe(true)
+    expect(
+      first.mappings.every(mapping => /^[0-9a-f]{128}$/.test(mapping.signature))
+    ).toBe(true)
+    expect(
+      first.mappings.every(mapping =>
+        schnorr.verify(
+          fromHex(mapping.signature),
+          createHash('sha256')
+            .update(Buffer.from(canonicalInvoiceStatement(mapping), 'ascii'))
+            .digest(),
+          fromHex(mapping.childXonlyPubkey)
+        )
+      )
+    ).toBe(true)
+    const publicJson = JSON.stringify(first.mappings)
+    expect(publicJson).not.toMatch(
+      /mnemonic|seed|private.?key|xpub|descriptor|source/i
+    )
+    expect(first.transportPayloads.join('\n')).not.toMatch(
+      /mnemonic|seed|private.?key|xpub|descriptor|source/i
+    )
+
+    await page.reload()
+    await page.addScriptTag({path: bundlePath})
+    const reload = await page.evaluate(
+      value =>
+        window.runArkadeInvoiceAllocatorProof({...value, step: 'reload'}),
+      input
+    )
+    expect(reload.repositoryName).toBe(first.repositoryName)
+    expect(reload.mappings).toEqual(first.mappings)
+    expect(reload.indices).toEqual(first.indices)
+    expect(reload.uniqueScripts).toBe(input.invoiceCount)
+    expect(reload.contractCount).toBe(input.invoiceCount)
+    expect(reload.lastIndexUsed).toBe(input.invoiceCount - 1)
     await firstContext.close()
   } finally {
     await rm(outputDirectory, {force: true, recursive: true})
