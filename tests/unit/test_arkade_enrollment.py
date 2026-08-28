@@ -353,6 +353,35 @@ def test_enrollment_route_uses_strict_dependency_and_optional_header():
 
 
 @pytest.mark.anyio
+async def test_enrollment_page_route_requires_authenticated_session():
+    from fastapi import Request
+    from fastapi.routing import APIRoute
+
+    from lnbits.core.views.generic import generic_router
+    from lnbits.decorators import check_authenticated_account
+
+    route = next(
+        route
+        for route in generic_router.routes
+        if isinstance(route, APIRoute) and route.path == "/arkade/enrollment"
+    )
+    assert any(
+        dependency.dependency is check_authenticated_account
+        for dependency in route.dependencies
+    )
+    request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/arkade/enrollment",
+            "query_string": b"usr=" + (b"a" * 32),
+        }
+    )
+    with pytest.raises(FastAPIHTTPException, match="Missing access token"):
+        await check_authenticated_account(request, None)
+
+
+@pytest.mark.anyio
 async def test_missing_idempotency_header_maps_to_stable_error(monkeypatch):
     from lnbits.core.views import arkade_api
 

@@ -17,6 +17,7 @@ from lnbits.decorators import (
     check_admin,
     check_admin_ui,
     check_blockexplorer_access,
+    check_authenticated_account,
     check_blockexplorer_public,
     check_extension_builder,
     check_first_install,
@@ -211,6 +212,19 @@ async def index(
         {
             "user": user.json(),
         },
+    )
+
+
+@generic_router.get(
+    "/arkade/enrollment", dependencies=[Depends(check_authenticated_account)]
+)
+async def arkade_enrollment_index(
+    request: Request, user: User = Depends(check_user_exists)
+) -> HTMLResponse:
+    return template_renderer().TemplateResponse(
+        request,
+        "base.html",
+        {"user": user.json()},
     )
 
 

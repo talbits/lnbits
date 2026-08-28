@@ -2,12 +2,13 @@
 // so the service worker reinitializes the cache
 const CURRENT_CACHE = 'lnbits-{{ cache_version }}-'
 
-const getApiKey = request => {
-  let api_key = request.headers.get('X-Api-Key')
-  if (!api_key || api_key == 'undefined') {
-    api_key = 'no_api_key'
-  }
-  return api_key
+const isCacheableAsset = request => {
+  const url = new URL(request.url)
+  return (
+    url.origin === self.location.origin &&
+    request.method === 'GET' &&
+    (url.pathname.startsWith('/static/') || url.pathname === '/favicon.ico')
+  )
 }
 
 // on activation we clean up the previously registered service workers
@@ -29,14 +30,11 @@ self.addEventListener('activate', evt =>
 // If no response is found, it populates the runtime cache with the response
 // from the network before returning it to the page.
 self.addEventListener('fetch', event => {
-  if (
-    event.request.url.startsWith(self.location.origin) &&
-    event.request.method == 'GET'
-  ) {
+  if (isCacheableAsset(event.request)) {
     // Open the cache
     event.respondWith(
       caches
-        .open(CURRENT_CACHE + getApiKey(event.request))
+        .open(CURRENT_CACHE + 'static')
         .then(cache => {
           // Go to the network first
           return fetch(event.request)

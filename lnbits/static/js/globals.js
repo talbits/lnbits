@@ -65,7 +65,8 @@ window.g = Vue.reactive({
   updatePayments: false, // used for updating the lnbits-payment-list
   updatePaymentsHash: false, // used for closing the receive dialog
   scanner: null,
-  newWalletType: null
+  newWalletType: null,
+  arkadeEnrollmentState: null
 })
 
 window.dateFormat = 'YYYY-MM-DD HH:mm'

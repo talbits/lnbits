@@ -55,6 +55,15 @@ const DynamicComponent = {
   }
 }
 
+let arkadeEnrollmentScript
+const loadArkadeEnrollment = async () => {
+  arkadeEnrollmentScript ??= LNbits.utils.loadScript(
+    '/static/js/pages/arkade-enrollment.js'
+  )
+  await arkadeEnrollmentScript
+  return window.PageArkadeEnrollment
+}
+
 const routes = [
   {
     path: '/node',
@@ -162,6 +171,11 @@ const routes = [
     component: PageFirstInstall
   },
   {
+    path: '/arkade/enrollment',
+    name: 'ArkadeEnrollment',
+    component: loadArkadeEnrollment
+  },
+  {
     path: '/',
     name: 'PageHome',
     component: PageHome
@@ -191,6 +205,16 @@ const routes = [
 window.router = VueRouter.createRouter({
   history: VueRouter.createWebHistory(),
   routes
+})
+
+window.router.beforeEach(to => {
+  if (
+    window.g.user?.installationMode === 'arkade_noncustodial' &&
+    to.path !== '/arkade/enrollment' &&
+    window.g.arkadeEnrollmentState !== 'ready_unlocked'
+  ) {
+    return '/arkade/enrollment'
+  }
 })
 
 // BACKWARDS compatibility extensions

@@ -96,6 +96,20 @@ window._lnbitsApi = {
       url: '/api/v1/auth'
     })
   },
+  arkadeEnrollmentChallenge(idempotencyKey) {
+    return axios({
+      method: 'POST',
+      url: '/api/v1/arkade/enrollment/challenge',
+      headers: {'Idempotency-Key': idempotencyKey}
+    })
+  },
+  arkadeEnrollmentComplete(data) {
+    return axios({
+      method: 'POST',
+      url: '/api/v1/arkade/enrollment/complete',
+      data
+    })
+  },
   login(username, password) {
     return axios({
       method: 'POST',
@@ -119,6 +133,7 @@ window._lnbitsApi = {
     })
   },
   logout() {
+    window.ArkadeEnrollment?.lock()
     return axios({
       method: 'POST',
       url: '/api/v1/auth/logout'

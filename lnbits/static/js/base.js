@@ -16,7 +16,8 @@ window.LNbits = {
         super_user: data.super_user,
         extra: data.extra ?? {},
         hasPassword: data.has_password ?? false,
-        uiCustomization: data.ui_customization || {}
+        uiCustomization: data.ui_customization || {},
+        installationMode: data.installation_mode || null
       }
       const mapWallet = this.wallet
       obj.wallets = obj.wallets.map(mapWallet).sort((a, b) => {

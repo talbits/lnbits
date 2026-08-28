@@ -52,18 +52,22 @@
         <lnbits-disclaimer v-if="g.user && !g.isPublicPage"></lnbits-disclaimer>
         <lnbits-qrcode-scanner :callback="g.scanner"></lnbits-qrcode-scanner>
         <lnbits-theme></lnbits-theme>
-        <lnbits-header></lnbits-header>
-        <lnbits-drawer v-if="g.user && !g.isPublicPage"></lnbits-drawer>
+        <lnbits-header
+          v-if="$route.path !== '/arkade/enrollment'"
+        ></lnbits-header>
+        <lnbits-drawer
+          v-if="g.user && !g.isPublicPage && $route.path !== '/arkade/enrollment'"
+        ></lnbits-drawer>
         {% block page_container %}
         <q-page-container>
           <q-page
             :class="$route.path.startsWith('/ext/') ? 'q-pa-none' : ['q-px-md', 'q-py-lg', {'q-px-lg': $q.screen.gt.xs}]"
           >
             <lnbits-wallet-new
-              v-if="g.user && !g.isPublicPage"
+              v-if="g.user && !g.isPublicPage && $route.path !== '/arkade/enrollment'"
             ></lnbits-wallet-new>
             <lnbits-header-wallets
-              v-if="g.user && !g.isPublicPage && !$route.path.startsWith('/ext/')"
+              v-if="g.user && !g.isPublicPage && $route.path !== '/arkade/enrollment' && !$route.path.startsWith('/ext/')"
             ></lnbits-header-wallets>
             <!-- block page content from static extensions -->
             <div

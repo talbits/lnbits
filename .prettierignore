@@ -12,6 +12,7 @@
 **/lnbits/static/bundle.*
 **/lnbits/static/bundle-components.*
 **/lnbits/static/css/*
+lnbits/static/js/pages/arkade-enrollment.js
 
 flake.lock
 
