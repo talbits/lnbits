@@ -1270,6 +1270,7 @@ class TransientSettings(InstalledExtensionsSettings, ExchangeHistorySettings):
 
     has_holdinvoice: bool = Field(default=False)
     has_nodemanager: bool = Field(default=False)
+    lnbits_effective_installation_mode: InstallationMode | None = Field(default=None)
 
     @property
     def lnbits_server_up_time(self) -> str:

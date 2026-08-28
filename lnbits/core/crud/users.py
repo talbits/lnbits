@@ -259,6 +259,7 @@ async def get_user_from_account(
         fiat_providers=account.fiat_providers,
         can_create_fiat_wallet=settings.can_create_fiat_wallet(account.id),
         has_password=account.password_hash is not None,
+        installation_mode=settings.lnbits_effective_installation_mode,
         ui_customization=account.ui_customization or {},
     )
 

@@ -16,7 +16,7 @@ from lnbits.helpers import (
     is_valid_pubkey,
     is_valid_username,
 )
-from lnbits.settings import settings
+from lnbits.settings import InstallationMode, settings
 
 from .wallets import Wallet
 
@@ -292,6 +292,7 @@ class User(BaseModel):
     fiat_providers: list[str] = []
     can_create_fiat_wallet: bool = False
     has_password: bool = False
+    installation_mode: InstallationMode | None = None
     extra: UserExtra = UserExtra()
     ui_customization: dict = Field(default_factory=dict)
 

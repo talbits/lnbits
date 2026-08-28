@@ -155,7 +155,7 @@ async def test_login_usr_not_allowed(
 
 @pytest.mark.anyio
 async def test_login_alan_username_password_ok(
-    user_alan: User, http_client: AsyncClient, settings: Settings
+    app, user_alan: User, http_client: AsyncClient, settings: Settings
 ):
     response = await http_client.post(
         "/api/v1/auth", json={"username": user_alan.username, "password": "secret1234"}
@@ -175,10 +175,12 @@ async def test_login_alan_username_password_ok(
         0 <= time.time() - access_token_payload.auth_time <= 5
     ), "Auth time should be very close to now()."
 
+    settings.lnbits_effective_installation_mode = "custodial"
     response = await http_client.get(
         "/api/v1/auth", headers={"Authorization": f"Bearer {access_token}"}
     )
     assert response.status_code == 200, "User exits."
+    assert response.json()["installation_mode"] == "custodial"
     user = User(**response.json())
     assert user.username == "alan", "Username check."
     assert user.email == "alan@lnbits.com", "Email check."
@@ -186,6 +188,7 @@ async def test_login_alan_username_password_ok(
     assert not user.admin, "Not admin."
     assert not user.super_user, "Not superuser."
     assert user.has_password, "Password configured."
+    assert user.installation_mode == "custodial"
     assert (
         len(user.wallets) == 1
     ), f"Expected 1 default wallet, not {len(user.wallets)}."
@@ -1570,6 +1573,8 @@ async def test_api_get_user_acls_no_auth(http_client: AsyncClient):
     # Attempt to get user ACLs without authentication
     response = await http_client.get("/api/v1/auth/acl")
     assert response.status_code == 401, "Unauthorized access."
+    response = await http_client.get("/api/v1/auth")
+    assert response.status_code == 401, "Installation mode requires authentication."
 
 
 @pytest.mark.anyio

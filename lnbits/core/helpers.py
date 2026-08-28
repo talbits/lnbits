@@ -170,6 +170,7 @@ async def initialize_installation_mode(
 async def migrate_databases():
     """Creates the necessary databases if they don't exist already; or migrates them."""
 
+    settings.lnbits_effective_installation_mode = None
     async with core_db.connect() as conn:
         exists = await _table_exists(conn, "dbversions")
         current_versions = await get_db_versions(conn) if exists else []
@@ -177,11 +178,13 @@ async def migrate_databases():
             (v for v in current_versions if v.db == "core"),
             DbVersion(db="core", version=0),
         )
-        await initialize_installation_mode(
+        persisted_mode = await initialize_installation_mode(
             conn,
             configured=settings.lnbits_installation_mode,
             core_version=core_version.version,
         )
+        check_installation_mode(settings.lnbits_installation_mode, persisted_mode)
+        settings.lnbits_effective_installation_mode = persisted_mode
         if not exists:
             await core_migrations.m000_create_migrations_table(conn)
         await run_migration(conn, core_migrations, "core", core_version)

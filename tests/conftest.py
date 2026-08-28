@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import inspect
+import os
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -69,8 +70,11 @@ def settings():
     # override settings for tests
     lnbits_settings.auth_https_only = False
     lnbits_settings.lnbits_admin_extensions = []
-    lnbits_settings.lnbits_data_folder = "./tests/data"
-    lnbits_settings.lnbits_wasm_extensions_path = "./tests/data/wasm_extensions"
+    test_data_folder = os.environ.get("LNBITS_DATA_FOLDER", "./tests/data")
+    lnbits_settings.lnbits_data_folder = test_data_folder
+    lnbits_settings.lnbits_wasm_extensions_path = os.path.join(
+        test_data_folder, "wasm_extensions"
+    )
     lnbits_settings.lnbits_admin_ui = True
     lnbits_settings.lnbits_extensions_default_install = []
     lnbits_settings.lnbits_extensions_deactivate_all = True
@@ -363,8 +367,11 @@ def _restore_pure_settings(settings: Settings):
 def _settings_cleanup(settings: Settings):
     _restore_pure_settings(settings)
     settings.auth_https_only = False
-    settings.lnbits_data_folder = "./tests/data"
-    settings.lnbits_wasm_extensions_path = "./tests/data/wasm_extensions"
+    test_data_folder = os.environ.get("LNBITS_DATA_FOLDER", "./tests/data")
+    settings.lnbits_data_folder = test_data_folder
+    settings.lnbits_wasm_extensions_path = os.path.join(
+        test_data_folder, "wasm_extensions"
+    )
     settings.bundle_assets = True
     settings.lnbits_admin_ui = True
     settings.lnbits_extensions_default_install = []
