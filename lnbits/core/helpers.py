@@ -1,10 +1,11 @@
 import importlib
 import re
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlparse
 from uuid import UUID
 
 from loguru import logger
+from sqlalchemy.exc import SQLAlchemyError
 
 from lnbits.core import migrations as core_migrations
 from lnbits.core.crud import (
@@ -17,8 +18,14 @@ from lnbits.core.models import DbVersion
 from lnbits.core.models.extensions import InstallableExtension
 from lnbits.core.wasm_ext.storage.crud import migrate_wasm_extension_database
 from lnbits.core.wasm_ext.wasm.loader import is_wasm_extension_id
-from lnbits.db import COCKROACH, POSTGRES, SQLITE, Connection
-from lnbits.settings import settings
+from lnbits.db import SQLITE, Connection
+from lnbits.settings import InstallationMode, settings
+
+INSTALLATION_MODE_MIGRATION = 51
+INSTALLATION_MODE_CORRUPT = (
+    "INSTALLATION_MODE_CORRUPT: the installation mode marker is missing or invalid. "
+    "Restore the database from backup; do not recreate or change the marker."
+)
 
 
 async def migrate_extension_database(
@@ -86,29 +93,97 @@ async def load_disabled_extension_list() -> None:
     settings.lnbits_deactivated_extensions.update([e.id for e in inactive_extensions])
 
 
+async def _table_exists(conn: Connection, table: str) -> bool:
+    if conn.type == SQLITE:
+        row = await conn.fetchone(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = :table",
+            {"table": table},
+        )
+    else:
+        row = await conn.fetchone(
+            "SELECT 1 FROM information_schema.tables "
+            "WHERE table_schema = 'public' AND table_name = :table",
+            {"table": table},
+        )
+    return bool(row)
+
+
+def check_installation_mode(
+    configured: InstallationMode, persisted: InstallationMode
+) -> None:
+    if configured == persisted:
+        return
+    raise RuntimeError(
+        "INSTALLATION_MODE_MISMATCH: configured mode "
+        f"'{configured}' does not match database mode '{persisted}'. "
+        f"Restore LNBITS_INSTALLATION_MODE={persisted} to use this database, "
+        f"or configure a new empty database for '{configured}'; existing "
+        "databases cannot change mode."
+    )
+
+
+async def get_installation_mode(conn: Connection) -> InstallationMode:
+    try:
+        rows = await conn.fetchall("SELECT id, mode FROM installation_mode")
+    except SQLAlchemyError as exc:
+        raise RuntimeError(INSTALLATION_MODE_CORRUPT) from exc
+    if len(rows) != 1 or rows[0]["id"] != 1:
+        raise RuntimeError(INSTALLATION_MODE_CORRUPT)
+    mode = rows[0]["mode"]
+    if mode not in {"custodial", "arkade_noncustodial"}:
+        raise RuntimeError(INSTALLATION_MODE_CORRUPT)
+    return cast(InstallationMode, mode)
+
+
+async def initialize_installation_mode(
+    conn: Connection,
+    *,
+    configured: InstallationMode,
+    core_version: int,
+) -> InstallationMode:
+    table_exists = await _table_exists(conn, "installation_mode")
+    if table_exists:
+        try:
+            rows = await conn.fetchall("SELECT id, mode FROM installation_mode")
+        except SQLAlchemyError as exc:
+            raise RuntimeError(INSTALLATION_MODE_CORRUPT) from exc
+        if rows:
+            return await get_installation_mode(conn)
+
+    if core_version >= INSTALLATION_MODE_MIGRATION:
+        raise RuntimeError(INSTALLATION_MODE_CORRUPT)
+
+    if not table_exists:
+        await core_migrations.m051_create_installation_mode_table(conn)
+
+    mode: InstallationMode = (
+        configured if not await _table_exists(conn, "accounts") else "custodial"
+    )
+    await conn.execute(
+        "INSERT INTO installation_mode (id, mode) VALUES (1, :mode) "
+        "ON CONFLICT (id) DO NOTHING",
+        {"mode": mode},
+    )
+    return await get_installation_mode(conn)
+
+
 async def migrate_databases():
     """Creates the necessary databases if they don't exist already; or migrates them."""
 
     async with core_db.connect() as conn:
-        exists = False
-        if conn.type == SQLITE:
-            exists = await conn.fetchone(
-                "SELECT * FROM sqlite_master WHERE type='table' AND name='dbversions'"
-            )
-        elif conn.type in {POSTGRES, COCKROACH}:
-            exists = await conn.fetchone(
-                "SELECT * FROM information_schema.tables WHERE table_schema = 'public'"
-                " AND table_name = 'dbversions'"
-            )
-
-        if not exists:
-            await core_migrations.m000_create_migrations_table(conn)
-
-        current_versions = await get_db_versions(conn)
+        exists = await _table_exists(conn, "dbversions")
+        current_versions = await get_db_versions(conn) if exists else []
         core_version = next(
             (v for v in current_versions if v.db == "core"),
             DbVersion(db="core", version=0),
         )
+        await initialize_installation_mode(
+            conn,
+            configured=settings.lnbits_installation_mode,
+            core_version=core_version.version,
+        )
+        if not exists:
+            await core_migrations.m000_create_migrations_table(conn)
         await run_migration(conn, core_migrations, "core", core_version)
 
     # here is the first place we can be sure that the

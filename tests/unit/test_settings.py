@@ -68,6 +68,15 @@ def test_ln_address_mode_rejects_invalid_value():
         UsersSettings.parse_obj({"lnbits_ln_address_mode": "invalid"})
 
 
+def test_installation_mode_defaults_to_custodial():
+    assert Settings().lnbits_installation_mode == "custodial"
+
+
+def test_installation_mode_rejects_invalid_value():
+    with pytest.raises(ValueError):
+        Settings.parse_obj({"lnbits_installation_mode": "invalid"})
+
+
 @pytest.fixture()
 def lnurlp():
     return RedirectPath(ext_id="lnurlp", **lnurlp_redirect_path)

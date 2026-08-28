@@ -21,6 +21,8 @@ DEFAULT_WASM_MANIFESTS = [
     "https://raw.githubusercontent.com/lnbits/lnbits-extensions-wasm/refs/heads/main/extensions.json"
 ]
 
+InstallationMode = Literal["custodial", "arkade_noncustodial"]
+
 
 def list_parse_fallback(v: str):
     v = v.replace(" ", "")
@@ -1187,6 +1189,7 @@ class PersistenceSettings(LNbitsSettings):
     lnbits_data_folder: str = Field(default="./data")
     lnbits_database_url: str | None = Field(default=None)
     lnbits_wasm_extensions_path: str = Field(default="")
+    lnbits_installation_mode: InstallationMode = Field(default="custodial")
 
     @validator("lnbits_wasm_extensions_path", pre=True, always=True)
     @classmethod

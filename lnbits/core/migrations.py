@@ -902,3 +902,14 @@ async def m050_add_lightning_address_to_wallets(db: Connection):
         CREATE UNIQUE INDEX IF NOT EXISTS idx_wallets_lightning_address
         ON wallets (lightning_address);
         """)
+
+
+async def m051_create_installation_mode_table(db: Connection):
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS installation_mode (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            mode TEXT NOT NULL CHECK (
+                mode IN ('custodial', 'arkade_noncustodial')
+            )
+        )
+        """)
