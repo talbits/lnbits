@@ -16,6 +16,7 @@ from lnbits.core.models.extensions import (
 )
 from lnbits.core.models.extensions_builder import ExtensionData
 from lnbits.core.models.users import Account, AccountId
+from lnbits.core.services.arkade import require_arkade_ready
 from lnbits.core.services.extensions import (
     activate_extension,
     install_extension,
@@ -86,6 +87,7 @@ async def api_deploy_extension(
     data: ExtensionData,
     account: Account = Depends(check_admin),
 ) -> SimpleStatus:
+    await require_arkade_ready(account.id)
     working_dir_name = "deploy_" + sha256(account.id.encode("utf-8")).hexdigest()
     stub_ext_id = "extension_builder_stub"
     release, build_dir = await build_extension_from_data(

@@ -20,6 +20,7 @@ from lnbits.core.crud import (
     update_admin_settings,
     update_wallet,
 )
+from lnbits.core.crud.arkade import ensure_arkade_account_deletion_allowed
 from lnbits.core.crud.users import clear_user_id_cache, get_account, update_account
 from lnbits.core.crud.wallets import delete_wallet_by_id
 from lnbits.core.models import (
@@ -168,6 +169,7 @@ async def api_update_user(
 async def api_users_delete_user(
     user_id: str, account: Account = Depends(check_admin)
 ) -> SimpleStatus:
+    await ensure_arkade_account_deletion_allowed(user_id)
     if user_id == settings.super_user:
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST,
@@ -356,6 +358,7 @@ async def api_users_delete_all_user_wallet(user_id: str) -> SimpleStatus:
             status_code=HTTPStatus.BAD_REQUEST,
             detail="Action not allowed.",
         )
+    await ensure_arkade_account_deletion_allowed(user_id)
 
     wallets = await get_wallets(user_id, deleted=False)
     for wallet in wallets:

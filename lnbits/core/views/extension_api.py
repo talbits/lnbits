@@ -49,6 +49,7 @@ from lnbits.core.models.extensions import (
 )
 from lnbits.core.models.users import Account, AccountId
 from lnbits.core.services import check_transaction_status, create_invoice
+from lnbits.core.services.arkade import require_arkade_ready
 from lnbits.core.services.extensions import (
     activate_extension,
     deactivate_extension,
@@ -325,6 +326,7 @@ async def api_update_pay_to_enable(
 async def api_enable_extension(
     ext_id: str, account_id: AccountId = Depends(check_account_id_exists)
 ) -> SimpleStatus:
+    await require_arkade_ready(account_id.id)
     if ext_id not in [e.code for e in await get_valid_extensions()]:
         raise HTTPException(
             HTTPStatus.NOT_FOUND, f"Extension '{ext_id}' doesn't exist."

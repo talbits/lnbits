@@ -1,3 +1,4 @@
+from lnbits.core.crud.arkade import ensure_arkade_wallet_creation_allowed
 from lnbits.core.crud.users import (
     get_account,
     get_account_by_username_or_email,
@@ -26,6 +27,9 @@ from lnbits.helpers import sha256s
 async def invite_to_wallet(
     source_wallet: Wallet, data: WalletSharePermission
 ) -> WalletSharePermission:
+    await ensure_arkade_wallet_creation_allowed(
+        source_wallet.user, WalletType.LIGHTNING_SHARED.value
+    )
     if not source_wallet.is_lightning_wallet:
         raise ValueError("Only lightning wallets can be shared.")
     if not data.username:
@@ -151,6 +155,9 @@ async def create_lightning_shared_wallet(
     source_wallet_id: str,
     conn: Connection | None = None,
 ) -> Wallet:
+    await ensure_arkade_wallet_creation_allowed(
+        user_id, WalletType.LIGHTNING_SHARED.value, conn=conn
+    )
     source_wallet = await get_standalone_wallet(source_wallet_id, conn=conn)
     if not source_wallet:
         raise ValueError("Shared wallet does not exist.")

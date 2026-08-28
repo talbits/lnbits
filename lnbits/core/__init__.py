@@ -3,6 +3,7 @@ from fastapi import APIRouter, FastAPI
 from .db import core_app_extra, db
 from .views.admin_api import admin_router
 from .views.api import api_router
+from .views.arkade_api import arkade_router
 from .views.asset_api import asset_router
 from .views.audit_api import audit_router
 from .views.auth_api import auth_router
@@ -32,6 +33,7 @@ def init_core_routers(app: FastAPI):
     app.include_router(generic_router)
     app.include_router(auth_router)
     app.include_router(admin_router)
+    app.include_router(arkade_router)
     app.include_router(node_router)
     app.include_router(extension_router)
     app.include_router(extension_websocket_router)

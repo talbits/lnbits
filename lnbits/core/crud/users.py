@@ -3,6 +3,10 @@ from time import time
 from typing import Any
 from uuid import uuid4
 
+from lnbits.core.crud.arkade import (
+    ensure_arkade_account_deletion_allowed,
+    get_arkade_binding,
+)
 from lnbits.core.crud.extensions import get_user_active_extensions_ids
 from lnbits.core.crud.wallets import (
     clear_wallet_cache,
@@ -52,6 +56,7 @@ async def update_account(account: Account, conn: Connection | None = None) -> Ac
 
 
 async def delete_account(user_id: str, conn: Connection | None = None) -> None:
+    await ensure_arkade_account_deletion_allowed(user_id, conn=conn)
     await (conn or db).execute(
         "DELETE from accounts WHERE id = :user",
         {"user": user_id},
@@ -136,6 +141,8 @@ async def delete_accounts_no_wallets(
     time_delta: int,
     conn: Connection | None = None,
 ) -> None:
+    if settings.lnbits_effective_installation_mode == "arkade_noncustodial":
+        return
     delta = int(time()) - time_delta
     await (conn or db).execute(
         # Timestamp placeholder is safe from SQL injection (not user input)
@@ -239,6 +246,9 @@ async def get_user_from_account(
         wallets = await get_wallets(account.id, deleted=False, conn=conn)
 
         if len(wallets) == 0:
+            binding = await get_arkade_binding(account.id, conn=conn)
+            if binding and binding.state == "pending":
+                raise ValueError("ARKADE_ENROLLMENT_REQUIRED")
             wallet = await create_wallet(user_id=account.id, conn=conn)
             wallets.append(wallet)
 

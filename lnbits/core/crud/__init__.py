@@ -1,3 +1,10 @@
+from .arkade import (
+    create_arkade_binding,
+    ensure_arkade_account_deletion_allowed,
+    ensure_arkade_wallet_creation_allowed,
+    ensure_arkade_wallet_deletion_allowed,
+    get_arkade_binding,
+)
 from .audit import create_audit_entry
 from .db_versions import (
     delete_dbversion,
@@ -91,6 +98,7 @@ __all__ = [
     "check_internal",
     "create_account",
     "create_admin_settings",
+    "create_arkade_binding",
     "create_audit_entry",
     "create_installed_extension",
     "create_payment",
@@ -111,6 +119,9 @@ __all__ = [
     "delete_webpush_subscription",
     "delete_webpush_subscriptions",
     "drop_extension_db",
+    "ensure_arkade_account_deletion_allowed",
+    "ensure_arkade_wallet_creation_allowed",
+    "ensure_arkade_wallet_deletion_allowed",
     "force_delete_wallet",
     "get_account",
     "get_account_by_email",
@@ -120,6 +131,7 @@ __all__ = [
     "get_accounts",
     "get_accounts_count",
     "get_admin_settings",
+    "get_arkade_binding",
     "get_db_version",
     "get_db_versions",
     "get_installed_extension",

@@ -1,3 +1,9 @@
+from .arkade import (
+    ArkadeAccountBinding,
+    ArkadeEnrollmentBindingResponse,
+    ArkadeEnrollmentChallenge,
+    ArkadeEnrollmentCompletion,
+)
 from .audit import AuditEntry, AuditFilters
 from .lnurl import CreateLnurlPayment, CreateLnurlWithdraw
 from .misc import (
@@ -56,6 +62,10 @@ __all__ = [
     "Account",
     "AccountFilters",
     "AccountOverview",
+    "ArkadeAccountBinding",
+    "ArkadeEnrollmentBindingResponse",
+    "ArkadeEnrollmentChallenge",
+    "ArkadeEnrollmentCompletion",
     "AuditEntry",
     "AuditFilters",
     "BalanceDelta",

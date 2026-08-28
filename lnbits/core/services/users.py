@@ -17,6 +17,7 @@ from lnbits.settings import (
 from ..crud import (
     create_account,
     create_admin_settings,
+    create_arkade_binding,
     create_user_extension,
     create_wallet,
     get_account,
@@ -31,12 +32,13 @@ from ..crud import (
     update_super_user,
     update_user_extension,
 )
-from ..helpers import to_valid_user_id
+from ..helpers import to_valid_user_id, validate_arkade_configuration
 from ..models import (
     Account,
     User,
     UserExtra,
 )
+from .arkade import require_arkade_ready
 from .settings import update_cached_settings
 
 
@@ -49,7 +51,7 @@ async def create_user_account(
     return await create_user_account_no_ckeck(account, wallet_name)
 
 
-async def create_user_account_no_ckeck(
+async def create_user_account_no_ckeck(  # noqa: C901
     account: Account | None = None,
     wallet_name: str | None = None,
     default_exts: list[str] | None = None,
@@ -57,6 +59,7 @@ async def create_user_account_no_ckeck(
 ) -> User:
     async with db.reuse_conn(conn) if conn else db.connect() as conn:
         await check_users_limit(conn)
+        _validate_arkade_creation_configuration()
 
         if account:
             account.validate_fields()
@@ -77,19 +80,49 @@ async def create_user_account_no_ckeck(
                 account.id = uuid4().hex
 
         account = await create_account(account, conn=conn)
-        await create_wallet(
-            user_id=account.id,
-            wallet_name=wallet_name or settings.lnbits_default_wallet_name,
-            conn=conn,
-        )
+        try:
+            if settings.lnbits_effective_installation_mode == "arkade_noncustodial":
+                await create_arkade_binding(account.id, conn=conn)
 
-        user_extensions = (default_exts or []) + settings.lnbits_user_default_extensions
-        for ext_id in user_extensions:
-            try:
-                user_ext = UserExtension(user=account.id, extension=ext_id, active=True)
-                await create_user_extension(user_ext, conn=conn)
-            except Exception as e:
-                logger.error(f"Error enabeling default extension {ext_id}: {e}")
+            await create_wallet(
+                user_id=account.id,
+                wallet_name=wallet_name or settings.lnbits_default_wallet_name,
+                allow_pending=True,
+                conn=conn,
+            )
+
+            user_extensions = (
+                []
+                if settings.lnbits_effective_installation_mode == "arkade_noncustodial"
+                else (default_exts or []) + settings.lnbits_user_default_extensions
+            )
+            for ext_id in user_extensions:
+                try:
+                    user_ext = UserExtension(
+                        user=account.id, extension=ext_id, active=True
+                    )
+                    await create_user_extension(user_ext, conn=conn)
+                except Exception as e:
+                    logger.error(f"Error enabeling default extension {ext_id}: {e}")
+        except Exception:
+            # Connection helpers commit each statement; compensate on a failed
+            # first-wallet/binding step so account creation remains atomic.
+            await conn.execute(
+                'DELETE FROM extensions WHERE "user" = :user',
+                {"user": account.id},
+            )
+            await conn.execute(
+                'DELETE FROM wallets WHERE "user" = :user', {"user": account.id}
+            )
+            if settings.lnbits_effective_installation_mode == "arkade_noncustodial":
+                await conn.execute(
+                    "DELETE FROM arkade_account_bindings WHERE account_id = :user",
+                    {"user": account.id},
+                )
+            await conn.execute(
+                "DELETE FROM accounts WHERE id = :user", {"user": account.id}
+            )
+            raise
 
         user = await get_user_from_account(account, conn=conn)
     if not user:
@@ -105,6 +138,11 @@ async def check_users_limit(conn: Connection | None = None):
     users_count = await get_accounts_count(conn=conn)
     if users_count >= settings.lnbits_max_users:
         raise ValueError("Max amount of users have been created")
+
+
+def _validate_arkade_creation_configuration() -> None:
+    if settings.lnbits_effective_installation_mode == "arkade_noncustodial":
+        validate_arkade_configuration()
 
 
 async def update_user_account(account: Account) -> Account:
@@ -140,6 +178,7 @@ async def update_user_account(account: Account) -> Account:
 
 
 async def update_user_extensions(user_id: str, extensions: list[str]):
+    await require_arkade_ready(user_id)
     user_extensions = await get_user_extensions(user_id)
     for user_ext in user_extensions:
         if user_ext.active:
@@ -207,8 +246,7 @@ async def init_admin_settings(super_user: str | None = None) -> SuperSettings:
             id=account_id,
             extra=UserExtra(provider="env"),
         )
-        await create_account(account)
-        await create_wallet(user_id=account.id)
+        await create_user_account_no_ckeck(account)
 
     editable_settings = EditableSettings.from_dict(settings.dict())
     return await create_admin_settings(account.id, editable_settings.dict())

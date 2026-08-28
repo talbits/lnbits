@@ -3,6 +3,7 @@ from typing import cast
 from unittest.mock import AsyncMock
 
 import pytest
+from coincurve import PrivateKey
 from fastapi import FastAPI
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 
@@ -82,6 +83,16 @@ async def test_migrate_databases_fresh_sqlite_records_and_reuses_mode(
         )
         monkeypatch.setattr(settings, "lnbits_installation_mode", mode)
         monkeypatch.setattr(settings, "lnbits_effective_installation_mode", None)
+        if mode == "arkade_noncustodial":
+            monkeypatch.setattr(settings, "lnbits_arkade_network", "regtest")
+            monkeypatch.setattr(
+                settings, "lnbits_arkade_server_url", "http://localhost:7070"
+            )
+            monkeypatch.setattr(
+                settings,
+                "lnbits_arkade_server_pubkey",
+                PrivateKey.from_int(1).public_key_xonly.format().hex(),
+            )
 
         await helpers.migrate_databases()
         row = await connection.fetchone("SELECT id, mode FROM installation_mode")
@@ -129,6 +140,39 @@ async def test_migrate_databases_rejects_mismatch_before_core_migration(
     with pytest.raises(RuntimeError, match="INSTALLATION_MODE_MISMATCH"):
         await helpers.migrate_databases()
 
+    run_migration.assert_not_awaited()
+    assert settings.lnbits_effective_installation_mode is None
+
+
+@pytest.mark.anyio
+async def test_migrate_databases_rejects_invalid_arkade_config_before_migration(
+    monkeypatch,
+):
+    class ConnectionContext:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, *_):
+            return None
+
+    monkeypatch.setattr(helpers.core_db, "connect", ConnectionContext)
+    monkeypatch.setattr(helpers, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(helpers, "get_db_versions", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        helpers,
+        "initialize_installation_mode",
+        AsyncMock(return_value="arkade_noncustodial"),
+    )
+    run_migration = AsyncMock()
+    monkeypatch.setattr(helpers, "run_migration", run_migration)
+    monkeypatch.setattr(settings, "lnbits_installation_mode", "arkade_noncustodial")
+    monkeypatch.setattr(settings, "lnbits_effective_installation_mode", "custodial")
+    monkeypatch.setattr(settings, "lnbits_arkade_network", None)
+    monkeypatch.setattr(settings, "lnbits_arkade_server_url", None)
+    monkeypatch.setattr(settings, "lnbits_arkade_server_pubkey", None)
+
+    with pytest.raises(RuntimeError, match="ARKADE_CONFIG_INVALID"):
+        await helpers.migrate_databases()
     run_migration.assert_not_awaited()
     assert settings.lnbits_effective_installation_mode is None
 

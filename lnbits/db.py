@@ -46,10 +46,11 @@ else:
     DB_TYPE = SQLITE
 
 
-def compat_timestamp_placeholder(key: str):
-    if DB_TYPE == POSTGRES:
+def compat_timestamp_placeholder(key: str, db_type: str | None = None):
+    db_type = db_type or DB_TYPE
+    if db_type == POSTGRES:
         return f"to_timestamp(:{key})"
-    elif DB_TYPE == COCKROACH:
+    elif db_type == COCKROACH:
         return f"cast(:{key} AS timestamp)"
     else:
         return f":{key}"
@@ -128,7 +129,7 @@ class Compat:
         return "BLOB"
 
     def timestamp_placeholder(self, key: str) -> str:
-        return compat_timestamp_placeholder(key)
+        return compat_timestamp_placeholder(key, self.type)
 
 
 class Connection(Compat):

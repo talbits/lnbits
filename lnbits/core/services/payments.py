@@ -47,6 +47,7 @@ from ..models import (
     PaymentState,
     Wallet,
 )
+from .arkade import require_arkade_payments_unavailable
 from .fiat_providers import check_fiat_status
 from .lnurl import execute_withdraw as lnurl_withdraw
 from .notifications import send_payment_notification_in_background
@@ -282,6 +283,7 @@ async def create_invoice(
     user_wallet = await get_wallet(wallet_id, conn=conn)
     if not user_wallet:
         raise InvoiceError(f"Could not fetch wallet '{wallet_id}'.", status="failed")
+    await require_arkade_payments_unavailable(user_wallet.user, conn=conn)
 
     if not user_wallet.can_receive_payments:
         raise InvoiceError(
@@ -974,6 +976,7 @@ async def _check_wallet_for_payment(
     wallet = await get_wallet(wallet_id, conn=conn)
     if not wallet:
         raise PaymentError(f"Could not fetch wallet '{wallet_id}'.", status="failed")
+    await require_arkade_payments_unavailable(wallet.user, conn=conn)
 
     # check if the payment is made for an extension that the user disabled
     status = await check_user_extension_access(wallet.user, tag, conn=conn)

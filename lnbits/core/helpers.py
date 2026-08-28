@@ -1,9 +1,10 @@
 import importlib
 import re
 from typing import Any, cast
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 from uuid import UUID
 
+from coincurve import PublicKeyXOnly
 from loguru import logger
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -26,6 +27,71 @@ INSTALLATION_MODE_CORRUPT = (
     "INSTALLATION_MODE_CORRUPT: the installation mode marker is missing or invalid. "
     "Restore the database from backup; do not recreate or change the marker."
 )
+
+
+def canonical_arkade_server_url(url: str) -> str:  # noqa: C901
+    """Return the only URL form accepted in Arkade enrollment statements."""
+    if not isinstance(url, str):
+        raise RuntimeError("ARKADE_CONFIG_INVALID")
+    try:
+        url.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise RuntimeError("ARKADE_CONFIG_INVALID") from exc
+    try:
+        parsed = urlsplit(url)
+    except ValueError as exc:
+        raise RuntimeError("ARKADE_CONFIG_INVALID") from exc
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise RuntimeError("ARKADE_CONFIG_INVALID")
+    if ":" in parsed.hostname:
+        # IPv6 must be bracketed in an authority. Rejecting it keeps the
+        # canonical statement unambiguous until an IPv6 policy is designed.
+        raise RuntimeError("ARKADE_CONFIG_INVALID")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise RuntimeError("ARKADE_CONFIG_INVALID")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise RuntimeError("ARKADE_CONFIG_INVALID") from exc
+    if port is not None and not 1 <= port <= 65535:
+        raise RuntimeError("ARKADE_CONFIG_INVALID")
+    if any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in url):
+        raise RuntimeError("ARKADE_CONFIG_INVALID")
+    if port and not (
+        (parsed.scheme == "http" and port == 80)
+        or (parsed.scheme == "https" and port == 443)
+    ):
+        host = f"{parsed.hostname.lower()}:{port}"
+    else:
+        host = parsed.hostname.lower()
+    return urlunsplit((parsed.scheme, host, parsed.path.rstrip("/"), "", ""))
+
+
+def get_arkade_configuration() -> tuple[str, str, str]:
+    network = settings.lnbits_arkade_network
+    server_url = settings.lnbits_arkade_server_url
+    signer_pubkey = settings.lnbits_arkade_server_pubkey
+    if not isinstance(network, str) or not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._-]{0,31}", network
+    ):
+        raise RuntimeError("ARKADE_CONFIG_INVALID")
+    if not isinstance(server_url, str) or not server_url:
+        raise RuntimeError("ARKADE_CONFIG_INVALID")
+    canonical_url = canonical_arkade_server_url(server_url)
+    if not isinstance(signer_pubkey, str) or not re.fullmatch(
+        r"[0-9a-fA-F]{64}", signer_pubkey
+    ):
+        raise RuntimeError("ARKADE_CONFIG_INVALID")
+    signer_pubkey = signer_pubkey.lower()
+    try:
+        PublicKeyXOnly(bytes.fromhex(signer_pubkey))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("ARKADE_CONFIG_INVALID") from exc
+    return network, canonical_url, signer_pubkey
+
+
+def validate_arkade_configuration() -> None:
+    get_arkade_configuration()
 
 
 async def migrate_extension_database(
@@ -184,6 +250,8 @@ async def migrate_databases():
             core_version=core_version.version,
         )
         check_installation_mode(settings.lnbits_installation_mode, persisted_mode)
+        if persisted_mode == "arkade_noncustodial":
+            validate_arkade_configuration()
         settings.lnbits_effective_installation_mode = persisted_mode
         if not exists:
             await core_migrations.m000_create_migrations_table(conn)

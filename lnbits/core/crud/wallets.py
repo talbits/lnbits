@@ -2,6 +2,10 @@ from datetime import datetime, timezone
 from time import time
 from uuid import uuid4
 
+from lnbits.core.crud.arkade import (
+    ensure_arkade_wallet_creation_allowed,
+    ensure_arkade_wallet_deletion_allowed,
+)
 from lnbits.core.db import db
 from lnbits.core.models.wallets import BaseWallet, WalletsFilters, WalletType
 from lnbits.db import Connection, Filters, Page
@@ -18,8 +22,16 @@ async def create_wallet(
     wallet_name: str | None = None,
     wallet_type: WalletType = WalletType.LIGHTNING,
     shared_wallet_id: str | None = None,
+    allow_pending: bool = False,
     conn: Connection | None = None,
 ) -> Wallet:
+    await ensure_arkade_wallet_creation_allowed(
+        user_id,
+        wallet_type.value,
+        allow_pending=allow_pending,
+        conn=conn,
+    )
+
     wallet_id = uuid4().hex
     wallet = Wallet(
         id=wallet_id,
@@ -55,6 +67,7 @@ async def delete_wallet(
     deleted: bool = True,
     conn: Connection | None = None,
 ) -> None:
+    await ensure_arkade_wallet_deletion_allowed(wallet_id, deleted=deleted, conn=conn)
     clear_wallet_id_cache(wallet_id)
     now = int(time())
 
@@ -70,6 +83,7 @@ async def delete_wallet(
 
 
 async def force_delete_wallet(wallet_id: str, conn: Connection | None = None) -> None:
+    await ensure_arkade_wallet_deletion_allowed(wallet_id, conn=conn)
     clear_wallet_id_cache(wallet_id)
     await (conn or db).execute(
         "DELETE FROM wallets WHERE id = :wallet",
@@ -80,6 +94,7 @@ async def force_delete_wallet(wallet_id: str, conn: Connection | None = None) ->
 async def delete_wallet_by_id(
     wallet_id: str, conn: Connection | None = None
 ) -> int | None:
+    await ensure_arkade_wallet_deletion_allowed(wallet_id, conn=conn)
     clear_wallet_id_cache(wallet_id)
     now = int(time())
     result = await (conn or db).execute(

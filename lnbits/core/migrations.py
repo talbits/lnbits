@@ -913,3 +913,36 @@ async def m051_create_installation_mode_table(db: Connection):
             )
         )
         """)
+
+
+async def m052_create_arkade_account_bindings_table(db: Connection):
+    await db.execute(f"""
+        CREATE TABLE IF NOT EXISTS arkade_account_bindings (
+            account_id TEXT PRIMARY KEY REFERENCES accounts (id),
+            state TEXT NOT NULL CHECK (state IN ('pending', 'ready')),
+            enrollment_id TEXT NOT NULL UNIQUE,
+            idempotency_key TEXT UNIQUE,
+            challenge_nonce TEXT,
+            challenge_expires_at TIMESTAMP,
+            network TEXT NOT NULL,
+            server_url TEXT NOT NULL,
+            server_pubkey TEXT NOT NULL,
+            identity_xonly_pubkey TEXT UNIQUE,
+            backup_acknowledged_at TIMESTAMP,
+            created_at TIMESTAMP NOT NULL DEFAULT {db.timestamp_now},
+            updated_at TIMESTAMP NOT NULL DEFAULT {db.timestamp_now},
+            ready_at TIMESTAMP,
+            CHECK (
+                (state = 'pending' AND identity_xonly_pubkey IS NULL
+                 AND backup_acknowledged_at IS NULL AND ready_at IS NULL)
+                OR
+                (state = 'ready' AND identity_xonly_pubkey IS NOT NULL
+                 AND backup_acknowledged_at IS NOT NULL AND ready_at IS NOT NULL
+                 AND challenge_nonce IS NULL AND challenge_expires_at IS NULL)
+            ),
+            CHECK (
+                (challenge_nonce IS NULL AND challenge_expires_at IS NULL)
+                OR (challenge_nonce IS NOT NULL AND challenge_expires_at IS NOT NULL)
+            )
+        )
+        """)

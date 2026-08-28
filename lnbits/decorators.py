@@ -31,6 +31,7 @@ from lnbits.core.models import (
 )
 from lnbits.core.models.users import AccountId, EndpointAccess
 from lnbits.core.models.wallets import BaseWallet, BaseWalletTypeInfo
+from lnbits.core.services.arkade import require_arkade_ready
 from lnbits.db import Connection, Filter, Filters, TFilterModel
 from lnbits.helpers import normalize_path, path_segments, sha256s
 from lnbits.settings import AuthMethods, settings
@@ -131,6 +132,7 @@ class KeyChecker(BaseKeyChecker):
 
             request.scope["user_id"] = wallet.user
             await _check_user_access(request, wallet.user, conn=conn)
+            await require_arkade_ready(wallet.user, conn=conn)
 
         key_type = await self._extract_key_type(key_value, wallet)
         return WalletTypeInfo(key_type, wallet)
@@ -156,6 +158,7 @@ class LightKeyChecker(BaseKeyChecker):
                 if key_info:
                     request.scope["user_id"] = key_info.wallet.user
                     await _check_user_access(request, key_info.wallet.user, conn=conn)
+                    await require_arkade_ready(key_info.wallet.user, conn=conn)
                     return key_info
 
             wallet = await get_base_wallet_for_key(key_value, conn=conn)
@@ -167,6 +170,7 @@ class LightKeyChecker(BaseKeyChecker):
                 )
             request.scope["user_id"] = wallet.user
             await _check_user_access(request, wallet.user, conn=conn)
+            await require_arkade_ready(wallet.user, conn=conn)
 
         key_type = await self._extract_key_type(key_value, wallet)
         key_info = BaseWalletTypeInfo(key_type, wallet)
@@ -281,6 +285,16 @@ async def check_account_exists(
     usr: UUID4 | None = None,
 ) -> Account:
     return await _check_account_exists(r, access_token, usr)
+
+
+async def check_authenticated_account(
+    r: Request,
+    access_token: Annotated[str | None, Depends(check_access_token)],
+) -> Account:
+    """Require a real session/access token; never accept the usr fallback."""
+    if not access_token:
+        raise HTTPException(HTTPStatus.UNAUTHORIZED, "Missing access token.")
+    return await _check_account_exists(r, access_token, None)
 
 
 async def _check_account_exists(

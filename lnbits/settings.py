@@ -1190,6 +1190,10 @@ class PersistenceSettings(LNbitsSettings):
     lnbits_database_url: str | None = Field(default=None)
     lnbits_wasm_extensions_path: str = Field(default="")
     lnbits_installation_mode: InstallationMode = Field(default="custodial")
+    # Arkade deployment identity is pinned into each account binding at enrollment.
+    lnbits_arkade_network: str | None = Field(default=None)
+    lnbits_arkade_server_url: str | None = Field(default=None)
+    lnbits_arkade_server_pubkey: str | None = Field(default=None)
 
     @validator("lnbits_wasm_extensions_path", pre=True, always=True)
     @classmethod
