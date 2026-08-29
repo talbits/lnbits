@@ -85,6 +85,14 @@ async def delete_wallet(
 async def force_delete_wallet(wallet_id: str, conn: Connection | None = None) -> None:
     await ensure_arkade_wallet_deletion_allowed(wallet_id, conn=conn)
     clear_wallet_id_cache(wallet_id)
+    if settings.lnbits_effective_installation_mode == "arkade_noncustodial":
+        mapped = await (conn or db).fetchone(
+            "SELECT 1 FROM arkade_receive_requests "
+            "WHERE wallet_id = :wallet LIMIT 1",
+            {"wallet": wallet_id},
+        )
+        if mapped:
+            raise ValueError("ARKADE_WALLET_DELETION_BLOCKED")
     await (conn or db).execute(
         "DELETE FROM wallets WHERE id = :wallet",
         {"wallet": wallet_id},
@@ -110,7 +118,14 @@ async def delete_wallet_by_id(
 
 
 async def remove_deleted_wallets(conn: Connection | None = None) -> None:
-    await (conn or db).execute("DELETE FROM wallets WHERE deleted = true")
+    if settings.lnbits_effective_installation_mode != "arkade_noncustodial":
+        await (conn or db).execute("DELETE FROM wallets WHERE deleted = true")
+        return
+    await (conn or db).execute(
+        "DELETE FROM wallets WHERE deleted = true AND NOT EXISTS ("
+        "SELECT 1 FROM arkade_receive_requests "
+        "WHERE wallet_id = wallets.id)"
+    )
 
 
 async def delete_unused_wallets(
@@ -118,6 +133,17 @@ async def delete_unused_wallets(
     conn: Connection | None = None,
 ) -> None:
     delta = int(time()) - time_delta
+    if settings.lnbits_effective_installation_mode == "arkade_noncustodial":
+        await (conn or db).execute(
+            "DELETE FROM wallets WHERE deleted = true AND ("
+            "SELECT COUNT(*) FROM apipayments WHERE wallet_id = wallets.id"
+            ") = 0 AND (updated_at < :delta OR (updated_at IS NULL "
+            "AND created_at < :delta)) AND NOT EXISTS ("
+            "SELECT 1 FROM arkade_receive_requests "
+            "WHERE wallet_id = wallets.id)",
+            {"delta": delta},
+        )
+        return
     await (conn or db).execute(
         """
         DELETE FROM wallets

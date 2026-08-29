@@ -2,7 +2,12 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from lnbits.core.db import db
-from lnbits.core.models import ArkadeAccountBinding
+from lnbits.core.models import (
+    ArkadeAccountBinding,
+    ArkadeIndexerVtxo,
+    ArkadeReceiveRequest,
+    ArkadeReconciliation,
+)
 from lnbits.db import Connection
 from lnbits.settings import settings
 
@@ -36,6 +41,318 @@ async def get_arkade_binding(
         {"account_id": account_id},
         ArkadeAccountBinding,
     )
+
+
+async def get_arkade_receive_request(
+    native_request_id: str, conn: Connection | None = None
+) -> ArkadeReceiveRequest | None:
+    return await (conn or db).fetchone(
+        "SELECT * FROM arkade_receive_requests "
+        "WHERE native_request_id = :native_request_id",
+        {"native_request_id": native_request_id},
+        ArkadeReceiveRequest,
+    )
+
+
+async def get_arkade_receive_request_by_idempotency(
+    account_id: str, idempotency_key: str, conn: Connection | None = None
+) -> ArkadeReceiveRequest | None:
+    return await (conn or db).fetchone(
+        "SELECT * FROM arkade_receive_requests "
+        "WHERE account_id = :account_id AND idempotency_key = :idempotency_key",
+        {"account_id": account_id, "idempotency_key": idempotency_key},
+        ArkadeReceiveRequest,
+    )
+
+
+async def get_arkade_receive_request_by_script(
+    account_id: str, script: str, conn: Connection | None = None
+) -> ArkadeReceiveRequest | None:
+    return await (conn or db).fetchone(
+        "SELECT * FROM arkade_receive_requests "
+        "WHERE account_id = :account_id AND script = :script",
+        {"account_id": account_id, "script": script},
+        ArkadeReceiveRequest,
+    )
+
+
+async def get_arkade_receive_requests(
+    account_id: str, conn: Connection | None = None
+) -> list[ArkadeReceiveRequest]:
+    return await (conn or db).fetchall(
+        "SELECT * FROM arkade_receive_requests "
+        "WHERE account_id = :account_id AND script IS NOT NULL",
+        {"account_id": account_id},
+        ArkadeReceiveRequest,
+    )
+
+
+async def create_arkade_receive_request(
+    request: ArkadeReceiveRequest, conn: Connection | None = None
+) -> bool:
+    database = conn or db
+    result = await database.execute(
+        f"""
+        INSERT INTO arkade_receive_requests (
+            native_request_id, account_id, wallet_id, idempotency_key, amount_sat,
+            network, server_url, server_pubkey, expires_at, state,
+            created_at, updated_at
+        ) VALUES (
+            :native_request_id, :account_id, :wallet_id, :idempotency_key,
+            :amount_sat, :network, :server_url, :server_pubkey,
+            {database.timestamp_placeholder('expires_at')}, 'pending',
+            {database.timestamp_placeholder('created_at')},
+            {database.timestamp_placeholder('updated_at')}
+        ) ON CONFLICT DO NOTHING
+        """,  # noqa: S608
+        {
+            "native_request_id": request.native_request_id,
+            "account_id": request.account_id,
+            "wallet_id": request.wallet_id,
+            "idempotency_key": request.idempotency_key,
+            "amount_sat": request.amount_sat,
+            "network": request.network,
+            "server_url": request.server_url,
+            "server_pubkey": request.server_pubkey,
+            "expires_at": request.expires_at,
+            "created_at": request.created_at,
+            "updated_at": request.updated_at,
+        },
+    )
+    return bool(result.rowcount)
+
+
+async def update_arkade_receive_acknowledgement(
+    request: ArkadeReceiveRequest,
+    *,
+    index: int,
+    address: str,
+    script: str,
+    child_xonly_pubkey: str,
+    state: str = "acknowledged",
+    conn: Connection | None = None,
+) -> bool:
+    database = conn or db
+    now = datetime.now(timezone.utc)
+    result = await database.execute(
+        f"""
+        UPDATE arkade_receive_requests SET
+            "index" = :index,
+            address = :address,
+            script = :script,
+            child_xonly_pubkey = :child_xonly_pubkey,
+            state = :state,
+            updated_at = {database.timestamp_placeholder('updated_at')}
+        WHERE native_request_id = :native_request_id AND state = 'pending'
+        """,  # noqa: S608
+        {
+            "index": index,
+            "address": address,
+            "script": script,
+            "child_xonly_pubkey": child_xonly_pubkey,
+            "state": state,
+            "native_request_id": request.native_request_id,
+            "updated_at": now,
+        },
+    )
+    return bool(result.rowcount)
+
+
+async def mark_arkade_receive_request_reconciliation_required(
+    native_request_id: str, conn: Connection | None = None
+) -> None:
+    await (conn or db).execute(
+        "UPDATE arkade_receive_requests "
+        "SET state = 'reconciliation_required' "
+        "WHERE native_request_id = :native_request_id AND state <> 'settled'",
+        {"native_request_id": native_request_id},
+    )
+
+
+async def settle_arkade_receive_request(
+    native_request_id: str, settled_at: datetime, conn: Connection | None = None
+) -> None:
+    database = conn or db
+    await database.execute(
+        f"""
+        UPDATE arkade_receive_requests
+        SET state = 'settled',
+            settled_at = {database.timestamp_placeholder('settled_at')},
+            updated_at = {database.timestamp_placeholder('updated_at')}
+        WHERE native_request_id = :native_request_id
+        """,  # noqa: S608
+        {
+            "native_request_id": native_request_id,
+            "settled_at": settled_at,
+            "updated_at": settled_at,
+        },
+    )
+
+
+async def get_arkade_receive_outpoint(
+    txid: str, vout: int, conn: Connection | None = None
+) -> dict | None:
+    return await (conn or db).fetchone(
+        "SELECT * FROM arkade_receive_outpoints WHERE txid = :txid AND vout = :vout",
+        {"txid": txid, "vout": vout},
+    )
+
+
+async def create_arkade_receive_outpoint(
+    *,
+    account_id: str,
+    native_request_id: str | None,
+    vtxo: ArkadeIndexerVtxo,
+    status: str,
+    conn: Connection | None = None,
+) -> bool:
+    result = await (conn or db).execute(
+        """
+        INSERT INTO arkade_receive_outpoints (
+            account_id, native_request_id, txid, vout, amount_sat, script,
+            status, is_preconfirmed, is_spent, is_swept, spent_by
+        ) VALUES (
+            :account_id, :native_request_id, :txid, :vout, :amount_sat, :script,
+            :status, :is_preconfirmed, :is_spent, :is_swept, :spent_by
+        ) ON CONFLICT (txid, vout) DO NOTHING
+        """,
+        {
+            "account_id": account_id,
+            "native_request_id": native_request_id,
+            "txid": vtxo.txid,
+            "vout": vtxo.vout,
+            "amount_sat": vtxo.amount_sat,
+            "script": vtxo.script,
+            "status": status,
+            "is_preconfirmed": vtxo.is_preconfirmed,
+            "is_spent": vtxo.is_spent,
+            "is_swept": vtxo.is_swept,
+            "spent_by": vtxo.spent_by,
+        },
+    )
+    return bool(result.rowcount)
+
+
+async def update_arkade_receive_outpoint_attribution(
+    txid: str,
+    vout: int,
+    native_request_id: str,
+    conn: Connection | None = None,
+) -> None:
+    await (conn or db).execute(
+        "UPDATE arkade_receive_outpoints SET "
+        "native_request_id = :request_id, status = 'valid' "
+        "WHERE txid = :txid AND vout = :vout",
+        {"request_id": native_request_id, "txid": txid, "vout": vout},
+    )
+
+
+async def mark_arkade_receive_outpoints_conflict(
+    native_request_id: str, conn: Connection | None = None
+) -> None:
+    await (conn or db).execute(
+        "UPDATE arkade_receive_outpoints SET status = 'conflict' "
+        "WHERE native_request_id = :native_request_id AND status = 'valid'",
+        {"native_request_id": native_request_id},
+    )
+
+
+async def get_arkade_receive_request_total(
+    native_request_id: str, conn: Connection | None = None
+) -> int:
+    row = await (conn or db).fetchone(
+        "SELECT COALESCE(SUM(amount_sat), 0) AS total "
+        "FROM arkade_receive_outpoints "
+        "WHERE native_request_id = :request_id AND status = 'valid'",
+        {"request_id": native_request_id},
+    )
+    return int(row["total"])
+
+
+async def update_arkade_receive_outpoint(
+    vtxo: ArkadeIndexerVtxo, conn: Connection | None = None
+) -> None:
+    await (conn or db).execute(
+        """
+        UPDATE arkade_receive_outpoints SET
+            is_preconfirmed = :is_preconfirmed,
+            is_spent = CASE WHEN is_spent OR :is_spent
+                            THEN true ELSE false END,
+            is_swept = CASE WHEN is_swept OR :is_swept
+                            THEN true ELSE false END,
+            spent_by = COALESCE(spent_by, :spent_by)
+        WHERE txid = :txid AND vout = :vout
+        """,
+        {
+            "txid": vtxo.txid,
+            "vout": vtxo.vout,
+            "is_preconfirmed": vtxo.is_preconfirmed,
+            "is_spent": vtxo.is_spent,
+            "is_swept": vtxo.is_swept,
+            "spent_by": vtxo.spent_by,
+        },
+    )
+
+
+async def mark_arkade_receive_outpoint_conflict(
+    txid: str,
+    vout: int,
+    account_id: str,
+    conn: Connection | None = None,
+) -> None:
+    await (conn or db).execute(
+        "UPDATE arkade_receive_outpoints SET status = 'conflict' "
+        "WHERE txid = :txid AND vout = :vout AND account_id = :account_id",
+        {"txid": txid, "vout": vout, "account_id": account_id},
+    )
+
+
+async def get_arkade_reconciliation(
+    account_id: str, conn: Connection | None = None
+) -> ArkadeReconciliation | None:
+    return await (conn or db).fetchone(
+        "SELECT * FROM arkade_reconciliation_state WHERE account_id = :account_id",
+        {"account_id": account_id},
+        ArkadeReconciliation,
+    )
+
+
+async def update_arkade_reconciliation(
+    account_id: str,
+    *,
+    state: str,
+    last_error: str | None = None,
+    observed_at: datetime | None = None,
+    conn: Connection | None = None,
+) -> ArkadeReconciliation:
+    database = conn or db
+    now = datetime.now(timezone.utc)
+    observed_at = observed_at or now
+    await database.execute(
+        f"""
+        INSERT INTO arkade_reconciliation_state
+            (account_id, state, last_error, observed_at, updated_at)
+        VALUES (:account_id, :state, :last_error,
+                {database.timestamp_placeholder('observed_at')},
+                {database.timestamp_placeholder('updated_at')})
+        ON CONFLICT (account_id) DO UPDATE SET
+            state = excluded.state,
+            last_error = excluded.last_error,
+            observed_at = excluded.observed_at,
+            updated_at = excluded.updated_at
+        """,  # noqa: S608
+        {
+            "account_id": account_id,
+            "state": state,
+            "last_error": last_error,
+            "observed_at": observed_at,
+            "updated_at": now,
+        },
+    )
+    result = await get_arkade_reconciliation(account_id, conn=conn)
+    if not result:
+        raise RuntimeError("ARKADE_RECONCILIATION_UNAVAILABLE")
+    return result
 
 
 async def update_arkade_challenge(

@@ -946,3 +946,82 @@ async def m052_create_arkade_account_bindings_table(db: Connection):
             )
         )
         """)
+
+
+async def m053_create_arkade_receive_tables(db: Connection):
+    """Public receive mappings and restart-safe indexer evidence."""
+    await db.execute(f"""
+        CREATE TABLE IF NOT EXISTS arkade_receive_requests (
+            native_request_id TEXT PRIMARY KEY,
+            account_id TEXT NOT NULL REFERENCES accounts (id),
+            wallet_id TEXT NOT NULL REFERENCES wallets (id),
+            idempotency_key TEXT NOT NULL,
+            amount_sat {db.big_int} NOT NULL
+                CHECK (amount_sat > 0 AND amount_sat <= 2100000000000000),
+            "index" INT CHECK ("index" >= 0 AND "index" <= 2147483647),
+            address TEXT,
+            script TEXT,
+            child_xonly_pubkey TEXT,
+            network TEXT NOT NULL,
+            server_url TEXT NOT NULL,
+            server_pubkey TEXT NOT NULL,
+            expires_at TIMESTAMP NOT NULL,
+            state TEXT NOT NULL CHECK (
+                state IN ('pending', 'acknowledged', 'settled',
+                          'reconciliation_required')
+            ),
+            settled_at TIMESTAMP,
+            created_at TIMESTAMP NOT NULL DEFAULT {db.timestamp_now},
+            updated_at TIMESTAMP NOT NULL DEFAULT {db.timestamp_now},
+            UNIQUE (account_id, "index"),
+            UNIQUE (account_id, idempotency_key),
+            UNIQUE (script),
+            UNIQUE (address),
+            CHECK (
+                (state = 'pending' AND "index" IS NULL AND address IS NULL
+                 AND script IS NULL AND child_xonly_pubkey IS NULL
+                )
+                OR
+                (state <> 'pending' AND "index" IS NOT NULL
+                 AND address IS NOT NULL AND script IS NOT NULL
+                 AND child_xonly_pubkey IS NOT NULL)
+            )
+        )
+        """)
+    await db.execute(f"""
+        CREATE TABLE IF NOT EXISTS arkade_receive_outpoints (
+            account_id TEXT NOT NULL REFERENCES accounts (id),
+            native_request_id TEXT REFERENCES arkade_receive_requests
+                (native_request_id),
+            txid TEXT NOT NULL,
+            vout {db.big_int} NOT NULL CHECK (vout >= 0 AND vout <= 4294967295),
+            amount_sat {db.big_int} NOT NULL
+                CHECK (amount_sat > 0 AND amount_sat <= 2100000000000000),
+            script TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (
+                status IN ('valid', 'unattributed', 'conflict')
+            ),
+            is_preconfirmed BOOLEAN NOT NULL DEFAULT false,
+            is_spent BOOLEAN NOT NULL DEFAULT false,
+            is_swept BOOLEAN NOT NULL DEFAULT false,
+            spent_by TEXT,
+            observed_at TIMESTAMP NOT NULL DEFAULT {db.timestamp_now},
+            UNIQUE (txid, vout)
+        )
+        """)
+    await db.execute(f"""
+        CREATE TABLE IF NOT EXISTS arkade_reconciliation_state (
+            account_id TEXT PRIMARY KEY REFERENCES accounts (id),
+            state TEXT NOT NULL CHECK (state IN ('ok', 'reconciliation_required')),
+            last_error TEXT CHECK (last_error IS NULL OR last_error IN (
+                'ARKADE_OUTPOINT_CONFLICT',
+                'ARKADE_UNATTRIBUTED_VALUE',
+                'ARKADE_RECEIVE_AMOUNT_CONFLICT',
+                'ARKADE_INDEXER_INVALID_RESPONSE',
+                'ARKADE_OUTPOINT_TERMINAL_CONFLICT',
+                'ARKADE_RECONCILIATION_REQUIRED'
+            )),
+            observed_at TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT {db.timestamp_now}
+        )
+        """)

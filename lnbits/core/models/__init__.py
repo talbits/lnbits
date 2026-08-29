@@ -3,6 +3,10 @@ from .arkade import (
     ArkadeEnrollmentBindingResponse,
     ArkadeEnrollmentChallenge,
     ArkadeEnrollmentCompletion,
+    ArkadeIndexerVtxo,
+    ArkadeReceiveAcknowledgement,
+    ArkadeReceiveRequest,
+    ArkadeReconciliation,
 )
 from .audit import AuditEntry, AuditFilters
 from .lnurl import CreateLnurlPayment, CreateLnurlWithdraw
@@ -66,6 +70,10 @@ __all__ = [
     "ArkadeEnrollmentBindingResponse",
     "ArkadeEnrollmentChallenge",
     "ArkadeEnrollmentCompletion",
+    "ArkadeIndexerVtxo",
+    "ArkadeReceiveAcknowledgement",
+    "ArkadeReceiveRequest",
+    "ArkadeReconciliation",
     "AuditEntry",
     "AuditFilters",
     "BalanceDelta",

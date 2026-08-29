@@ -2,20 +2,44 @@ import hashlib
 import re
 from datetime import datetime, timedelta, timezone
 from secrets import token_hex
+from uuid import uuid4
 
+import httpx
+from bech32 import CHARSET, bech32_hrp_expand, bech32_polymod, convertbits
 from coincurve import PublicKeyXOnly
 from sqlalchemy.exc import IntegrityError
 
 from lnbits.core.crud.arkade import (
     complete_arkade_binding,
+    create_arkade_receive_outpoint,
+    create_arkade_receive_request,
     get_arkade_binding,
+    get_arkade_receive_outpoint,
+    get_arkade_receive_request,
+    get_arkade_receive_request_by_idempotency,
+    get_arkade_receive_request_by_script,
+    get_arkade_receive_request_total,
+    get_arkade_receive_requests,
+    get_arkade_reconciliation,
+    mark_arkade_receive_outpoint_conflict,
+    mark_arkade_receive_outpoints_conflict,
+    mark_arkade_receive_request_reconciliation_required,
+    settle_arkade_receive_request,
     update_arkade_challenge,
+    update_arkade_receive_acknowledgement,
+    update_arkade_receive_outpoint,
+    update_arkade_receive_outpoint_attribution,
+    update_arkade_reconciliation,
 )
+from lnbits.core.crud.wallets import get_wallet
 from lnbits.core.models import (
     ArkadeAccountBinding,
     ArkadeEnrollmentBindingResponse,
     ArkadeEnrollmentChallenge,
     ArkadeEnrollmentCompletion,
+    ArkadeIndexerVtxo,
+    ArkadeReceiveAcknowledgement,
+    ArkadeReceiveRequest,
 )
 from lnbits.core.models.users import Account
 from lnbits.db import Connection
@@ -27,9 +51,28 @@ CHALLENGE_TTL_SECONDS = 10 * 60
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _ID = re.compile(r"^[0-9a-f]{32}$")
 _IDEMPOTENCY = re.compile(r"^[0-9a-f]{32}$")
+_TXID = re.compile(r"^[0-9a-f]{64}$")
+_SCRIPT = re.compile(r"^[0-9a-fA-F]+$")
+RECEIVE_ACTION = "lnbits-arkade-receive-v1"
+MAX_AMOUNT_SAT = 2_100_000_000_000_000
+MAX_VOUT = 4_294_967_295
+_TAPROOT_UNSPENDABLE_KEY = bytes.fromhex(
+    "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0"
+)
+ARKADE_HRPS = {
+    "bitcoin": "ark",
+    "testnet": "tark",
+    "signet": "tark",
+    "mutinynet": "tark",
+    "regtest": "tark",
+}
 
 
 class ArkadeEnrollmentError(ValueError):
+    pass
+
+
+class ArkadeReceiveError(ValueError):
     pass
 
 
@@ -291,3 +334,612 @@ async def require_arkade_payments_unavailable(
     await require_arkade_ready(account_id, conn=conn)
     if settings.lnbits_effective_installation_mode == "arkade_noncustodial":
         raise ArkadeEnrollmentError("ARKADE_PAYMENTS_UNAVAILABLE")
+
+
+def canonical_receive_statement(data: ArkadeReceiveAcknowledgement) -> str:
+    """The browser signs this exact public allocation statement."""
+    values = (
+        ("account_id", data.account_id),
+        ("wallet_id", data.wallet_id),
+        ("native_request_id", data.native_request_id),
+        ("idempotency_key", data.idempotency_key),
+        ("amount_sat", str(data.amount_sat)),
+        ("index", str(data.index)),
+        ("address", data.address),
+        ("script", data.script),
+        ("child_xonly_pubkey", data.child_xonly_pubkey),
+        ("network", data.network),
+        ("server_url", data.server_url),
+        ("server_pubkey", data.server_pubkey),
+        ("expires_at", str(data.expires_at)),
+    )
+    if any("\n" in value or "\r" in value for _, value in values):
+        raise ArkadeReceiveError("ARKADE_RECEIVE_INVALID_STATEMENT")
+    try:
+        statement = "\n".join(
+            [f"action={RECEIVE_ACTION}"] + [f"{key}={value}" for key, value in values]
+        )
+        statement.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise ArkadeReceiveError("ARKADE_RECEIVE_INVALID_STATEMENT") from exc
+    return statement
+
+
+def verify_receive_proof(data: ArkadeReceiveAcknowledgement) -> None:
+    if len(data.script) % 2 or not _SCRIPT.fullmatch(data.script):
+        raise ArkadeReceiveError("ARKADE_RECEIVE_INVALID_MAPPING")
+    try:
+        public_key = PublicKeyXOnly(bytes.fromhex(data.child_xonly_pubkey))
+        digest = hashlib.sha256(
+            canonical_receive_statement(data).encode("ascii")
+        ).digest()
+        valid = public_key.verify(bytes.fromhex(data.signature), digest)
+    except (ValueError, TypeError):
+        valid = False
+    if not valid:
+        raise ArkadeReceiveError("ARKADE_RECEIVE_INVALID_PROOF")
+
+
+def _tagged_hash(tag: str, payload: bytes) -> bytes:
+    tag_hash = hashlib.sha256(tag.encode("ascii")).digest()
+    return hashlib.sha256(tag_hash + tag_hash + payload).digest()
+
+
+def verify_receive_exit_membership(  # noqa: C901
+    data: ArkadeReceiveAcknowledgement,
+) -> None:
+    """Bind the SDK-provided DefaultVtxo exit leaf to the submitted output.
+
+    This checks only the two-leaf membership witness; it deliberately does not
+    recreate the Ark tree or infer HD lineage from the child key.
+    """
+    try:
+        tapleaf = bytes.fromhex(data.exit_tapleaf)
+        control = bytes.fromhex(data.exit_control_block)
+    except ValueError as exc:
+        raise ArkadeReceiveError("ARKADE_RECEIVE_INVALID_MAPPING") from exc
+    if len(control) != 65 or len(tapleaf) < 38 or len(tapleaf) > 43:
+        raise ArkadeReceiveError("ARKADE_RECEIVE_INVALID_MAPPING")
+    if control[0] & 0xFE != 0xC0 or tapleaf[-1] != 0xC0:
+        raise ArkadeReceiveError("ARKADE_RECEIVE_INVALID_MAPPING")
+    body = tapleaf[:-1]
+    if not 37 <= len(body) <= 42:
+        raise ArkadeReceiveError("ARKADE_RECEIVE_INVALID_MAPPING")
+    opcode = body[0]
+    if opcode == 0:
+        sequence = 0
+        offset = 1
+    elif 0x51 <= opcode <= 0x60:
+        sequence = opcode - 0x50
+        offset = 1
+    elif 1 <= opcode <= 5:
+        offset = 1 + opcode
+        number = body[1:offset]
+        if len(number) != opcode or number[-1] & 0x80:
+            raise ArkadeReceiveError("ARKADE_RECEIVE_INVALID_MAPPING")
+        if opcode == 1 and number[0] <= 16:
+            raise ArkadeReceiveError("ARKADE_RECEIVE_INVALID_MAPPING")
+        if int.from_bytes(number, "little") == 0 or (
+            opcode > 1 and number[-1] == 0 and not number[-2] & 0x80
+        ):
+            raise ArkadeReceiveError("ARKADE_RECEIVE_INVALID_MAPPING")
+        sequence = int.from_bytes(number, "little")
+    else:
+        raise ArkadeReceiveError("ARKADE_RECEIVE_INVALID_MAPPING")
+    if sequence > 0xFFFFFFFF:
+        raise ArkadeReceiveError("ARKADE_RECEIVE_INVALID_MAPPING")
+    try:
+        child = bytes.fromhex(data.child_xonly_pubkey)
+        output = bytes.fromhex(data.script)
+        internal = PublicKeyXOnly(control[1:33])
+    except (TypeError, ValueError) as exc:
+        raise ArkadeReceiveError("ARKADE_RECEIVE_INVALID_MAPPING") from exc
+    if body[offset:] != b"\xb2\x75\x20" + child + b"\xac":
+        raise ArkadeReceiveError("ARKADE_RECEIVE_INVALID_MAPPING")
+    if control[1:33] != _TAPROOT_UNSPENDABLE_KEY:
+        raise ArkadeReceiveError("ARKADE_RECEIVE_INVALID_MAPPING")
+    leaf_hash = _tagged_hash("TapLeaf", b"\xc0" + bytes([len(body)]) + body)
+    sibling = control[33:]
+    branch = _tagged_hash(
+        "TapBranch", min(leaf_hash, sibling) + max(leaf_hash, sibling)
+    )
+    try:
+        internal.tweak_add(_tagged_hash("TapTweak", internal.format() + branch))
+    except ValueError as exc:
+        raise ArkadeReceiveError("ARKADE_RECEIVE_INVALID_MAPPING") from exc
+    if internal.format() != output[2:]:
+        raise ArkadeReceiveError("ARKADE_RECEIVE_INVALID_MAPPING")
+    if internal.parity != bool(control[0] & 1):
+        raise ArkadeReceiveError("ARKADE_RECEIVE_INVALID_MAPPING")
+
+
+def validate_arkade_address_script(
+    address: str,
+    script: str,
+    server_pubkey: str,
+    expected_hrp: str,
+) -> None:
+    """Validate only the generic ArkAddress envelope and v1 pkScript.
+
+    The pinned SDK's ArkAddress format is bech32m(version || server key ||
+    taproot output key).  The ACK path additionally checks the SDK canonical
+    exit leaf and BIP341 membership against that output key; full Ark tree and
+    HD lineage validation remain outside this generic envelope parser.
+    """
+    if address != address.lower() or len(address) > 1023:
+        raise ArkadeReceiveError("ARKADE_RECEIVE_INVALID_MAPPING")
+    separator = address.rfind("1")
+    if separator < 1 or separator + 7 > len(address):
+        raise ArkadeReceiveError("ARKADE_RECEIVE_INVALID_MAPPING")
+    hrp = address[:separator]
+    if hrp != expected_hrp or any(
+        ord(char) < 33 or ord(char) > 126 for char in address
+    ):
+        raise ArkadeReceiveError("ARKADE_RECEIVE_INVALID_MAPPING")
+    try:
+        words = [CHARSET.index(char) for char in address[separator + 1 :]]
+    except ValueError as exc:
+        raise ArkadeReceiveError("ARKADE_RECEIVE_INVALID_MAPPING") from exc
+    if bech32_polymod(bech32_hrp_expand(hrp) + words) != 0x2BC830A3:
+        raise ArkadeReceiveError("ARKADE_RECEIVE_INVALID_MAPPING")
+    payload = convertbits(words[:-6], 5, 8, False)
+    if payload is None or len(payload) != 65 or payload[0] != 0:
+        raise ArkadeReceiveError("ARKADE_RECEIVE_INVALID_MAPPING")
+    if bytes(payload[1:33]).hex() != server_pubkey:
+        raise ArkadeReceiveError("ARKADE_RECEIVE_INVALID_MAPPING")
+    expected_script = "5120" + bytes(payload[33:]).hex()
+    if script != expected_script:
+        raise ArkadeReceiveError("ARKADE_RECEIVE_INVALID_MAPPING")
+
+
+def _request_mapping_matches(
+    request: ArkadeReceiveRequest, data: ArkadeReceiveAcknowledgement
+) -> bool:
+    return all(
+        (
+            request.account_id == data.account_id,
+            request.wallet_id == data.wallet_id,
+            request.native_request_id == data.native_request_id,
+            request.idempotency_key == data.idempotency_key,
+            request.amount_sat == data.amount_sat,
+            request.index == data.index,
+            request.address == data.address,
+            request.script == data.script,
+            request.child_xonly_pubkey == data.child_xonly_pubkey,
+            request.network == data.network,
+            request.server_url == data.server_url,
+            request.server_pubkey == data.server_pubkey,
+            int(request.expires_at.timestamp()) == data.expires_at,
+        )
+    )
+
+
+def _outpoint_matches(
+    row: dict,
+    account_id: str,
+    request_id: str | None,
+    vtxo: ArkadeIndexerVtxo,
+) -> bool:
+    return (
+        row["account_id"] == account_id
+        and row["native_request_id"] == request_id
+        and row["script"] == vtxo.script
+        and int(row["amount_sat"]) == vtxo.amount_sat
+    )
+
+
+async def create_arkade_receive_request_for_account(
+    account_id: str,
+    *,
+    wallet_id: str,
+    amount_sat: int,
+    idempotency_key: str,
+    expires_at: datetime,
+    conn: Connection | None = None,
+) -> ArkadeReceiveRequest:
+    if settings.lnbits_effective_installation_mode != "arkade_noncustodial":
+        raise ArkadeReceiveError("ARKADE_RECEIVE_UNAVAILABLE")
+    await require_arkade_ready(account_id, conn=conn)
+    if not isinstance(idempotency_key, str) or not _IDEMPOTENCY.fullmatch(
+        idempotency_key
+    ):
+        raise ArkadeReceiveError("ARKADE_RECEIVE_INVALID_IDEMPOTENCY")
+    if amount_sat < 1 or amount_sat > MAX_AMOUNT_SAT:
+        raise ArkadeReceiveError("ARKADE_RECEIVE_INVALID_AMOUNT")
+    wallet = await get_wallet(wallet_id, conn=conn)
+    if not wallet or wallet.id != wallet_id or wallet.user != account_id:
+        raise ArkadeReceiveError("ARKADE_WALLET_NOT_OWNED")
+    existing = await get_arkade_receive_request_by_idempotency(
+        account_id, idempotency_key, conn=conn
+    )
+    if existing:
+        if existing.wallet_id != wallet_id or existing.amount_sat != amount_sat:
+            raise ArkadeReceiveError("ARKADE_RECEIVE_IDEMPOTENCY_CONFLICT")
+        return existing
+    binding = await get_arkade_binding(account_id, conn=conn)
+    if not binding or binding.state != "ready":
+        raise ArkadeReceiveError("ARKADE_ENROLLMENT_REQUIRED")
+    now = datetime.now(timezone.utc)
+    request = ArkadeReceiveRequest(
+        account_id=account_id,
+        wallet_id=wallet_id,
+        native_request_id=uuid4().hex,
+        idempotency_key=idempotency_key,
+        amount_sat=amount_sat,
+        network=binding.network,
+        server_url=binding.server_url,
+        server_pubkey=binding.server_pubkey,
+        expires_at=expires_at,
+        created_at=now,
+        updated_at=now,
+    )
+    created = await create_arkade_receive_request(request, conn=conn)
+    if not created:
+        winner = await get_arkade_receive_request_by_idempotency(
+            account_id, idempotency_key, conn=conn
+        )
+        if winner and winner.wallet_id == wallet_id and winner.amount_sat == amount_sat:
+            return winner
+        raise ArkadeReceiveError("ARKADE_RECEIVE_IDEMPOTENCY_CONFLICT")
+    return request
+
+
+async def acknowledge_arkade_receive(  # noqa: C901
+    account_id: str,
+    data: ArkadeReceiveAcknowledgement,
+    conn: Connection | None = None,
+) -> ArkadeReceiveRequest:
+    if settings.lnbits_effective_installation_mode != "arkade_noncustodial":
+        raise ArkadeReceiveError("ARKADE_RECEIVE_UNAVAILABLE")
+    await require_arkade_ready(account_id, conn=conn)
+    if data.account_id != account_id:
+        raise ArkadeReceiveError("ARKADE_RECEIVE_ACCOUNT_MISMATCH")
+    request = await get_arkade_receive_request(data.native_request_id, conn=conn)
+    if not request or request.account_id != account_id:
+        raise ArkadeReceiveError("ARKADE_RECEIVE_NOT_FOUND")
+    mapping = request
+    if request.state == "pending":
+        mapping = request.copy(
+            update={
+                "index": data.index,
+                "address": data.address,
+                "script": data.script,
+                "child_xonly_pubkey": data.child_xonly_pubkey,
+            }
+        )
+    if not _request_mapping_matches(mapping, data):
+        raise ArkadeReceiveError("ARKADE_RECEIVE_MAPPING_CONFLICT")
+    if data.script != data.script.lower():
+        raise ArkadeReceiveError("ARKADE_RECEIVE_INVALID_MAPPING")
+    if data.expires_at != int(request.expires_at.timestamp()):
+        raise ArkadeReceiveError("ARKADE_RECEIVE_MAPPING_CONFLICT")
+    expected_hrp = ARKADE_HRPS.get(request.network)
+    if not expected_hrp:
+        raise ArkadeReceiveError("ARKADE_RECEIVE_INVALID_MAPPING")
+    validate_arkade_address_script(
+        data.address, data.script, request.server_pubkey, expected_hrp
+    )
+    verify_receive_proof(data)
+    verify_receive_exit_membership(data)
+    if request.state != "pending":
+        return request
+    try:
+        updated = await update_arkade_receive_acknowledgement(
+            request,
+            index=data.index,
+            address=data.address,
+            script=data.script.lower(),
+            child_xonly_pubkey=data.child_xonly_pubkey,
+            conn=conn,
+        )
+    except IntegrityError as exc:
+        raise ArkadeReceiveError("ARKADE_RECEIVE_MAPPING_CONFLICT") from exc
+    if not updated:
+        winner = await get_arkade_receive_request(data.native_request_id, conn=conn)
+        if winner and _request_mapping_matches(winner, data):
+            return winner
+        raise ArkadeReceiveError("ARKADE_RECEIVE_MAPPING_CONFLICT")
+    result = await get_arkade_receive_request(data.native_request_id, conn=conn)
+    if not result:
+        raise ArkadeReceiveError("ARKADE_RECEIVE_UNAVAILABLE")
+    return result
+
+
+def parse_indexer_vtxos(body: object) -> list[ArkadeIndexerVtxo]:
+    if not isinstance(body, dict) or not isinstance(body.get("vtxos"), list):
+        raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
+    _validate_indexer_page(body.get("page"))
+    parsed: list[ArkadeIndexerVtxo] = []
+    for raw in body["vtxos"]:
+        if not isinstance(raw, dict) or not isinstance(raw.get("outpoint"), dict):
+            raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
+        outpoint = raw["outpoint"]
+        txid, vout, amount, script = (
+            outpoint.get("txid"),
+            outpoint.get("vout"),
+            raw.get("amount"),
+            raw.get("script"),
+        )
+        if (
+            not isinstance(txid, str)
+            or not _TXID.fullmatch(txid)
+            or isinstance(vout, bool)
+            or not isinstance(vout, int)
+            or vout < 0
+            or vout > MAX_VOUT
+            or not isinstance(amount, str)
+            or not amount.isdecimal()
+            or not 0 < int(amount) <= MAX_AMOUNT_SAT
+            or not isinstance(script, str)
+            or len(script) % 2
+            or not _SCRIPT.fullmatch(script)
+        ):
+            raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
+        status_keys = ("isPreconfirmed", "isSpent", "isSwept")
+        if any(key not in raw for key in status_keys):
+            raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
+        flags = {key: raw[key] for key in status_keys}
+        if any(not isinstance(value, bool) for value in flags.values()):
+            raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
+        raw_spent_by = raw.get("spentBy")
+        if raw_spent_by is None or raw_spent_by == "":
+            spent_by = None
+        elif isinstance(raw_spent_by, str) and _TXID.fullmatch(raw_spent_by):
+            spent_by = raw_spent_by
+        else:
+            raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
+        parsed.append(
+            ArkadeIndexerVtxo(
+                txid=txid,
+                vout=vout,
+                amount_sat=int(amount),
+                script=script.lower(),
+                is_preconfirmed=flags["isPreconfirmed"],
+                is_spent=flags["isSpent"] or bool(spent_by),
+                is_swept=flags["isSwept"],
+                spent_by=spent_by,
+            )
+        )
+    return parsed
+
+
+def _validate_indexer_page(page: object) -> None:
+    if page is None:
+        return
+    if not isinstance(page, dict):
+        raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
+    current, next_page, total = (
+        page.get("current"),
+        page.get("next"),
+        page.get("total"),
+    )
+    if (
+        not isinstance(current, int)
+        or isinstance(current, bool)
+        or not isinstance(next_page, int)
+        or isinstance(next_page, bool)
+        or not isinstance(total, int)
+        or isinstance(total, bool)
+    ):
+        raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
+    if current < 0 or next_page < 0 or total < 0 or current > total:
+        raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
+    if next_page <= current and current < total:
+        raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
+    if next_page > total:
+        raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
+
+
+async def fetch_arkade_indexer_vtxos(  # noqa: C901
+    account_id: str, conn: Connection | None = None
+) -> list[ArkadeIndexerVtxo]:
+    binding = await get_arkade_binding(account_id, conn=conn)
+    if not binding or binding.state != "ready":
+        raise ArkadeReceiveError("ARKADE_ENROLLMENT_REQUIRED")
+    requests = await get_arkade_receive_requests(account_id, conn=conn)
+    scripts = sorted({request.script for request in requests if request.script})
+    if not scripts:
+        return []
+    result: list[ArkadeIndexerVtxo] = []
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            for offset in range(0, len(scripts), 32):
+                chunk = scripts[offset : offset + 32]
+                page_index = 0
+                seen_pages: set[int] = set()
+                while True:
+                    if page_index in seen_pages:
+                        raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
+                    seen_pages.add(page_index)
+                    params = tuple(
+                        [("scripts", script) for script in chunk]
+                        + [("page.index", str(page_index)), ("page.size", "500")]
+                    )
+                    response = await client.get(
+                        f"{binding.server_url}/v1/indexer/vtxos", params=params
+                    )
+                    response.raise_for_status()
+                    try:
+                        body = response.json()
+                    except ValueError as exc:
+                        raise ArkadeReceiveError(
+                            "ARKADE_INDEXER_INVALID_RESPONSE"
+                        ) from exc
+                    result.extend(parse_indexer_vtxos(body))
+                    page = body.get("page") if isinstance(body, dict) else None
+                    if page is None:
+                        raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
+                    _validate_indexer_page(page)
+                    if page["current"] >= page["total"]:
+                        break
+                    page_index = page["next"]
+    except httpx.HTTPError as exc:
+        raise ArkadeReceiveError("ARKADE_INDEXER_UNAVAILABLE") from exc
+    except ArkadeReceiveError as exc:
+        if str(exc) == "ARKADE_INDEXER_INVALID_RESPONSE":
+            await _mark_receive_reconciliation_required(
+                account_id, "ARKADE_INDEXER_INVALID_RESPONSE", conn=conn
+            )
+        raise
+    return result
+
+
+async def _mark_receive_reconciliation_required(
+    account_id: str,
+    reason: str,
+    request_id: str | None = None,
+    conn: Connection | None = None,
+) -> None:
+    if request_id:
+        await mark_arkade_receive_request_reconciliation_required(request_id, conn=conn)
+    await update_arkade_reconciliation(
+        account_id,
+        state="reconciliation_required",
+        last_error=reason,
+        conn=conn,
+    )
+
+
+async def reconcile_arkade_receive(  # noqa: C901
+    account_id: str,
+    evidence: list[ArkadeIndexerVtxo],
+    *,
+    conn: Connection | None = None,
+) -> None:
+    if settings.lnbits_effective_installation_mode != "arkade_noncustodial":
+        raise ArkadeReceiveError("ARKADE_RECEIVE_UNAVAILABLE")
+    await require_arkade_ready(account_id, conn=conn)
+    previous_state = await get_arkade_reconciliation(account_id, conn=conn)
+    required = bool(
+        previous_state and previous_state.state == "reconciliation_required"
+    )
+    last_error = (
+        previous_state.last_error
+        if required and previous_state and previous_state.last_error
+        else None
+    )
+    for vtxo in evidence:
+        request = await get_arkade_receive_request_by_script(
+            account_id, vtxo.script, conn=conn
+        )
+        existing = await get_arkade_receive_outpoint(vtxo.txid, vtxo.vout, conn=conn)
+        if existing:
+            if (
+                existing.get("spent_by")
+                and vtxo.spent_by
+                and existing["spent_by"] != vtxo.spent_by
+            ):
+                required = True
+                last_error = "ARKADE_OUTPOINT_TERMINAL_CONFLICT"
+                await mark_arkade_receive_outpoint_conflict(
+                    vtxo.txid, vtxo.vout, account_id, conn=conn
+                )
+                continue
+            if (
+                existing["account_id"] == account_id
+                and existing["native_request_id"] is None
+                and existing["status"] != "conflict"
+                and request
+                and existing["script"] == vtxo.script
+                and int(existing["amount_sat"]) == vtxo.amount_sat
+            ):
+                await update_arkade_receive_outpoint_attribution(
+                    vtxo.txid, vtxo.vout, request.native_request_id, conn=conn
+                )
+                await update_arkade_receive_outpoint(vtxo, conn=conn)
+                continue
+            if (
+                existing["account_id"] != account_id
+                or existing["script"] != vtxo.script
+                or int(existing["amount_sat"]) != vtxo.amount_sat
+                or existing["native_request_id"]
+                != (request.native_request_id if request else None)
+            ):
+                required = True
+                last_error = "ARKADE_OUTPOINT_CONFLICT"
+                await mark_arkade_receive_outpoint_conflict(
+                    vtxo.txid, vtxo.vout, account_id, conn=conn
+                )
+                continue
+            await update_arkade_receive_outpoint(vtxo, conn=conn)
+            continue
+        if not request:
+            required = True
+            last_error = "ARKADE_UNATTRIBUTED_VALUE"
+            created = await create_arkade_receive_outpoint(
+                account_id=account_id,
+                native_request_id=None,
+                vtxo=vtxo,
+                status="unattributed",
+                conn=conn,
+            )
+            if not created:
+                winner = await get_arkade_receive_outpoint(
+                    vtxo.txid, vtxo.vout, conn=conn
+                )
+                if winner and _outpoint_matches(winner, account_id, None, vtxo):
+                    await update_arkade_receive_outpoint(vtxo, conn=conn)
+                else:
+                    last_error = "ARKADE_OUTPOINT_CONFLICT"
+                    await mark_arkade_receive_outpoint_conflict(
+                        vtxo.txid, vtxo.vout, account_id, conn=conn
+                    )
+            continue
+        created = await create_arkade_receive_outpoint(
+            account_id=account_id,
+            native_request_id=request.native_request_id,
+            vtxo=vtxo,
+            status="valid",
+            conn=conn,
+        )
+        if not created:
+            winner = await get_arkade_receive_outpoint(vtxo.txid, vtxo.vout, conn=conn)
+            if winner and _outpoint_matches(
+                winner, account_id, request.native_request_id, vtxo
+            ):
+                await update_arkade_receive_outpoint(vtxo, conn=conn)
+            else:
+                required = True
+                last_error = "ARKADE_OUTPOINT_CONFLICT"
+                await mark_arkade_receive_outpoint_conflict(
+                    vtxo.txid, vtxo.vout, account_id, conn=conn
+                )
+    requests = await get_arkade_receive_requests(account_id, conn=conn)
+    for request in requests:
+        if request.state == "reconciliation_required":
+            required = True
+            last_error = last_error or "ARKADE_RECONCILIATION_REQUIRED"
+            continue
+        total = await get_arkade_receive_request_total(
+            request.native_request_id, conn=conn
+        )
+        if total > request.amount_sat:
+            required = True
+            last_error = "ARKADE_RECEIVE_AMOUNT_CONFLICT"
+            await mark_arkade_receive_outpoints_conflict(
+                request.native_request_id, conn=conn
+            )
+            await _mark_receive_reconciliation_required(
+                account_id,
+                "ARKADE_RECEIVE_AMOUNT_CONFLICT",
+                request.native_request_id,
+                conn,
+            )
+        elif total == request.amount_sat and request.state in {
+            "acknowledged",
+            "settled",
+        }:
+            if request.state != "settled":
+                now = datetime.now(timezone.utc)
+                # P2-8 owns the native payment/credit seam. P2-7 only records
+                # accepted indexer evidence and never writes apipayments or balances.
+                await settle_arkade_receive_request(
+                    request.native_request_id, now, conn=conn
+                )
+    state = "reconciliation_required" if required else "ok"
+    await update_arkade_reconciliation(
+        account_id,
+        state=state,
+        last_error=last_error if required else None,
+        conn=conn,
+    )
