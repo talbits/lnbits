@@ -308,11 +308,12 @@ async def lnurlwallet(request: Request, lightning: str = ""):
         amount=withdraw.maxWithdrawable / 1000,
         memo=withdraw.defaultDescription or "lnurl wallet withdraw",
     )
+    _, _, bolt11 = payment.lightning_identifiers
 
     try:
         await execute_withdraw(
             withdraw,
-            payment.bolt11,
+            bolt11,
             user_agent=settings.user_agent,
             timeout=5,
         )

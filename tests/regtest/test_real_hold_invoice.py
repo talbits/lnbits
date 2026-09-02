@@ -99,6 +99,7 @@ async def test_settle_real_hold_invoice(app, from_wallet):
         await settle_hold_invoice(payment=payment, preimage=preimage)
 
     def pay_invoice():
+        assert payment.bolt11 is not None
         pay_real_invoice(payment.bolt11)
 
     async def settle():

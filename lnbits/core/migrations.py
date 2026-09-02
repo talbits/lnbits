@@ -6,7 +6,7 @@ from loguru import logger
 from sqlalchemy.exc import OperationalError
 
 from lnbits import bolt11
-from lnbits.db import Connection
+from lnbits.db import SQLITE, Connection
 
 
 async def m000_create_migrations_table(db: Connection):
@@ -1025,3 +1025,155 @@ async def m053_create_arkade_receive_tables(db: Connection):
             updated_at TIMESTAMP NOT NULL DEFAULT {db.timestamp_now}
         )
         """)
+
+
+async def m054_add_payment_protocol_identity(db: Connection):
+    """Add protocol-specific payment identity atomically."""
+    async with db.transaction():
+        await _m054_add_payment_protocol_identity(db)
+
+
+async def _m054_add_payment_protocol_identity(
+    db: Connection,
+):
+    """Add protocol-specific identity fields to payments."""
+    if db.type != SQLITE:
+        await db.execute(
+            "ALTER TABLE apipayments ALTER COLUMN checking_id DROP NOT NULL"
+        )
+        await db.execute(
+            "ALTER TABLE apipayments ADD COLUMN protocol TEXT NOT NULL "
+            "DEFAULT 'lightning'"
+        )
+        await db.execute("ALTER TABLE apipayments ADD COLUMN native_id TEXT")
+        await db.execute("ALTER TABLE apipayments ADD COLUMN arkade_address TEXT")
+        await db.execute(
+            "UPDATE apipayments SET native_id = checking_id "
+            "WHERE protocol = 'lightning'"
+        )
+        await db.execute("""
+            ALTER TABLE apipayments ADD CONSTRAINT apipayments_protocol_identity
+            CHECK (
+                (protocol = 'lightning' AND checking_id IS NOT NULL
+                 AND arkade_address IS NULL)
+                OR
+                (protocol = 'arkade' AND native_id IS NOT NULL
+                 AND checking_id IS NULL AND bolt11 IS NULL
+                 AND payment_hash IS NULL)
+            )
+        """)
+        await db.execute("""
+            CREATE UNIQUE INDEX idx_payments_arkade_native_id
+            ON apipayments (native_id)
+            WHERE protocol = 'arkade' AND native_id IS NOT NULL
+        """)
+        return
+
+    # SQLite cannot drop NOT NULL from an existing column, so rebuild this
+    # table while preserving the current payment data and indexes.
+    await db.execute("DROP VIEW IF EXISTS balances")
+    for index in [
+        "by_hash",
+        "idx_payments_wallet_id",
+        "idx_payments_checking_id",
+        "idx_payments_payment_hash",
+        "idx_payments_amount",
+        "idx_payments_fee",
+        "idx_payments_labels",
+        "idx_payments_time",
+        "idx_payments_status",
+        "idx_payments_memo",
+        "idx_payments_created_at",
+        "idx_payments_updated_at",
+        "idx_payments_external_id",
+    ]:
+        await db.execute(f"DROP INDEX IF EXISTS {index}")
+
+    await db.execute(f"""
+        CREATE TABLE apipayments_new (
+            checking_id TEXT,
+            amount {db.big_int} NOT NULL,
+            fee INTEGER NOT NULL DEFAULT 0,
+            wallet_id TEXT NOT NULL,
+            memo TEXT,
+            time TIMESTAMP NOT NULL DEFAULT {db.timestamp_now},
+            payment_hash TEXT,
+            preimage TEXT,
+            bolt11 TEXT,
+            extra TEXT,
+            webhook TEXT,
+            webhook_status TEXT,
+            expiry TIMESTAMP,
+            status TEXT DEFAULT 'pending',
+            tag TEXT,
+            extension TEXT,
+            created_at TIMESTAMP,
+            updated_at TIMESTAMP,
+            fiat_provider TEXT,
+            labels TEXT,
+            external_id TEXT,
+            protocol TEXT NOT NULL DEFAULT 'lightning'
+                CHECK (protocol IN ('lightning', 'arkade')),
+            native_id TEXT,
+            arkade_address TEXT,
+            UNIQUE (wallet_id, checking_id),
+            CHECK (
+                (protocol = 'lightning' AND checking_id IS NOT NULL
+                 AND arkade_address IS NULL)
+                OR
+                (protocol = 'arkade' AND native_id IS NOT NULL
+                 AND checking_id IS NULL AND bolt11 IS NULL
+                 AND payment_hash IS NULL)
+            )
+        )
+    """)
+    await db.execute("""
+        INSERT INTO apipayments_new (
+            checking_id, amount, fee, wallet_id, memo, time, payment_hash,
+            preimage, bolt11, extra, webhook, webhook_status, expiry, status,
+            tag, extension, created_at, updated_at, fiat_provider, labels,
+            external_id, protocol, native_id, arkade_address
+        )
+        SELECT checking_id, amount, fee, wallet_id, memo, time, payment_hash,
+               preimage, bolt11, extra, webhook, webhook_status, expiry, status,
+               tag, extension, created_at, updated_at, fiat_provider, labels,
+               external_id, 'lightning', checking_id, NULL
+        FROM apipayments
+    """)
+    await db.execute("DROP TABLE apipayments")
+    await db.execute("ALTER TABLE apipayments_new RENAME TO apipayments")
+
+    for index in [
+        "wallet_id",
+        "checking_id",
+        "payment_hash",
+        "amount",
+        "fee",
+        "labels",
+        "time",
+        "status",
+        "memo",
+        "created_at",
+        "updated_at",
+        "external_id",
+    ]:
+        await db.execute(f"CREATE INDEX idx_payments_{index} ON apipayments ({index})")
+    await db.execute("CREATE INDEX by_hash ON apipayments (payment_hash)")
+    await db.execute("""
+        CREATE UNIQUE INDEX idx_payments_arkade_native_id
+        ON apipayments (native_id)
+        WHERE protocol = 'arkade' AND native_id IS NOT NULL
+    """)
+    await db.execute("""
+        CREATE VIEW balances AS
+        SELECT apipayments.wallet_id,
+               SUM(apipayments.amount - ABS(apipayments.fee)) AS balance
+        FROM wallets
+        LEFT JOIN apipayments ON apipayments.wallet_id = wallets.id
+        WHERE (wallets.deleted = false OR wallets.deleted is NULL)
+        AND (
+            (apipayments.status = 'success' AND apipayments.amount > 0)
+            OR (apipayments.status IN ('success', 'pending') AND apipayments.amount < 0)
+        )
+        GROUP BY apipayments.wallet_id
+    """)

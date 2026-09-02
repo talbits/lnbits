@@ -611,6 +611,12 @@
       >
       </lnbits-qrcode>
       <lnbits-qrcode
+        v-else-if="receive.protocol === 'arkade'"
+        :href="receive.paymentReq"
+        :value="receive.paymentReq"
+      >
+      </lnbits-qrcode>
+      <lnbits-qrcode
         v-else-if="!isFiatWallet"
         :href="'lightning:' + receive.paymentReq"
         :value="'LIGHTNING:' + receive.paymentReq.toUpperCase()"
@@ -620,6 +626,7 @@
         v-if="
           !isFiatWallet &&
           !receive.fiatPaymentReq &&
+          receive.protocol !== 'arkade' &&
           g.settings.enableWalletLightningAddresses &&
           g.wallet.lightningAddressFull
         "
@@ -655,7 +662,13 @@
         >
           <span v-text="formattedSatAmount"></span>
         </h5>
-        <div v-if="!isFiatWallet && !receive.fiatPaymentReq">
+        <div
+          v-if="
+            !isFiatWallet &&
+            !receive.fiatPaymentReq &&
+            receive.protocol !== 'arkade'
+          "
+        >
           <q-chip v-if="hasNfc" outline square color="positive">
             <q-avatar icon="nfc" color="positive" text-color="white"></q-avatar>
             <span v-text="$t('nfc_supported')"></span>

@@ -138,6 +138,26 @@ class Connection(Compat):
         self.type = typ
         self.name = name
         self.schema = schema
+        self._autocommit = True
+
+    @asynccontextmanager
+    async def transaction(self):
+        if not self._autocommit:
+            raise RuntimeError("Nested transactions are not supported")
+        if self.conn.in_transaction():
+            await self.conn.commit()
+        await self.conn.exec_driver_sql("BEGIN")
+        autocommit = self._autocommit
+        self._autocommit = False
+        try:
+            yield self
+        except BaseException:
+            await self.conn.rollback()
+            raise
+        else:
+            await self.conn.commit()
+        finally:
+            self._autocommit = autocommit
 
     def rewrite_query(self, query) -> str:
         if self.type in {POSTGRES, COCKROACH}:
@@ -198,13 +218,15 @@ class Connection(Compat):
         await self.conn.execute(
             text(update_query(table_name, model, where)), model_to_dict(model)
         )
-        await self.conn.commit()
+        if self._autocommit:
+            await self.conn.commit()
 
     async def insert(self, table_name: str, model: BaseModel):
         await self.conn.execute(
             text(insert_query(table_name, model)), model_to_dict(model)
         )
-        await self.conn.commit()
+        if self._autocommit:
+            await self.conn.commit()
 
     async def fetch_page(
         self,
@@ -286,7 +308,8 @@ class Connection(Compat):
     async def execute(self, query: str, values: dict | None = None):
         params = self.rewrite_values(values) if values else {}
         result = await self.conn.execute(text(self.rewrite_query(query)), params)
-        await self.conn.commit()
+        if self._autocommit:
+            await self.conn.commit()
         return result
 
 

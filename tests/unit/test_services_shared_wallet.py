@@ -562,6 +562,7 @@ async def test_shared_wallet_view_permissions(from_wallet: Wallet):
             amount=1000 + i * 100,
             memo=f"Test invoice {i}",
         )
+        assert payment.bolt11 is not None
         await pay_invoice(wallet_id=from_wallet.id, payment_request=payment.bolt11)
         wallet_balance += payment.sat
 
@@ -593,6 +594,7 @@ async def test_shared_wallet_view_permissions(from_wallet: Wallet):
         amount=1000,
         memo="Test invoice for payment",
     )
+    assert payment.bolt11 is not None
     with pytest.raises(
         PaymentError, match="Wallet does not have permission to pay invoices."
     ):
@@ -624,6 +626,7 @@ async def test_shared_wallet_no_permissions(from_wallet: Wallet):
         amount=1000,
         memo="Test invoice",
     )
+    assert payment.bolt11 is not None
 
     with pytest.raises(
         InvoiceError, match="Wallet does not have permission to create invoices."
@@ -671,6 +674,7 @@ async def test_shared_wallet_receive_permission(from_wallet: Wallet):
         amount=1000,
         memo="Test invoice",
     )
+    assert payment.bolt11 is not None
     # but not to pay
     await update_wallet_balance(mirror_wallet, 100000)
     with pytest.raises(
@@ -732,6 +736,7 @@ async def test_shared_wallet_send_permission(from_wallet: Wallet):
         amount=1000,
         memo="Test invoice",
     )
+    assert payment.bolt11 is not None
     await update_wallet_balance(mirror_wallet, 100000)
     await pay_invoice(wallet_id=mirror_wallet.id, payment_request=payment.bolt11)
 

@@ -60,6 +60,7 @@ async def test_payment_datetime_fields_have_timezone(app, to_user):
     invoice_data = CreateInvoice(amount=10, memo="timezone_test", out=False)
     invoice = await create_wallet_invoice(wallet.id, invoice_data)
 
+    assert invoice.checking_id is not None
     payment = await get_payment(invoice.checking_id)
     assert payment is not None
 

@@ -78,7 +78,53 @@ type InvoiceProof = {
     outpoint: string
     afterLogicalExpiry: boolean
   }
+  recovery?: {
+    mappedRowsBeforeDeletion: number
+    mappedRowsAfterDeletion: number
+    usedSigningDescriptorCount: number
+    recoveredContractCount: number
+    recoveredDescriptorsExact: boolean
+    recoveredScriptsExact: boolean
+    recoveredAddressesExact: boolean
+    recoveredMetadataExact: boolean
+    watermarkUnchanged: boolean
+    secondRecoveryIdempotent: boolean
+    nextAllocationIndex: number
+    nextAllocationFresh: boolean
+  }
   transportPayloads: string[]
+}
+
+type CompleteLossRecoveryProof = {
+  repositoryName: string
+  priorLocalStorageEntries: number
+  priorIndexedDbNames: string[]
+  freshWalletRepository: boolean
+  freshContractRepository: boolean
+  mappingsUnchanged: boolean
+  publicMappingCount: number
+  enumeratedDescriptorCount: number
+  firstRecoveryCreatedCount: number
+  recoveredContractCount: number
+  recoveredDescriptorsExact: boolean
+  recoveredScriptsExact: boolean
+  recoveredAddressesExact: boolean
+  recoveredChildKeysExact: boolean
+  recoveredMetadataExact: boolean
+  highestMappedIndex: number
+  watermarkBeforeRecoveryIndex: number
+  watermarkAfterRecoveryIndex: number
+  secondRecoveryCreatedCount: number
+  secondRecoveryWatermarkUnchanged: boolean
+  nextAllocationIndex: number
+  nextAllocationFresh: boolean
+  lateObservation: {
+    nativeRequestId: string
+    mappingIndex: number
+    observedScript: string
+    attributedScript: string
+    outpoint: string
+  }
 }
 
 type ProofInput = {
@@ -110,6 +156,10 @@ declare global {
         serverUrl?: string
       }
     ) => Promise<InvoiceProof>
+    runArkadeCompleteBrowserLossRecoveryProof: (input: {
+      mnemonic: string
+      mappings: InvoiceMapping[]
+    }) => Promise<CompleteLossRecoveryProof>
   }
 }
 
@@ -274,7 +324,7 @@ test('proves descriptor attribution only (no receive intent or funded Wallet)', 
   }
 })
 
-test('proves browser-owned per-invoice allocation and reload attribution', async ({
+test('proves browser-owned allocation, contract-row recovery, and reload attribution', async ({
   browser
 }) => {
   const input = {
@@ -316,10 +366,12 @@ test('proves browser-owned per-invoice allocation and reload attribution', async
     )
 
     expect(first.outstandingUnpaid).toBeGreaterThan(20)
-    expect(first.indices).toEqual([...Array(input.invoiceCount).keys()])
+    expect(first.indices).toEqual(
+      [...Array(input.invoiceCount).keys()].map(index => index + 1)
+    )
     expect(first.uniqueAddresses).toBe(input.invoiceCount)
     expect(first.uniqueScripts).toBe(input.invoiceCount)
-    expect(first.lastIndexUsed).toBe(input.invoiceCount - 1)
+    expect(first.lastIndexUsed).toBe(input.invoiceCount)
     expect(first.contractCount).toBe(input.invoiceCount)
     expect(first.metadataHasSource).toBe(false)
     expect(first.metadataExactlySigningDescriptor).toBe(true)
@@ -327,6 +379,20 @@ test('proves browser-owned per-invoice allocation and reload attribution', async
     expect(first.conflictRejected).toBe(true)
     expect(first.failOnceAfterLocalPersist).toBe(true)
     expect(first.retrySameMapping).toBe(true)
+    expect(first.recovery).toEqual({
+      mappedRowsBeforeDeletion: input.invoiceCount,
+      mappedRowsAfterDeletion: 0,
+      usedSigningDescriptorCount: input.invoiceCount + 1,
+      recoveredContractCount: input.invoiceCount,
+      recoveredDescriptorsExact: true,
+      recoveredScriptsExact: true,
+      recoveredAddressesExact: true,
+      recoveredMetadataExact: true,
+      watermarkUnchanged: true,
+      secondRecoveryIdempotent: true,
+      nextAllocationIndex: input.invoiceCount + 1,
+      nextAllocationFresh: true
+    })
     expect(first.lateObservation).toEqual({
       nativeRequestId: stableInvoiceId(0, 0),
       observedScript: first.mappings[0].script,
@@ -404,8 +470,101 @@ test('proves browser-owned per-invoice allocation and reload attribution', async
     expect(reload.indices).toEqual(first.indices)
     expect(reload.uniqueScripts).toBe(input.invoiceCount)
     expect(reload.contractCount).toBe(input.invoiceCount)
-    expect(reload.lastIndexUsed).toBe(input.invoiceCount - 1)
+    expect(reload.lastIndexUsed).toBe(input.invoiceCount + 1)
     await firstContext.close()
+  } finally {
+    await rm(outputDirectory, {force: true, recursive: true})
+  }
+})
+
+test('proves complete browser loss recovery from mnemonic and public mappings', async ({
+  browser
+}) => {
+  const allocatorInput = {
+    mnemonic,
+    installationId: `complete-loss-installation-${Date.now()}`,
+    accountId: 'account-test',
+    networkName: 'regtest' as const,
+    schemaVersion: '1',
+    invoiceCount: 25
+  }
+  const outputDirectory = await mkdtemp(
+    join(tmpdir(), 'lnbits-arkade-complete-loss-')
+  )
+  const bundlePath = join(outputDirectory, 'arkade-complete-loss.js')
+
+  try {
+    await build({
+      absWorkingDir: projectRoot,
+      bundle: true,
+      entryPoints: [browserSource],
+      format: 'iife',
+      outfile: bundlePath,
+      platform: 'browser',
+      target: 'es2022'
+    })
+
+    const sourceContext = await browser.newContext()
+    const sourcePage = await sourceContext.newPage()
+    await sourcePage.goto('/')
+    await sourcePage.addScriptTag({path: bundlePath})
+    const allocated = await sourcePage.evaluate(
+      value => window.runArkadeInvoiceAllocatorProof(value),
+      allocatorInput
+    )
+    const mappingSnapshot = JSON.stringify(allocated.mappings)
+    const publicJson = JSON.stringify(allocated.mappings)
+    expect(publicJson).not.toMatch(
+      /mnemonic|seed|private.?key|xpub|descriptor|source/i
+    )
+    await sourceContext.close()
+
+    const recoveryContext = await browser.newContext()
+    const recoveryPage = await recoveryContext.newPage()
+    await recoveryPage.goto('/')
+    await recoveryPage.addScriptTag({path: bundlePath})
+    const recovered = await recoveryPage.evaluate(
+      value => window.runArkadeCompleteBrowserLossRecoveryProof(value),
+      {mnemonic, mappings: allocated.mappings}
+    )
+
+    expect(recovered.repositoryName).not.toBe(allocated.repositoryName)
+    expect(recovered.priorLocalStorageEntries).toBe(0)
+    expect(recovered.priorIndexedDbNames).toEqual([])
+    expect(recovered.freshWalletRepository).toBe(true)
+    expect(recovered.freshContractRepository).toBe(true)
+    expect(recovered.mappingsUnchanged).toBe(true)
+    expect(JSON.stringify(allocated.mappings)).toBe(mappingSnapshot)
+    expect(recovered.publicMappingCount).toBe(allocatorInput.invoiceCount)
+    expect(recovered.enumeratedDescriptorCount).toBeGreaterThanOrEqual(
+      allocatorInput.invoiceCount
+    )
+    expect(recovered.firstRecoveryCreatedCount).toBe(
+      allocatorInput.invoiceCount
+    )
+    expect(recovered.recoveredContractCount).toBe(allocatorInput.invoiceCount)
+    expect(recovered.recoveredDescriptorsExact).toBe(true)
+    expect(recovered.recoveredScriptsExact).toBe(true)
+    expect(recovered.recoveredAddressesExact).toBe(true)
+    expect(recovered.recoveredChildKeysExact).toBe(true)
+    expect(recovered.recoveredMetadataExact).toBe(true)
+    expect(recovered.highestMappedIndex).toBe(allocatorInput.invoiceCount)
+    expect(recovered.watermarkBeforeRecoveryIndex).toBe(0)
+    expect(recovered.watermarkAfterRecoveryIndex).toBe(
+      recovered.highestMappedIndex
+    )
+    expect(recovered.secondRecoveryCreatedCount).toBe(0)
+    expect(recovered.secondRecoveryWatermarkUnchanged).toBe(true)
+    expect(recovered.nextAllocationIndex).toBe(recovered.highestMappedIndex + 1)
+    expect(recovered.nextAllocationFresh).toBe(true)
+    expect(recovered.lateObservation).toEqual({
+      nativeRequestId: allocated.mappings.at(-1)!.nativeRequestId,
+      mappingIndex: allocated.mappings.at(-1)!.index,
+      observedScript: allocated.mappings.at(-1)!.script,
+      attributedScript: allocated.mappings.at(-1)!.script,
+      outpoint: 'b'.repeat(64) + ':1'
+    })
+    await recoveryContext.close()
   } finally {
     await rm(outputDirectory, {force: true, recursive: true})
   }

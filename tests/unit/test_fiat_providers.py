@@ -352,6 +352,7 @@ async def test_create_wallet_fiat_invoice_success(
         payment.extra.get("fiat_payment_request")
         == "https://stripe.com/pay/session_123"
     )
+    assert payment.checking_id is not None
     assert payment.checking_id.startswith("fiat_stripe_")
     assert payment.fee <= 0
 
@@ -589,6 +590,7 @@ async def test_create_wallet_square_fiat_invoice_success(
     assert payment.status == PaymentState.PENDING
     assert payment.fiat_provider == "square"
     assert payment.extra.get("fiat_checking_id") == fiat_mock_response.checking_id
+    assert payment.checking_id is not None
     assert payment.checking_id.startswith("fiat_square_order_123")
 
 
@@ -957,6 +959,7 @@ async def test_create_wallet_revolut_fiat_invoice_success(
     assert payment.status == PaymentState.PENDING
     assert payment.fiat_provider == "revolut"
     assert payment.extra.get("fiat_checking_id") == fiat_mock_response.checking_id
+    assert payment.checking_id is not None
     assert payment.checking_id.startswith("fiat_revolut_order_ORDER123")
 
 
@@ -1751,6 +1754,7 @@ async def test_handle_fiat_payment_confirmation(
         faucet_payment.extra.get("fiat_payment_request")
         == fiat_mock_response.payment_request
     )
+    assert faucet_payment.checking_id is not None
     assert faucet_payment.checking_id.startswith("internal_fiat_stripe_")
 
 
@@ -1995,6 +1999,7 @@ async def test_check_fiat_status_persists_successful_payment(
 
     assert status.success is True
     assert payment.status == PaymentState.SUCCESS
+    assert payment.checking_id is not None
     updated_payment = await get_payment(payment.checking_id)
     assert updated_payment.status == PaymentState.SUCCESS
     queue_put.assert_called_once_with(payment)

@@ -8,6 +8,7 @@ from lnbits.core.models.extensions import ExtensionPermission
 from lnbits.core.wasm_ext.api.host import ExtensionHostAPI
 from lnbits.core.wasm_ext.api.models import (
     CreateInvoicePublicRequest,
+    CreateInvoiceRequest,
     EmptyRequest,
     PayInvoiceRequest,
     PayLnurlRequest,
@@ -19,6 +20,7 @@ from lnbits.core.wasm_ext.api.models import (
 )
 from lnbits.exceptions import PaymentError
 from lnbits.helpers import sha256s
+from lnbits.settings import settings
 
 
 @pytest.mark.anyio
@@ -696,6 +698,7 @@ async def test_host_api_public_invoice_uses_granted_source_policy(
         payment_request="lnbc1demo",
         bolt11="lnbc1fallback",
         checking_id="checking-id",
+        lightning_identifiers=("checking-id", "hash", "lnbc1fallback"),
     )
     create_mock = mocker.patch(
         "lnbits.core.services.payments.create_payment_request",
@@ -733,6 +736,85 @@ async def test_host_api_public_invoice_uses_granted_source_policy(
         "extra_demoext": {"note": "thanks"},
     }
     assert invoice.extension == "demoext"
+
+
+@pytest.mark.anyio
+async def test_host_api_invoice_methods_reject_arkade_mode_before_service_call(
+    mocker: MockerFixture,
+):
+    mocker.patch(
+        "lnbits.core.crud.wallets.get_wallet",
+        mocker.AsyncMock(return_value=SimpleNamespace(id="wallet-1", user="user-1")),
+    )
+    mocker.patch(
+        "lnbits.core.wasm_ext.api.host.storage_get_public_row",
+        mocker.AsyncMock(return_value={"id": "tip-1", "wallet_id": "wallet-1"}),
+    )
+    create_mock = mocker.patch(
+        "lnbits.core.services.payments.create_payment_request",
+        mocker.AsyncMock(),
+    )
+    mocker.patch.object(
+        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
+    )
+    request = CreateInvoiceRequest(
+        wallet_id="wallet-1", amount=21, currency="sat", memo="Receive", tag="demo"
+    )
+    api = ExtensionHostAPI("demoext", ["wallet.create_invoice"], user_id="user-1")
+    public_api = ExtensionHostAPI(
+        "demoext",
+        [
+            ExtensionPermission(
+                id="wallet.create_invoice_public",
+                policies=[{"table": "tips", "wallet_field": "wallet_id"}],
+            )
+        ],
+    )
+
+    with pytest.raises(PermissionError, match="ARKADE_BROWSER_REQUIRED"):
+        await api.wallet_create_invoice(request)
+    with pytest.raises(PermissionError, match="ARKADE_BROWSER_REQUIRED"):
+        await public_api.wallet_create_invoice_public(
+            CreateInvoicePublicRequest(
+                source_id="tip-1", amount=21, currency="sat", memo="Tip"
+            )
+        )
+
+    create_mock.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_host_api_invoice_remains_lightning_in_custodial_mode(
+    mocker: MockerFixture,
+):
+    wallet = SimpleNamespace(id="wallet-1", user="user-1")
+    mocker.patch(
+        "lnbits.core.crud.wallets.get_wallet", mocker.AsyncMock(return_value=wallet)
+    )
+    payment = SimpleNamespace(
+        payment_hash="hash",
+        payment_request="lnbc1demo",
+        bolt11="lnbc1fallback",
+        checking_id="checking-id",
+        lightning_identifiers=("checking-id", "hash", "lnbc1fallback"),
+    )
+    create_mock = mocker.patch(
+        "lnbits.core.services.payments.create_payment_request",
+        mocker.AsyncMock(return_value=payment),
+    )
+    mocker.patch.object(settings, "lnbits_effective_installation_mode", "custodial")
+    api = ExtensionHostAPI("demoext", ["wallet.create_invoice"], user_id="user-1")
+
+    response = await api.wallet_create_invoice(
+        CreateInvoiceRequest(
+            wallet_id="wallet-1", amount=21, currency="sat", memo="Receive", tag="demo"
+        )
+    )
+
+    assert response.payment_hash == "hash"
+    assert response.payment_request == "lnbc1demo"
+    assert response.checking_id == "checking-id"
+    create_mock.assert_awaited_once()
 
 
 @pytest.mark.anyio

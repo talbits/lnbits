@@ -1,5 +1,5 @@
 import {
-  ContractManager,
+  CSVMultisigTapscript,
   DefaultVtxo,
   deriveDescriptorLeafPubKey,
   getNetwork,
@@ -417,7 +417,53 @@ type InvoiceProof = {
     outpoint: string
     afterLogicalExpiry: boolean
   }
+  recovery?: {
+    mappedRowsBeforeDeletion: number
+    mappedRowsAfterDeletion: number
+    usedSigningDescriptorCount: number
+    recoveredContractCount: number
+    recoveredDescriptorsExact: boolean
+    recoveredScriptsExact: boolean
+    recoveredAddressesExact: boolean
+    recoveredMetadataExact: boolean
+    watermarkUnchanged: boolean
+    secondRecoveryIdempotent: boolean
+    nextAllocationIndex: number
+    nextAllocationFresh: boolean
+  }
   transportPayloads: string[]
+}
+
+type CompleteLossRecoveryProof = {
+  repositoryName: string
+  priorLocalStorageEntries: number
+  priorIndexedDbNames: string[]
+  freshWalletRepository: boolean
+  freshContractRepository: boolean
+  mappingsUnchanged: boolean
+  publicMappingCount: number
+  enumeratedDescriptorCount: number
+  firstRecoveryCreatedCount: number
+  recoveredContractCount: number
+  recoveredDescriptorsExact: boolean
+  recoveredScriptsExact: boolean
+  recoveredAddressesExact: boolean
+  recoveredChildKeysExact: boolean
+  recoveredMetadataExact: boolean
+  highestMappedIndex: number
+  watermarkBeforeRecoveryIndex: number
+  watermarkAfterRecoveryIndex: number
+  secondRecoveryCreatedCount: number
+  secondRecoveryWatermarkUnchanged: boolean
+  nextAllocationIndex: number
+  nextAllocationFresh: boolean
+  lateObservation: {
+    nativeRequestId: string
+    mappingIndex: number
+    observedScript: string
+    attributedScript: string
+    outpoint: string
+  }
 }
 
 const invoiceRepositoryNameFor = (input: RepositoryInputs): string =>
@@ -481,6 +527,54 @@ class IsolatedIndexer {
 
   fund(script: string, vtxo: unknown) {
     this.funded.set(script, [...(this.funded.get(script) ?? []), vtxo])
+  }
+}
+
+const isolatedWalletProviders = (
+  networkName: 'regtest',
+  serverPubKey: Uint8Array,
+  indexer: IsolatedIndexer
+) => {
+  const network = getNetwork(networkName)
+  const csvTimelock = {value: 144n, type: 'blocks' as const}
+  const forfeitScript = new DefaultVtxo.Script({
+    pubKey: serverPubKey,
+    serverPubKey,
+    csvTimelock
+  })
+  return {
+    arkProvider: {
+      getInfo: async () => ({
+        boardingExitDelay: 288n,
+        checkpointTapscript: toHex(
+          CSVMultisigTapscript.encode({
+            timelock: {value: 4096n, type: 'blocks'},
+            pubkeys: [serverPubKey]
+          }).script
+        ),
+        deprecatedSigners: [],
+        digest: 'isolated-invoice-proof',
+        dust: 330n,
+        fees: {intentFee: {}, txFeeRate: '0'},
+        forfeitAddress: forfeitScript.onchainAddress(network),
+        forfeitPubkey: toHex(serverPubKey),
+        network: networkName,
+        serviceStatus: {},
+        sessionDuration: 3600n,
+        signerPubkey: toHex(serverPubKey),
+        unilateralExitDelay: 144n,
+        utxoMaxAmount: -1n,
+        utxoMinAmount: 0n,
+        version: 'isolated-invoice-proof',
+        vtxoMaxAmount: -1n,
+        vtxoMinAmount: 0n
+      }),
+      onServerInfoChanged: () => () => {},
+      getEventStream: async function* () {},
+      getTransactionsStream: async function* () {}
+    },
+    indexerProvider: indexer,
+    onchainProvider: {getCoins: async () => []}
   }
 }
 
@@ -588,17 +682,22 @@ const runInvoiceAllocatorProof = async ({
     identity,
     repository
   )
-  const indexer = new IsolatedIndexer()
-  const manager = await ContractManager.create({
-    indexerProvider: indexer as never,
-    contractRepository,
-    walletRepository: repository,
-    watcherConfig: {failsafePollIntervalMs: 60 * 60 * 1000}
-  })
   const serverPubKey = fromHex(
     '79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798'
   )
-  const csvTimelock = {value: 144n, type: 'blocks' as const}
+  const indexer = new IsolatedIndexer()
+  const providers = isolatedWalletProviders(networkName, serverPubKey, indexer)
+  const wallet = await Wallet.create({
+    identity,
+    arkProvider: providers.arkProvider as never,
+    indexerProvider: providers.indexerProvider as never,
+    onchainProvider: providers.onchainProvider as never,
+    storage: {walletRepository: repository, contractRepository},
+    walletMode: 'hd',
+    settlementConfig: false,
+    watcherConfig: {failsafePollIntervalMs: 60 * 60 * 1000}
+  })
+  const manager = await wallet.getContractManager()
   const mappings = readInvoiceMappings(journalKey)
 
   if (step === 'initial' && mappings.length) {
@@ -623,22 +722,22 @@ const runInvoiceAllocatorProof = async ({
         transportPayloads
       )
 
-    const signingDescriptor =
-      await descriptorProvider.getNextSigningDescriptor()
-    if (!signingDescriptor) throw new Error('missing signing descriptor')
+    const [newAddress] = await wallet.getNewAddresses({forceNew: true})
+    if (!newAddress?.signingDescriptor || !newAddress.contract) {
+      throw new Error(
+        'SDK allocator did not return a signing descriptor/contract'
+      )
+    }
+    const signingDescriptor = newAddress.signingDescriptor
     const indexMatch = signingDescriptor.match(/\/0\/(\d+)\)$/)
     if (!indexMatch) throw new Error('unparseable signing descriptor')
     const index = Number(indexMatch[1])
     const pubKey = deriveDescriptorLeafPubKey(signingDescriptor)
-    const tapscript = new DefaultVtxo.Script({
-      pubKey,
-      serverPubKey,
-      csvTimelock
-    })
-    const script = toHex(tapscript.pkScript)
-    const address = tapscript
-      .address(getNetwork(networkName).hrp, serverPubKey)
-      .encode()
+    const script = newAddress.contract.script
+    const address = newAddress.address
+    if (!script || newAddress.contract.address !== address) {
+      throw new Error('SDK allocator returned mismatched contract data')
+    }
     const serverPubkeyHex = toHex(serverPubKey)
     const mapping = Object.freeze({
       action: 'lnbits-arkade-receive-v1' as const,
@@ -668,19 +767,6 @@ const runInvoiceAllocatorProof = async ({
         'schnorr'
       )
     )
-    // Isolated SDK 0.4.66 proof only; P2-8 must check released #810 and
-    // replace this manual allocator with its supported receive API.
-    await manager.createContract({
-      type: 'default',
-      params: {
-        pubKey: toHex(pubKey),
-        serverPubKey: toHex(serverPubKey),
-        csvTimelock: timelockToSequence(csvTimelock).toString()
-      },
-      script,
-      address,
-      metadata: {signingDescriptor}
-    })
     const signedMapping = Object.freeze({...mapping, signature})
     const persistedMapping = persistInvoiceMapping(journalKey, signedMapping)
     return acknowledgeInvoice(
@@ -732,6 +818,201 @@ const runInvoiceAllocatorProof = async ({
       throw new Error('conflicting invoice acknowledgement accepted')
 
     const oldMapping = readInvoiceMappings(journalKey)[0]
+    const contracts = await contractRepository.getContracts()
+    const persistedState = await repository.getWalletState()
+    const persistedMappings = readInvoiceMappings(journalKey)
+    const invoiceScripts = new Set(
+      persistedMappings.map(mapping => mapping.script)
+    )
+    const invoiceContracts = contracts.filter(contract =>
+      invoiceScripts.has(contract.script)
+    )
+    const persistedRetryMapping = persistedMappings.find(
+      mapping => mapping.nativeRequestId === stableInvoiceId(3, 0)
+    )
+    if (!persistedState || invoiceContracts.length !== invoiceCount) {
+      throw new Error('invoice contracts or watermark were not persisted')
+    }
+    const watermarkBeforeRecovery = await descriptorProvider.getLastIndexUsed()
+    await wallet.dispose()
+    for (const mapping of persistedMappings) {
+      await contractRepository.deleteContract(mapping.script)
+    }
+    const mappedRowsAfterDeletion = (
+      await contractRepository.getContracts({
+        script: persistedMappings.map(mapping => mapping.script)
+      })
+    ).length
+    if (mappedRowsAfterDeletion !== 0) {
+      throw new Error('invoice contract rows survived simulated loss')
+    }
+
+    const reopenedWallet = await Wallet.create({
+      identity,
+      arkProvider: providers.arkProvider as never,
+      indexerProvider: providers.indexerProvider as never,
+      onchainProvider: providers.onchainProvider as never,
+      storage: {walletRepository: repository, contractRepository},
+      walletMode: 'hd',
+      settlementConfig: false,
+      watcherConfig: {failsafePollIntervalMs: 60 * 60 * 1000}
+    })
+    const reopenedManager = await reopenedWallet.getContractManager()
+    const reopenedDescriptorProvider = await HDDescriptorProvider.create(
+      identity,
+      repository
+    )
+    const originalByScript = new Map(
+      invoiceContracts.map(contract => [contract.script, contract])
+    )
+    const mappingByScript = new Map(
+      persistedMappings.map(mapping => [mapping.script, mapping])
+    )
+    const contractProjection = (contract: {
+      type: string
+      params: Record<string, string>
+      script: string
+      address: string
+      state: string
+      metadata?: Record<string, unknown>
+    }): string =>
+      JSON.stringify({
+        type: contract.type,
+        params: contract.params,
+        script: contract.script,
+        address: contract.address,
+        state: contract.state,
+        metadata: contract.metadata
+      })
+    const mappedScripts = persistedMappings.map(mapping => mapping.script)
+    const recoverMissingContracts = async () => {
+      const usedSigningDescriptors =
+        await reopenedWallet.getUsedSigningDescriptors()
+      const existing = await contractRepository.getContracts({
+        script: mappedScripts
+      })
+      const existingScripts = new Set(existing.map(contract => contract.script))
+      const matchedDescriptors = new Map<string, string>()
+      let createdCount = 0
+      for (const signingDescriptor of usedSigningDescriptors) {
+        const pubKey = deriveDescriptorLeafPubKey(signingDescriptor)
+        const tapscript = new DefaultVtxo.Script({
+          ...reopenedWallet.offchainTapscript.options,
+          pubKey
+        })
+        const script = toHex(tapscript.pkScript)
+        const address = tapscript
+          .address(reopenedWallet.network.hrp, tapscript.options.serverPubKey)
+          .encode()
+        const mapping = mappingByScript.get(script)
+        if (!mapping || mapping.address !== address) continue
+        if (mapping.childXonlyPubkey !== toHex(pubKey)) {
+          throw new Error(
+            'descriptor matched invoice script with wrong child key'
+          )
+        }
+        matchedDescriptors.set(mapping.script, signingDescriptor)
+        if (existingScripts.has(script)) continue
+        await reopenedManager.createContract({
+          type: 'default',
+          params: {
+            pubKey: toHex(pubKey),
+            serverPubKey: toHex(tapscript.options.serverPubKey),
+            csvTimelock: timelockToSequence(
+              tapscript.options.csvTimelock
+            ).toString()
+          },
+          script,
+          address,
+          state: 'active',
+          metadata: {signingDescriptor}
+        })
+        existingScripts.add(script)
+        createdCount += 1
+      }
+      if (matchedDescriptors.size !== persistedMappings.length) {
+        throw new Error(
+          'used descriptors did not recover every invoice mapping'
+        )
+      }
+      const recoveredContracts = await contractRepository.getContracts({
+        script: mappedScripts
+      })
+      if (recoveredContracts.length !== invoiceCount) {
+        throw new Error(
+          'recovery did not rebuild every missing invoice contract'
+        )
+      }
+      return {
+        usedSigningDescriptors,
+        matchedDescriptors,
+        recoveredContracts,
+        createdCount
+      }
+    }
+    const firstRecovery = await recoverMissingContracts()
+    if (firstRecovery.createdCount !== invoiceCount) {
+      throw new Error('first recovery did not create exactly the missing rows')
+    }
+    const {usedSigningDescriptors, matchedDescriptors, recoveredContracts} =
+      firstRecovery
+    const recoveryExact = persistedMappings.every(mapping => {
+      const original = originalByScript.get(mapping.script)
+      const recovered = recoveredContracts.find(
+        contract => contract.script === mapping.script
+      )
+      const descriptor = matchedDescriptors.get(mapping.script)
+      return (
+        !!original &&
+        !!recovered &&
+        !!descriptor &&
+        recovered.script === original.script &&
+        recovered.address === original.address &&
+        recovered.metadata?.signingDescriptor === descriptor &&
+        contractProjection(recovered) === contractProjection(original)
+      )
+    })
+    if (!recoveryExact)
+      throw new Error('recovered contract differs from original')
+
+    const secondRecovery = await recoverMissingContracts()
+    const recoveredAfterSecondPass = secondRecovery.recoveredContracts
+    const secondRecoveryIdempotent =
+      secondRecovery.createdCount === 0 &&
+      recoveredAfterSecondPass.every(contract => {
+        const before = recoveredContracts.find(
+          item => item.script === contract.script
+        )
+        return (
+          !!before &&
+          contractProjection(contract) === contractProjection(before)
+        )
+      })
+    if (!secondRecoveryIdempotent) {
+      throw new Error('second recovery changed contract rows')
+    }
+    const watermarkAfterRecovery =
+      await reopenedDescriptorProvider.getLastIndexUsed()
+    if (watermarkAfterRecovery !== watermarkBeforeRecovery) {
+      throw new Error('recovery changed the allocation watermark')
+    }
+    const [nextAddress] = await reopenedWallet.getNewAddresses({forceNew: true})
+    if (!nextAddress?.signingDescriptor || !nextAddress.contract) {
+      throw new Error('fresh allocation after recovery failed')
+    }
+    const nextIndexMatch = nextAddress.signingDescriptor.match(/\/0\/(\d+)\)$/)
+    if (!nextIndexMatch) throw new Error('unparseable post-recovery descriptor')
+    const nextAllocationIndex = Number(nextIndexMatch[1])
+    const nextAllocationFresh =
+      nextAllocationIndex >
+        Math.max(...persistedMappings.map(({index}) => index)) &&
+      !invoiceScripts.has(nextAddress.contract.script) &&
+      !new Set(persistedMappings.map(mapping => mapping.address)).has(
+        nextAddress.address
+      )
+    if (!nextAllocationFresh) {
+      throw new Error('post-recovery allocation reused an invoice artifact')
+    }
     indexer.fund(oldMapping.script, {
       txid: 'a'.repeat(64),
       vout: 0,
@@ -741,20 +1022,13 @@ const runInvoiceAllocatorProof = async ({
       isSpent: false,
       isSwept: false
     })
-    await manager.refreshVtxos({scripts: [oldMapping.script]})
+    await reopenedManager.refreshVtxos({scripts: [oldMapping.script]})
     const persistedOldVtxos = await repository.getVtxos(oldMapping.address)
     const oldVtxo = persistedOldVtxos.find(
       vtxo => vtxo.script === oldMapping.script
     )
-    if (!oldVtxo) throw new Error('funded invoice VTXO was not persisted')
-    await manager.dispose()
-    const contracts = await contractRepository.getContracts()
-    const persistedState = await repository.getWalletState()
-    const persistedMappings = readInvoiceMappings(journalKey)
-    const metadata = contracts.map(contract => contract.metadata ?? {})
-    const persistedRetryMapping = persistedMappings.find(
-      mapping => mapping.nativeRequestId === stableInvoiceId(3, 0)
-    )
+    if (!oldVtxo)
+      throw new Error('funded invoice VTXO was not persisted after recovery')
     const lateObservation = {
       nativeRequestId: oldMapping.nativeRequestId,
       observedScript: oldVtxo.script,
@@ -762,9 +1036,8 @@ const runInvoiceAllocatorProof = async ({
       outpoint: `${oldVtxo.txid}:${oldVtxo.vout}`,
       afterLogicalExpiry: Date.now() > oldMapping.expiresAt
     }
-    if (!persistedState || contracts.length !== invoiceCount) {
-      throw new Error('invoice contracts or watermark were not persisted')
-    }
+    await reopenedWallet.dispose()
+    const metadata = invoiceContracts.map(contract => contract.metadata ?? {})
     return {
       repositoryName,
       mappings: persistedMappings,
@@ -778,8 +1051,8 @@ const runInvoiceAllocatorProof = async ({
       mappingsFrozen: persistedMappings.every(mapping =>
         Object.isFrozen(mapping)
       ),
-      lastIndexUsed: await descriptorProvider.getLastIndexUsed(),
-      contractCount: contracts.length,
+      lastIndexUsed: watermarkBeforeRecovery,
+      contractCount: invoiceContracts.length,
       metadataHasSource: metadata.some(item => 'source' in item),
       metadataExactlySigningDescriptor: metadata.every(
         item =>
@@ -796,14 +1069,34 @@ const runInvoiceAllocatorProof = async ({
         !!persistedRetryMapping &&
         mappingPayload(retryMapping) === mappingPayload(persistedRetryMapping),
       lateObservation,
+      recovery: {
+        mappedRowsBeforeDeletion: invoiceContracts.length,
+        mappedRowsAfterDeletion,
+        usedSigningDescriptorCount: usedSigningDescriptors.length,
+        recoveredContractCount: recoveredContracts.length,
+        recoveredDescriptorsExact: recoveryExact,
+        recoveredScriptsExact: recoveryExact,
+        recoveredAddressesExact: recoveryExact,
+        recoveredMetadataExact: recoveryExact,
+        watermarkUnchanged: watermarkAfterRecovery === watermarkBeforeRecovery,
+        secondRecoveryIdempotent,
+        nextAllocationIndex,
+        nextAllocationFresh
+      },
       transportPayloads
     }
   }
 
   const contracts = await contractRepository.getContracts()
   const persistedMappings = readInvoiceMappings(journalKey)
+  const invoiceScripts = new Set(
+    persistedMappings.map(mapping => mapping.script)
+  )
+  const invoiceContracts = contracts.filter(contract =>
+    invoiceScripts.has(contract.script)
+  )
   const duplicateRequestMapping = await allocate(stableInvoiceId(0, 0))
-  await manager.dispose()
+  await wallet.dispose()
   return {
     repositoryName,
     mappings: persistedMappings,
@@ -817,11 +1110,11 @@ const runInvoiceAllocatorProof = async ({
       Object.isFrozen(mapping)
     ),
     lastIndexUsed: await descriptorProvider.getLastIndexUsed(),
-    contractCount: contracts.length,
-    metadataHasSource: contracts.some(
+    contractCount: invoiceContracts.length,
+    metadataHasSource: invoiceContracts.some(
       contract => 'source' in (contract.metadata ?? {})
     ),
-    metadataExactlySigningDescriptor: contracts.every(
+    metadataExactlySigningDescriptor: invoiceContracts.every(
       contract =>
         Object.keys(contract.metadata ?? {}).length === 1 &&
         typeof contract.metadata?.signingDescriptor === 'string'
@@ -842,9 +1135,271 @@ const runInvoiceAllocatorProof = async ({
   }
 }
 
+const runCompleteBrowserLossRecoveryProof = async ({
+  mnemonic,
+  mappings
+}: {
+  mnemonic: string
+  mappings: InvoiceMapping[]
+}): Promise<CompleteLossRecoveryProof> => {
+  const priorLocalStorageEntries = localStorage.length
+  const priorIndexedDbNames = (await indexedDB.databases())
+    .map(database => database.name)
+    .filter((name): name is string => typeof name === 'string')
+  if (priorLocalStorageEntries || priorIndexedDbNames.length) {
+    throw new Error('complete-loss proof requires a fresh browser context')
+  }
+  if (!mappings.length) throw new Error('public receive mappings are required')
+
+  const mappingSnapshot = JSON.stringify(mappings)
+  const publicMappings = mappings.map(mapping => Object.freeze({...mapping}))
+  const firstMapping = publicMappings[0]
+  if (
+    firstMapping.network !== 'regtest' ||
+    !/^[0-9a-f]{64}$/.test(firstMapping.serverPubkey) ||
+    publicMappings.some(
+      mapping =>
+        mapping.network !== firstMapping.network ||
+        mapping.serverUrl !== firstMapping.serverUrl ||
+        mapping.serverPubkey !== firstMapping.serverPubkey ||
+        !Number.isSafeInteger(mapping.index) ||
+        mapping.index < 0
+    ) ||
+    new Set(publicMappings.map(mapping => mapping.index)).size !==
+      publicMappings.length
+  ) {
+    throw new Error('public receive mappings have inconsistent server data')
+  }
+
+  const repositoryName = `lnbits-arkade-complete-loss-${crypto.randomUUID()}`
+  const repository = new IndexedDBWalletRepository(repositoryName)
+  const contractRepository = new IndexedDBContractRepository(repositoryName)
+  const freshWalletRepository = (await repository.getWalletState()) === null
+  const freshContractRepository =
+    (await contractRepository.getContracts()).length === 0
+  if (!freshWalletRepository || !freshContractRepository) {
+    throw new Error('complete-loss proof repositories were not empty')
+  }
+
+  const identity = MnemonicIdentity.fromMnemonic(mnemonic, {isMainnet: false})
+  const indexer = new IsolatedIndexer()
+  const providers = isolatedWalletProviders(
+    'regtest',
+    fromHex(firstMapping.serverPubkey),
+    indexer
+  )
+  const wallet = await Wallet.create({
+    identity,
+    arkProvider: providers.arkProvider as never,
+    indexerProvider: providers.indexerProvider as never,
+    onchainProvider: providers.onchainProvider as never,
+    storage: {walletRepository: repository, contractRepository},
+    walletMode: 'hd',
+    settlementConfig: false,
+    watcherConfig: {failsafePollIntervalMs: 60 * 60 * 1000}
+  })
+  const manager = await wallet.getContractManager()
+  const highestMappedIndex = Math.max(
+    ...publicMappings.map(mapping => mapping.index)
+  )
+  const descriptorIndex = (descriptor: string): number => {
+    const match = descriptor.match(/\/0\/(\d+)\)$/)
+    if (!match) throw new Error('unparseable recovered signing descriptor')
+    return Number(match[1])
+  }
+  const enumerateThroughHighestMapping = async () => {
+    const currentDescriptor = await wallet.getCurrentSigningDescriptor()
+    const currentIndex = currentDescriptor
+      ? descriptorIndex(currentDescriptor)
+      : -1
+    return wallet.getUsedSigningDescriptors({
+      lookAhead: Math.max(0, highestMappedIndex - currentIndex)
+    })
+  }
+  const deriveMappedDescriptors = async () => {
+    const descriptors = await enumerateThroughHighestMapping()
+    const derivedByIndex = new Map(
+      descriptors.map(descriptor => {
+        const pubKey = deriveDescriptorLeafPubKey(descriptor)
+        const tapscript = new DefaultVtxo.Script({
+          ...wallet.offchainTapscript.options,
+          pubKey
+        })
+        return [
+          descriptorIndex(descriptor),
+          {
+            descriptor,
+            pubKey,
+            script: toHex(tapscript.pkScript),
+            address: tapscript
+              .address(wallet.network.hrp, tapscript.options.serverPubKey)
+              .encode(),
+            tapscript
+          }
+        ] as const
+      })
+    )
+    const recovered = publicMappings.map(mapping => ({
+      mapping,
+      derived: derivedByIndex.get(mapping.index)
+    }))
+    return {descriptors, recovered}
+  }
+  const recover = async () => {
+    const {descriptors, recovered} = await deriveMappedDescriptors()
+    const existingScripts = new Set(
+      (
+        await contractRepository.getContracts({
+          script: publicMappings.map(mapping => mapping.script)
+        })
+      ).map(contract => contract.script)
+    )
+    let createdCount = 0
+    for (const {mapping, derived} of recovered) {
+      if (
+        !derived ||
+        derived.script !== mapping.script ||
+        derived.address !== mapping.address ||
+        toHex(derived.pubKey) !== mapping.childXonlyPubkey
+      ) {
+        throw new Error(`public mapping ${mapping.index} did not rederive`)
+      }
+      if (existingScripts.has(mapping.script)) continue
+      await manager.createContract({
+        type: 'default',
+        params: {
+          pubKey: toHex(derived.pubKey),
+          serverPubKey: toHex(derived.tapscript.options.serverPubKey),
+          csvTimelock: timelockToSequence(
+            derived.tapscript.options.csvTimelock
+          ).toString()
+        },
+        script: derived.script,
+        address: derived.address,
+        state: 'active',
+        metadata: {signingDescriptor: derived.descriptor}
+      })
+      existingScripts.add(mapping.script)
+      createdCount += 1
+    }
+    const highest = recovered.find(
+      item => item.mapping.index === highestMappedIndex
+    )?.derived
+    if (!highest) throw new Error('highest public mapping did not rederive')
+    await wallet.advanceSigningDescriptorWatermark(highest.descriptor)
+    return {descriptors, recovered, createdCount}
+  }
+
+  const watermarkBeforeRecovery = await wallet.getCurrentSigningDescriptor()
+  if (!watermarkBeforeRecovery) throw new Error('fresh wallet has no watermark')
+  const firstRecovery = await recover()
+  const watermarkAfterRecovery = await wallet.getCurrentSigningDescriptor()
+  if (!watermarkAfterRecovery) throw new Error('recovery did not set watermark')
+  const recoveredContracts = await contractRepository.getContracts({
+    script: publicMappings.map(mapping => mapping.script)
+  })
+  const contractByScript = new Map(
+    recoveredContracts.map(contract => [contract.script, contract])
+  )
+  const recoveredDescriptorsExact = firstRecovery.recovered.every(
+    ({mapping, derived}) =>
+      !!derived && descriptorIndex(derived.descriptor) === mapping.index
+  )
+  const recoveredScriptsExact = firstRecovery.recovered.every(
+    ({mapping, derived}) => derived?.script === mapping.script
+  )
+  const recoveredAddressesExact = firstRecovery.recovered.every(
+    ({mapping, derived}) => derived?.address === mapping.address
+  )
+  const recoveredChildKeysExact = firstRecovery.recovered.every(
+    ({mapping, derived}) =>
+      !!derived && toHex(derived.pubKey) === mapping.childXonlyPubkey
+  )
+  const recoveredMetadataExact = firstRecovery.recovered.every(
+    ({mapping, derived}) => {
+      const metadata = contractByScript.get(mapping.script)?.metadata
+      return (
+        !!derived &&
+        Object.keys(metadata ?? {}).length === 1 &&
+        metadata?.signingDescriptor === derived.descriptor
+      )
+    }
+  )
+
+  const secondRecovery = await recover()
+  const watermarkAfterSecondRecovery =
+    await wallet.getCurrentSigningDescriptor()
+  const [nextAddress] = await wallet.getNewAddresses({forceNew: true})
+  if (!nextAddress?.signingDescriptor || !nextAddress.contract) {
+    throw new Error('fresh allocation after complete-loss recovery failed')
+  }
+  const nextAllocationIndex = descriptorIndex(nextAddress.signingDescriptor)
+  const mappedScripts = new Set(publicMappings.map(mapping => mapping.script))
+  const mappedAddresses = new Set(
+    publicMappings.map(mapping => mapping.address)
+  )
+  const nextAllocationFresh =
+    nextAllocationIndex > highestMappedIndex &&
+    !mappedScripts.has(nextAddress.contract.script) &&
+    !mappedAddresses.has(nextAddress.address)
+
+  const highMapping = publicMappings.find(
+    mapping => mapping.index === highestMappedIndex
+  )!
+  indexer.fund(highMapping.script, {
+    txid: 'b'.repeat(64),
+    vout: 1,
+    value: highMapping.amountSat,
+    script: highMapping.script,
+    isPreconfirmed: false,
+    isSpent: false,
+    isSwept: false
+  })
+  await manager.refreshVtxos({scripts: [highMapping.script]})
+  const highVtxo = (await repository.getVtxos(highMapping.address)).find(
+    vtxo => vtxo.script === highMapping.script
+  )
+  if (!highVtxo) throw new Error('recovered high mapping missed funded VTXO')
+
+  await wallet.dispose()
+  return {
+    repositoryName,
+    priorLocalStorageEntries,
+    priorIndexedDbNames,
+    freshWalletRepository,
+    freshContractRepository,
+    mappingsUnchanged: JSON.stringify(publicMappings) === mappingSnapshot,
+    publicMappingCount: publicMappings.length,
+    enumeratedDescriptorCount: firstRecovery.descriptors.length,
+    firstRecoveryCreatedCount: firstRecovery.createdCount,
+    recoveredContractCount: recoveredContracts.length,
+    recoveredDescriptorsExact,
+    recoveredScriptsExact,
+    recoveredAddressesExact,
+    recoveredChildKeysExact,
+    recoveredMetadataExact,
+    highestMappedIndex,
+    watermarkBeforeRecoveryIndex: descriptorIndex(watermarkBeforeRecovery),
+    watermarkAfterRecoveryIndex: descriptorIndex(watermarkAfterRecovery),
+    secondRecoveryCreatedCount: secondRecovery.createdCount,
+    secondRecoveryWatermarkUnchanged:
+      watermarkAfterSecondRecovery === watermarkAfterRecovery,
+    nextAllocationIndex,
+    nextAllocationFresh,
+    lateObservation: {
+      nativeRequestId: highMapping.nativeRequestId,
+      mappingIndex: highMapping.index,
+      observedScript: highVtxo.script,
+      attributedScript: highMapping.script,
+      outpoint: `${highVtxo.txid}:${highVtxo.vout}`
+    }
+  }
+}
+
 Object.assign(window, {
   arkadeRepositoryName: repositoryNameFor,
   runArkadeBip39Proof: runProof,
   runArkadeRegtestProof: runRegtestProof,
-  runArkadeInvoiceAllocatorProof: runInvoiceAllocatorProof
+  runArkadeInvoiceAllocatorProof: runInvoiceAllocatorProof,
+  runArkadeCompleteBrowserLossRecoveryProof: runCompleteBrowserLossRecoveryProof
 })

@@ -43,6 +43,15 @@ async def get_arkade_binding(
     )
 
 
+async def get_arkade_ready_account_ids(
+    conn: Connection | None = None,
+) -> list[str]:
+    rows = await (conn or db).fetchall(
+        "SELECT account_id FROM arkade_account_bindings WHERE state = 'ready'"
+    )
+    return [row["account_id"] for row in rows]
+
+
 async def get_arkade_receive_request(
     native_request_id: str, conn: Connection | None = None
 ) -> ArkadeReceiveRequest | None:

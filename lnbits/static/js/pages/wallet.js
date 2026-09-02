@@ -28,8 +28,10 @@ window.PageWallet = {
         show: false,
         status: 'pending',
         paymentReq: null,
+        protocol: null,
         paymentHash: null,
         amountMsat: null,
+        fiatPaymentReq: null,
         minMax: [0, 2100000000000000],
         lnurl: null,
         units: [],
@@ -254,6 +256,7 @@ window.PageWallet = {
       this.receive.show = true
       this.receive.status = 'pending'
       this.receive.paymentReq = null
+      this.receive.protocol = null
       this.receive.paymentHash = null
       this.receive.fiatPaymentReq = null
       this.receive.fiatProvider = this.isFiatWallet ? 'cash' : ''
@@ -337,10 +340,10 @@ window.PageWallet = {
             this.receive.data.payment_hash
           )
       request
-        .then(response => {
-          this.g.updatePayments = !this.g.updatePayments
-          this.receive.status = 'success'
+        .then(async response => {
           if (cash) {
+            this.g.updatePayments = !this.g.updatePayments
+            this.receive.status = 'success'
             this.receive.show = false
             Quasar.Notify.create({
               type: 'positive',
@@ -348,6 +351,29 @@ window.PageWallet = {
             })
             return
           }
+          if (
+            response.data.protocol === 'arkade' &&
+            response.data.browser_required
+          ) {
+            const allocateReceive = window.ArkadeEnrollment?.allocateReceive
+            if (!allocateReceive)
+              throw new Error('Arkade wallet is unavailable')
+            const result = await allocateReceive(
+              this.g.wallet.id,
+              response.data
+            )
+            this.g.updatePayments = !this.g.updatePayments
+            this.receive.status = 'success'
+            this.receive.protocol = 'arkade'
+            this.receive.paymentReq = result.mapping.address
+            this.receive.fiatPaymentReq = null
+            this.receive.amountMsat = response.data.amount
+            this.receive.paymentHash = null
+            return
+          }
+          this.g.updatePayments = !this.g.updatePayments
+          this.receive.status = 'success'
+          this.receive.protocol = response.data.protocol || 'lightning'
           this.receive.paymentReq = response.data.bolt11
           this.receive.fiatPaymentReq =
             response.data.extra?.fiat_payment_request

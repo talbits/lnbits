@@ -1,4 +1,11 @@
-import {MnemonicIdentity} from '@arkade-os/sdk'
+import {
+  DefaultVtxo,
+  IndexedDBContractRepository,
+  IndexedDBWalletRepository,
+  MnemonicIdentity,
+  Wallet,
+  deriveDescriptorLeafPubKey
+} from '@arkade-os/sdk'
 import {generateMnemonic, validateMnemonic} from '@scure/bip39'
 import {wordlist} from '@scure/bip39/wordlists/english.js'
 
@@ -12,6 +19,7 @@ const HEX64 = /^[0-9a-f]{64}$/
 const NETWORK = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/
 const PASSWORD_MIN_LENGTH = 12
 const MAX_CIPHERTEXT_BYTES = 1024 * 1024
+const RECEIVE_JOURNAL_PREFIX = 'lnbits-arkade-receive-v1'
 const RECORD_FIELDS = new Set([
   'accountId',
   'version',
@@ -43,12 +51,71 @@ type VaultRecord = {
 let identity: MnemonicIdentity | null = null
 let activeBinding: any = null
 let idleTimer: number | undefined
+let allocationWallet: Awaited<ReturnType<typeof Wallet.create>> | null = null
+let allocationWalletKey = ''
+
+type ReceiveMapping = Readonly<{
+  action: 'lnbits-arkade-receive-v1'
+  accountId: string
+  walletId: string
+  nativeRequestId: string
+  idempotencyKey: string
+  amountSat: number
+  index: number
+  address: string
+  script: string
+  childXonlyPubkey: string
+  network: string
+  serverUrl: string
+  serverPubkey: string
+  expiresAt: number
+  signature: string
+  exitTapleaf: string
+  exitControlBlock: string
+}>
 
 const bytesToHex = (bytes: Uint8Array) =>
   Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('')
 
 const randomHex = (bytes: number) =>
   bytesToHex(crypto.getRandomValues(new Uint8Array(bytes)))
+
+const receiveJournalKey = (accountId: string) =>
+  `${RECEIVE_JOURNAL_PREFIX}:${location.origin}:${accountId}`
+
+const readReceiveJournal = (accountId: string): ReceiveMapping[] => {
+  const value = localStorage.getItem(receiveJournalKey(accountId))
+  if (!value) return []
+  const mappings = JSON.parse(value)
+  if (!Array.isArray(mappings)) throw new Error('receive journal corrupt')
+  return mappings
+}
+
+const persistReceiveMapping = (
+  accountId: string,
+  mapping: ReceiveMapping
+): ReceiveMapping => {
+  const mappings = readReceiveJournal(accountId)
+  const existing = mappings.find(
+    item => item.nativeRequestId === mapping.nativeRequestId
+  )
+  if (existing) {
+    if (JSON.stringify(existing) !== JSON.stringify(mapping))
+      throw new Error('receive allocation conflict')
+    return existing
+  }
+  mappings.push(mapping)
+  localStorage.setItem(receiveJournalKey(accountId), JSON.stringify(mappings))
+  return mapping
+}
+
+const expirySeconds = (value: unknown): number => {
+  const seconds =
+    typeof value === 'number' ? value : Date.parse(String(value)) / 1000
+  if (!Number.isSafeInteger(seconds) || seconds < 0)
+    throw new Error('invalid receive expiry')
+  return seconds
+}
 
 const validateBinding = (
   value: any,
@@ -315,6 +382,221 @@ const digest = async (value: string) =>
     await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value))
   )
 
+const receiveStatement = (mapping: ReceiveMapping): string =>
+  [
+    `action=${mapping.action}`,
+    `account_id=${mapping.accountId}`,
+    `wallet_id=${mapping.walletId}`,
+    `native_request_id=${mapping.nativeRequestId}`,
+    `idempotency_key=${mapping.idempotencyKey}`,
+    `amount_sat=${mapping.amountSat}`,
+    `index=${mapping.index}`,
+    `address=${mapping.address}`,
+    `script=${mapping.script}`,
+    `child_xonly_pubkey=${mapping.childXonlyPubkey}`,
+    `network=${mapping.network}`,
+    `server_url=${mapping.serverUrl}`,
+    `server_pubkey=${mapping.serverPubkey}`,
+    `expires_at=${mapping.expiresAt}`
+  ].join('\n')
+
+const getAllocationWallet = async (accountId: string, binding: any) => {
+  if (!identity || binding?.state !== 'ready')
+    throw new Error('wallet is locked')
+  const key = JSON.stringify([
+    location.origin,
+    accountId,
+    binding.network,
+    binding.server_url
+  ])
+  if (allocationWallet && allocationWalletKey === key) return allocationWallet
+  if (allocationWallet) {
+    await allocationWallet.dispose()
+    allocationWallet = null
+  }
+  const repositoryName = `lnbits-arkade-${key}`
+  allocationWallet = await Wallet.create({
+    identity,
+    arkServerUrl: binding.server_url,
+    arkServerPublicKey: binding.server_pubkey,
+    storage: {
+      walletRepository: new IndexedDBWalletRepository(repositoryName),
+      contractRepository: new IndexedDBContractRepository(repositoryName)
+    },
+    walletMode: 'hd',
+    settlementConfig: false
+  })
+  allocationWalletKey = key
+  return allocationWallet
+}
+
+const requestMatchesMapping = (request: any, mapping: ReceiveMapping) =>
+  !!request &&
+  request.account_id === mapping.accountId &&
+  request.wallet_id === mapping.walletId &&
+  request.native_request_id === mapping.nativeRequestId &&
+  request.idempotency_key === mapping.idempotencyKey &&
+  request.amount_sat === mapping.amountSat &&
+  request.network === mapping.network &&
+  request.server_url === mapping.serverUrl &&
+  request.server_pubkey === mapping.serverPubkey &&
+  expirySeconds(request.expires_at) === mapping.expiresAt
+
+const acknowledgementMatchesMapping = (
+  response: any,
+  mapping: ReceiveMapping
+) => {
+  try {
+    return (
+      requestMatchesMapping(response, mapping) &&
+      (response.state === 'acknowledged' || response.state === 'settled') &&
+      response.index === mapping.index &&
+      response.address === mapping.address &&
+      response.script === mapping.script &&
+      response.child_xonly_pubkey === mapping.childXonlyPubkey
+    )
+  } catch {
+    return false
+  }
+}
+
+const acknowledgeReceive = async (
+  accountId: string,
+  mapping: ReceiveMapping
+) => {
+  const request = (
+    await LNbits.api.arkadeReceiveRequest(mapping.nativeRequestId)
+  ).data
+  if (!requestMatchesMapping(request, mapping))
+    throw new Error('receive allocation conflict')
+  const response = (
+    await LNbits.api.arkadeReceiveAck({
+      native_request_id: mapping.nativeRequestId,
+      account_id: mapping.accountId,
+      wallet_id: mapping.walletId,
+      idempotency_key: mapping.idempotencyKey,
+      amount_sat: mapping.amountSat,
+      index: mapping.index,
+      address: mapping.address,
+      script: mapping.script,
+      child_xonly_pubkey: mapping.childXonlyPubkey,
+      network: mapping.network,
+      server_url: mapping.serverUrl,
+      server_pubkey: mapping.serverPubkey,
+      expires_at: mapping.expiresAt,
+      signature: mapping.signature,
+      exit_tapleaf: mapping.exitTapleaf,
+      exit_control_block: mapping.exitControlBlock
+    })
+  ).data
+  if (!acknowledgementMatchesMapping(response, mapping))
+    throw new Error('receive acknowledgement conflict')
+  return {accountId, mapping}
+}
+
+const allocateReceive = async (
+  walletId: string,
+  payment: any
+): Promise<{accountId: string; mapping: ReceiveMapping}> => {
+  const accountId = window.g.user.id
+  if (!identity || !activeBinding || activeBinding.state !== 'ready')
+    throw new Error('wallet is locked')
+  if (
+    payment?.protocol !== 'arkade' ||
+    typeof payment.native_id !== 'string' ||
+    !HEX32.test(payment.native_id) ||
+    payment.wallet_id !== walletId ||
+    !Number.isSafeInteger(payment.amount) ||
+    payment.amount < 1000 ||
+    payment.amount % 1000 !== 0
+  )
+    throw new Error('invalid Arkade payment')
+  const nativeRequestId = payment.native_id
+  const request = (await LNbits.api.arkadeReceiveRequest(nativeRequestId)).data
+  const amountSat = payment.amount / 1000
+  const expiresAt = request ? expirySeconds(request.expires_at) : -1
+  if (
+    !request ||
+    request.account_id !== accountId ||
+    request.wallet_id !== walletId ||
+    request.native_request_id !== nativeRequestId ||
+    typeof request.idempotency_key !== 'string' ||
+    !HEX32.test(request.idempotency_key) ||
+    request.amount_sat !== amountSat ||
+    request.network !== activeBinding.network ||
+    request.server_url !== activeBinding.server_url ||
+    request.server_pubkey !== activeBinding.server_pubkey ||
+    !Number.isSafeInteger(expiresAt)
+  )
+    throw new Error('invalid Arkade payment mapping')
+  const existing = readReceiveJournal(accountId).find(
+    mapping => mapping.nativeRequestId === nativeRequestId
+  )
+  if (existing) return acknowledgeReceive(accountId, existing)
+  if (request.state !== 'pending')
+    throw new Error('Arkade payment mapping is no longer pending')
+  const wallet = await getAllocationWallet(accountId, request)
+  const [newAddress] = await wallet.getNewAddresses({forceNew: true})
+  if (!newAddress?.signingDescriptor || !newAddress.contract)
+    throw new Error(
+      'SDK allocator did not return a signing descriptor/contract'
+    )
+  const signingDescriptor = newAddress.signingDescriptor
+  const indexMatch = signingDescriptor.match(/\/0\/(\d+)\)?$/)
+  if (!indexMatch) throw new Error('unparseable signing descriptor')
+  const index = Number(indexMatch[1])
+  const childPubkey = deriveDescriptorLeafPubKey(signingDescriptor)
+  const script = newAddress.contract.script
+  const address = newAddress.address
+  const tapscript = new DefaultVtxo.Script({
+    ...wallet.offchainTapscript.options,
+    pubKey: childPubkey
+  })
+  if (!script || newAddress.contract.address !== address)
+    throw new Error('SDK allocator returned mismatched contract data')
+  if (bytesToHex(tapscript.pkScript) !== script)
+    throw new Error('SDK allocator returned an unsupported contract')
+  const [controlBlock, exitTapleaf] = tapscript.exit()
+  if (controlBlock.merklePath.length !== 1)
+    throw new Error('SDK allocator returned an unsupported exit path')
+  const control = new Uint8Array([
+    controlBlock.version,
+    ...controlBlock.internalKey,
+    ...controlBlock.merklePath[0]
+  ])
+  const unsignedMapping = {
+    action: 'lnbits-arkade-receive-v1' as const,
+    accountId,
+    walletId,
+    nativeRequestId,
+    idempotencyKey: request.idempotency_key,
+    amountSat,
+    index,
+    address,
+    script,
+    childXonlyPubkey: bytesToHex(childPubkey),
+    network: request.network,
+    serverUrl: request.server_url,
+    serverPubkey: request.server_pubkey,
+    expiresAt,
+    signature: '',
+    exitTapleaf: bytesToHex(exitTapleaf),
+    exitControlBlock: bytesToHex(control)
+  }
+  const signer = await wallet.signerForDescriptor(signingDescriptor)
+  const signature = bytesToHex(
+    await signer.signMessage(
+      await digest(receiveStatement(unsignedMapping)),
+      'schnorr'
+    )
+  )
+  const mapping = persistReceiveMapping(accountId, {
+    ...unsignedMapping,
+    signature
+  })
+  return acknowledgeReceive(accountId, mapping)
+}
+
 const probe = async () => {
   const accountId = window.g.user.id
   let idempotencyKey: string
@@ -411,6 +693,10 @@ const unlock = async (password: string) => {
 
 const lock = () => {
   identity = null
+  const wallet = allocationWallet
+  allocationWallet = null
+  allocationWalletKey = ''
+  if (wallet) void wallet.dispose().catch(() => {})
   if (idleTimer) window.clearTimeout(idleTimer)
   idleTimer = undefined
   if (window.g?.user?.installationMode === 'arkade_noncustodial') {
@@ -500,6 +786,9 @@ window.ArkadeEnrollment = {
   },
   async finish() {
     await finish()
+  },
+  async allocateReceive(walletId: string, payment: any) {
+    return allocateReceive(walletId, payment)
   },
   async binding() {
     return activeBinding

@@ -7,7 +7,7 @@ from typing import Literal
 from fastapi import Query
 from lnurl import LnurlWithdrawResponse
 from loguru import logger
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, PrivateAttr, root_validator, validator
 
 from lnbits.db import FilterModel
 from lnbits.fiat.base import (
@@ -49,8 +49,8 @@ class PayInvoice(BaseModel):
 
 class CreatePayment(BaseModel):
     wallet_id: str
-    payment_hash: str
-    bolt11: str
+    payment_hash: str | None = None
+    bolt11: str | None = None
     amount_msat: int
     memo: str
     extra: dict | None = {}
@@ -61,19 +61,38 @@ class CreatePayment(BaseModel):
     fee: int = 0
     labels: list[str] | None = None
     external_id: str | None = None
+    protocol: Literal["lightning", "arkade"] = "lightning"
+    native_id: str | None = None
+    arkade_address: str | None = None
 
     @validator("external_id")
     def validate_external_id(cls, external_id):
         return _validate_external_id(external_id)
 
+    @root_validator
+    def validate_identity(cls, values):
+        if values.get("protocol") == "arkade":
+            if not values.get("native_id"):
+                raise ValueError("Arkade payments require native_id")
+            if any(
+                values.get(field) is not None for field in ("bolt11", "payment_hash")
+            ):
+                raise ValueError("Arkade payments cannot have Lightning identifiers")
+        else:
+            if values.get("arkade_address") is not None:
+                raise ValueError("Lightning payments cannot have an Arkade address")
+            if not all(values.get(field) for field in ("payment_hash", "bolt11")):
+                raise ValueError("Lightning payments require Lightning identifiers")
+        return values
+
 
 class Payment(BaseModel):
-    checking_id: str
-    payment_hash: str
+    checking_id: str | None
+    payment_hash: str | None
     wallet_id: str
     amount: int
     fee: int
-    bolt11: str
+    bolt11: str | None
     payment_request: str | None = Field(default=None, no_database=True)
     fiat_provider: str | None = None
     status: str = PaymentState.PENDING
@@ -90,13 +109,37 @@ class Payment(BaseModel):
     labels: list[str] = []
     extra: dict = {}
     external_id: str | None = None
+    protocol: Literal["lightning", "arkade"] = "lightning"
+    native_id: str | None = None
+    arkade_address: str | None = None
+    _original_native_id: str | None = PrivateAttr(default=None)
 
     @validator("external_id")
     def validate_external_id(cls, external_id):
         return _validate_external_id(external_id)
 
+    @root_validator
+    def validate_identity(cls, values):
+        if values.get("protocol") == "arkade":
+            if not values.get("native_id"):
+                raise ValueError("Arkade payments require native_id")
+            if any(
+                values.get(field) is not None
+                for field in ("checking_id", "bolt11", "payment_hash")
+            ):
+                raise ValueError("Arkade payments cannot have Lightning identifiers")
+        else:
+            if values.get("arkade_address") is not None:
+                raise ValueError("Lightning payments cannot have an Arkade address")
+            if not all(
+                values.get(field) for field in ("checking_id", "payment_hash", "bolt11")
+            ):
+                raise ValueError("Lightning payments require Lightning identifiers")
+        return values
+
     def __init__(self, **data):
         super().__init__(**data)
+        self._original_native_id = self.native_id
         if "fiat_payment_request" in self.extra:
             self.payment_request = self.extra["fiat_payment_request"]
         else:
@@ -136,9 +179,18 @@ class Payment(BaseModel):
 
     @property
     def is_internal(self) -> bool:
-        return self.checking_id.startswith("internal_") or self.checking_id.startswith(
-            "fiat_"
+        return bool(self.checking_id) and (
+            self.checking_id.startswith("internal_")
+            or self.checking_id.startswith("fiat_")
         )
+
+    @property
+    def lightning_identifiers(self) -> tuple[str, str, str]:
+        if self.protocol != "lightning":
+            raise ValueError("Payment is not a Lightning payment")
+        if not self.checking_id or not self.payment_hash or not self.bolt11:
+            raise ValueError("Payment is missing Lightning identifiers")
+        return self.checking_id, self.payment_hash, self.bolt11
 
     # DEPRECATED: in v1.5.0, use service check_payment_status instead
     async def check_status(self) -> PaymentStatus:

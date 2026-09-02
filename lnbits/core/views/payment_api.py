@@ -9,6 +9,7 @@ from fastapi import (
     HTTPException,
     Query,
 )
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from lnurl import url_decode
 
@@ -258,6 +259,7 @@ async def api_all_payments_paginated(
         field to supply the BOLT11 invoice to be paid.
     """,
     status_code=HTTPStatus.CREATED,
+    response_model=Payment,
     responses={
         400: {"description": "Invalid BOLT11 string or missing fields."},
         401: {"description": "Invoice (or Admin) key required."},
@@ -267,7 +269,7 @@ async def api_all_payments_paginated(
 async def api_payments_create(
     invoice_data: CreateInvoice,
     key_info: BaseWalletTypeInfo = Depends(require_base_invoice_key),
-) -> Payment:
+) -> Payment | JSONResponse:
     wallet_id = key_info.wallet.id
     if invoice_data.out is True and key_info.key_type == KeyType.admin:
         if not invoice_data.bolt11:
@@ -291,7 +293,12 @@ async def api_payments_create(
         )
 
     # If the payment is not outgoing, we can create a new invoice.
-    return await create_payment_request(wallet_id, invoice_data)
+    payment = await create_payment_request(wallet_id, invoice_data)
+    if payment.protocol == "arkade":
+        response = jsonable_encoder(payment)
+        response["browser_required"] = True
+        return JSONResponse(status_code=HTTPStatus.ACCEPTED, content=response)
+    return payment
 
 
 @payment_router.put("/{payment_hash}/labels")

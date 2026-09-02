@@ -483,16 +483,19 @@ async def test_check_transaction_status_and_payment_status(mocker: MockerFixture
     assert (await check_transaction_status(wallet.id, pending_hash)).failed is True
 
     internal_success = await get_payment(success_id)
+    assert internal_success.payment_hash is not None
     internal_success.checking_id = "internal_" + internal_success.payment_hash
     internal_success.status = PaymentState.SUCCESS.value
     assert (await check_payment_status(internal_success)).success is True
 
     internal_failed = await get_payment(success_id)
+    assert internal_failed.payment_hash is not None
     internal_failed.checking_id = "internal_" + internal_failed.payment_hash
     internal_failed.status = PaymentState.FAILED.value
     assert (await check_payment_status(internal_failed)).failed is True
 
     internal_fiat = await get_payment(success_id)
+    assert internal_fiat.payment_hash is not None
     internal_fiat.checking_id = "fiat_" + internal_fiat.payment_hash
     internal_fiat.status = PaymentState.PENDING.value
     internal_fiat.fiat_provider = "stripe"

@@ -45,7 +45,9 @@ async def connection(monkeypatch):
             "VALUES (:id, :user, 'test', 'a', 'b')",
             {"id": WALLET_ID, "user": ACCOUNT_ID},
         )
-        await connection.execute("CREATE TABLE apipayments (wallet_id TEXT)")
+        await connection.execute(
+            "CREATE TABLE apipayments (wallet_id TEXT, native_id TEXT)"
+        )
         await migrations.m052_create_arkade_account_bindings_table(connection)
         await migrations.m053_create_arkade_receive_tables(connection)
         now = datetime.now(timezone.utc)

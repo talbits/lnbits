@@ -27,7 +27,7 @@
     "terser": "^5.47.1"
   },
   "dependencies": {
-    "@arkade-os/sdk": "0.4.66",
+    "@arkade-os/sdk": "0.4.67",
     "@scure/bip39": "2.0.1",
     "axios": "^1.18.0",
     "chart.js": "^4.5.1",

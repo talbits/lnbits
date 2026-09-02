@@ -110,6 +110,19 @@ window._lnbitsApi = {
       data
     })
   },
+  arkadeReceiveRequest(nativeRequestId) {
+    return axios({
+      method: 'GET',
+      url: `/api/v1/arkade/receive/${nativeRequestId}`
+    })
+  },
+  arkadeReceiveAck(data) {
+    return axios({
+      method: 'POST',
+      url: '/api/v1/arkade/receive/ack',
+      data
+    })
+  },
   login(username, password) {
     return axios({
       method: 'POST',

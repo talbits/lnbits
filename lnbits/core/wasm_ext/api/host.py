@@ -8,6 +8,7 @@ from collections.abc import Iterable, Mapping
 from typing import Any
 
 from lnbits.helpers import sha256s
+from lnbits.settings import settings
 
 from ..client.extensions import send_extension_api_request
 from ..storage.crud import (
@@ -347,6 +348,11 @@ class ExtensionHostAPI:
         if wallet is None or wallet.user != self.user_id:
             raise PermissionError("Not your wallet.")
 
+        if settings.lnbits_effective_installation_mode == "arkade_noncustodial":
+            raise PermissionError(
+                "ARKADE_BROWSER_REQUIRED: browser allocation is required; "
+                "the Lightning-only WASM invoice call is unsupported."
+            )
         payment = await create_payment_request(
             request.wallet_id,
             CreateInvoice(
@@ -357,10 +363,11 @@ class ExtensionHostAPI:
                 extension=self.extension_id,
             ),
         )
+        checking_id, payment_hash, bolt11 = payment.lightning_identifiers
         return CreateInvoiceResponse(
-            payment_hash=payment.payment_hash,
-            payment_request=payment.payment_request or payment.bolt11,
-            checking_id=payment.checking_id,
+            payment_hash=payment_hash,
+            payment_request=payment.payment_request or bolt11,
+            checking_id=checking_id,
         )
 
     @extension_api_method(
@@ -398,6 +405,11 @@ class ExtensionHostAPI:
         if not isinstance(wallet_id, str) or not wallet_id:
             raise PermissionError("Public invoice source has no valid wallet.")
 
+        if settings.lnbits_effective_installation_mode == "arkade_noncustodial":
+            raise PermissionError(
+                "ARKADE_BROWSER_REQUIRED: browser allocation is required; "
+                "the Lightning-only WASM invoice call is unsupported."
+            )
         payment = await create_payment_request(
             wallet_id,
             CreateInvoice(
@@ -412,10 +424,11 @@ class ExtensionHostAPI:
                 extension=self.extension_id,
             ),
         )
+        checking_id, payment_hash, bolt11 = payment.lightning_identifiers
         return CreateInvoiceResponse(
-            payment_hash=payment.payment_hash,
-            payment_request=payment.payment_request or payment.bolt11,
-            checking_id=payment.checking_id,
+            payment_hash=payment_hash,
+            payment_request=payment.payment_request or bolt11,
+            checking_id=checking_id,
         )
 
     @extension_api_method(

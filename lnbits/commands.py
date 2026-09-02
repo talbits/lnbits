@@ -249,12 +249,13 @@ async def check_invalid_payments(
     invalid_payments: list[Payment] = []
     invalid_wallets = {}
     for db_payment in settled_db_payments:
+        checking_id, _, _ = db_payment.lightning_identifiers
         if verbose:
             click.echo(
-                f"Checking Payment: '{db_payment.checking_id}' for wallet"
+                f"Checking Payment: '{checking_id}' for wallet"
                 + f" '{db_payment.wallet_id}'."
             )
-        payment_status = await funding_source.get_invoice_status(db_payment.checking_id)
+        payment_status = await funding_source.get_invoice_status(checking_id)
 
         if payment_status.pending:
             invalid_payments.append(db_payment)
@@ -267,7 +268,7 @@ async def check_invalid_payments(
                 "Invalid Payment:  '"
                 + " ".join(
                     [
-                        db_payment.checking_id,
+                        checking_id,
                         db_payment.wallet_id,
                         str(db_payment.amount / 1000).ljust(10),
                         db_payment.memo or "",

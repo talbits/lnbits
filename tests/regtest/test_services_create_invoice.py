@@ -24,6 +24,8 @@ async def test_create_invoice(from_wallet):
     if not is_boltz_wallet:
         assert payment.preimage
 
+    assert payment.bolt11 is not None
+    assert payment.payment_hash is not None
     invoice = decode(payment.bolt11)
     assert invoice.payment_hash == payment.payment_hash
     assert invoice.amount_msat == 1000000
@@ -45,6 +47,8 @@ async def test_create_internal_invoice(from_wallet):
     if not is_boltz_wallet:
         assert payment.preimage
 
+    assert payment.bolt11 is not None
+    assert payment.payment_hash is not None
     invoice = decode(payment.bolt11)
     assert invoice.payment_hash == payment.payment_hash
     assert invoice.amount_msat == 1000000

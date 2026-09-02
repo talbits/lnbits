@@ -158,6 +158,76 @@ async def test_create_invoice(client, inkey_headers_to):
 
 
 @pytest.mark.anyio
+async def test_create_arkade_invoice_returns_accepted_payment(
+    client, inkey_headers_to, to_wallet, mocker: MockerFixture
+):
+    payment = Payment(
+        checking_id=None,
+        payment_hash=None,
+        wallet_id=to_wallet.id,
+        amount=42_000,
+        fee=0,
+        bolt11=None,
+        memo="arkade",
+        protocol="arkade",
+        native_id="arkade-native",
+    )
+    mocker.patch(
+        "lnbits.core.views.payment_api.create_payment_request",
+        mocker.AsyncMock(return_value=payment),
+    )
+
+    response = await client.post(
+        "/api/v1/payments",
+        json={"out": False, "amount": 42, "memo": "arkade"},
+        headers=inkey_headers_to,
+    )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["protocol"] == "arkade"
+    assert body["native_id"] == "arkade-native"
+    assert body["status"] == "pending"
+    assert body["browser_required"] is True
+    assert body["arkade_address"] is None
+    assert body["checking_id"] is None
+    assert body["payment_hash"] is None
+    assert body["bolt11"] is None
+
+
+@pytest.mark.anyio
+async def test_create_custodial_invoice_keeps_created_response(
+    client, inkey_headers_to, to_wallet, mocker: MockerFixture
+):
+    payment = Payment(
+        checking_id="checking",
+        payment_hash="11" * 32,
+        wallet_id=to_wallet.id,
+        amount=42_000,
+        fee=0,
+        bolt11="bolt11",
+        memo="lightning",
+    )
+    mocker.patch(
+        "lnbits.core.views.payment_api.create_payment_request",
+        mocker.AsyncMock(return_value=payment),
+    )
+
+    response = await client.post(
+        "/api/v1/payments",
+        json={"out": False, "amount": 42, "memo": "lightning"},
+        headers=inkey_headers_to,
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["checking_id"] == "checking"
+    assert body["payment_hash"] == "11" * 32
+    assert body["bolt11"] == "bolt11"
+    assert "browser_required" not in body
+
+
+@pytest.mark.anyio
 async def test_create_invoice_fiat_amount(client, inkey_headers_to):
     data = await get_random_invoice_data()
     data["unit"] = "EUR"

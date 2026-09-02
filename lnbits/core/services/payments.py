@@ -1,13 +1,21 @@
 import asyncio
 import time
 from datetime import datetime, timedelta, timezone
+from secrets import token_hex
 
 from bolt11 import Bolt11, MilliSatoshi, Tags
 from bolt11 import decode as bolt11_decode
 from bolt11 import encode as bolt11_encode
 from loguru import logger
 
-from lnbits.core.crud.payments import get_daily_stats
+from lnbits.core.crud.arkade import (
+    get_arkade_ready_account_ids,
+)
+from lnbits.core.crud.payments import (
+    compare_and_set_arkade_payment_failed,
+    get_arkade_pending_payments,
+    get_daily_stats,
+)
 from lnbits.core.db import db
 from lnbits.core.models import PaymentDailyStats, PaymentFilters
 from lnbits.core.models.payments import CreateInvoice
@@ -34,6 +42,7 @@ from lnbits.wallets.base import (
 from ..crud import (
     check_internal,
     create_payment,
+    get_payment_by_native_id,
     get_payments,
     get_standalone_payment,
     get_wallet,
@@ -47,7 +56,13 @@ from ..models import (
     PaymentState,
     Wallet,
 )
-from .arkade import require_arkade_payments_unavailable
+from .arkade import (
+    ArkadeReceiveError,
+    create_arkade_receive_request_for_account,
+    fetch_arkade_indexer_vtxos,
+    reconcile_arkade_receive,
+    require_arkade_payments_unavailable,
+)
 from .fiat_providers import check_fiat_status
 from .lnurl import execute_withdraw as lnurl_withdraw
 from .notifications import send_payment_notification_in_background
@@ -118,12 +133,138 @@ async def create_payment_request(
     """
     Create a lightning invoice or a fiat payment request.
     """
+    if settings.lnbits_effective_installation_mode == "arkade_noncustodial":
+        if (
+            invoice_data.internal
+            or invoice_data.payment_hash
+            or invoice_data.description_hash
+            or invoice_data.unhashed_description
+            or invoice_data.lnurl_withdraw
+            or invoice_data.fiat_provider
+            or invoice_data.bolt11
+        ):
+            raise ArkadeReceiveError("ARKADE_INVOICE_UNSUPPORTED")
+        if invoice_data.amount is None:
+            raise InvoiceError("Amountless invoices not supported.", status="failed")
+        return await create_arkade_pending_invoice(
+            wallet_id=wallet_id,
+            amount=invoice_data.amount,
+            memo=invoice_data.memo or settings.lnbits_site_title,
+            currency=invoice_data.unit,
+            expiry=invoice_data.expiry,
+            extra=invoice_data.extra,
+            extension=invoice_data.extension,
+            webhook=invoice_data.webhook,
+            labels=invoice_data.labels,
+            external_id=invoice_data.external_id,
+        )
+
     if invoice_data.fiat_provider:
         if invoice_data.is_fiat_subscription():
             raise ValueError("Cannot create direct fiat subscription payments.")
         return await create_fiat_invoice(wallet_id, invoice_data)
 
     return await create_wallet_invoice(wallet_id, invoice_data)
+
+
+async def create_arkade_pending_invoice(
+    *,
+    wallet_id: str,
+    amount: float,
+    memo: str,
+    currency: str | None = "sat",
+    expiry: int | None = None,
+    extra: dict | None = None,
+    extension: str | None = None,
+    webhook: str | None = None,
+    labels: list[str] | None = None,
+    external_id: str | None = None,
+    idempotency_key: str | None = None,
+    conn: Connection | None = None,
+) -> Payment:
+    """Create an unallocated Arkade payment and receive request atomically."""
+    if settings.lnbits_effective_installation_mode != "arkade_noncustodial":
+        raise ArkadeReceiveError("ARKADE_RECEIVE_UNAVAILABLE")
+    if webhook:
+        check_callback_url(webhook)
+
+    key = idempotency_key or token_hex(16)
+    effective_expiry = expiry or settings.lightning_invoice_expiry
+
+    async with db.reuse_conn(conn) if conn else db.connect() as new_conn:
+        async with new_conn.transaction():
+            wallet = await get_wallet(wallet_id, conn=new_conn)
+            if not wallet:
+                raise InvoiceError(
+                    f"Could not fetch wallet '{wallet_id}'.", status="failed"
+                )
+            if not wallet.can_receive_payments:
+                raise InvoiceError(
+                    "Wallet does not have permission to create invoices.",
+                    status="failed",
+                )
+
+            amount_sat, payment_extra = await calculate_fiat_amounts(
+                amount, wallet, currency, extra
+            )
+            if amount_sat < 1:
+                raise InvoiceError("Invoice amount must be positive.", status="failed")
+            if amount_sat > settings.lnbits_max_incoming_payment_amount_sats:
+                raise InvoiceError(
+                    f"Invoice amount {amount_sat} sats is too high. Max allowed: "
+                    f"{settings.lnbits_max_incoming_payment_amount_sats} sats.",
+                    status="failed",
+                )
+            if settings.is_wallet_max_balance_exceeded(
+                wallet.balance_msat / 1000 + amount_sat
+            ):
+                raise InvoiceError(
+                    "Wallet balance cannot exceed "
+                    f"{settings.lnbits_wallet_limit_max_balance} sats.",
+                    status="failed",
+                )
+
+            expires_at = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(
+                seconds=effective_expiry
+            )
+            request = await create_arkade_receive_request_for_account(
+                wallet.user,
+                wallet_id=wallet_id,
+                amount_sat=amount_sat,
+                idempotency_key=key,
+                expires_at=expires_at,
+                conn=new_conn,
+            )
+            payment = await get_payment_by_native_id(
+                request.native_request_id, conn=new_conn
+            )
+            if payment:
+                if (
+                    payment.protocol != "arkade"
+                    or payment.native_id != request.native_request_id
+                    or payment.wallet_id != request.wallet_id
+                    or payment.amount != amount_sat * 1000
+                ):
+                    raise ArkadeReceiveError("ARKADE_RECEIVE_IDEMPOTENCY_CONFLICT")
+                return payment
+
+            return await create_payment(
+                checking_id=None,
+                data=CreatePayment(
+                    wallet_id=request.wallet_id,
+                    amount_msat=amount_sat * 1000,
+                    memo=memo,
+                    extra=payment_extra,
+                    extension=extension,
+                    expiry=request.expires_at,
+                    webhook=webhook,
+                    labels=labels,
+                    external_id=external_id,
+                    protocol="arkade",
+                    native_id=request.native_request_id,
+                ),
+                conn=new_conn,
+            )
 
 
 async def create_fiat_invoice(
@@ -162,9 +303,10 @@ async def create_fiat_invoice(
     if not fiat_provider:
         raise InvoiceError("No fiat provider found.", status="failed")
 
+    _, payment_hash, _ = internal_payment.lightning_identifiers
     fiat_invoice = await fiat_provider.create_invoice(
         amount=invoice_data.amount,
-        payment_hash=internal_payment.payment_hash,
+        payment_hash=payment_hash,
         currency=invoice_data.unit,
         memo=invoice_data.memo,
         extra=invoice_data.extra or {},
@@ -243,9 +385,10 @@ async def create_wallet_invoice(wallet_id: str, data: CreateInvoice) -> Payment:
     if data.lnurl_withdraw:
         try:
             check_callback_url(data.lnurl_withdraw.callback)
+            _, _, bolt11 = payment.lightning_identifiers
             await lnurl_withdraw(
                 data.lnurl_withdraw,
-                payment.bolt11,
+                bolt11,
                 user_agent=settings.user_agent,
                 timeout=10,
             )
@@ -413,6 +556,36 @@ async def check_pending_payments():
     the backend and also to delete expired invoices. Incoming payments will be
     checked only once, outgoing pending payments will be checked regularly.
     """
+    if settings.lnbits_effective_installation_mode == "arkade_noncustodial":
+        start_time = time.time()
+        async with db.connect() as conn:
+            async with conn.transaction():
+                for payment in await get_arkade_pending_payments(conn=conn):
+                    if payment.is_expired:
+                        await compare_and_set_arkade_payment_failed(payment, conn=conn)
+        for account_id in await get_arkade_ready_account_ids():
+            try:
+                # Indexer I/O must not hold the ledger transaction open.
+                evidence = await fetch_arkade_indexer_vtxos(account_id)
+                async with db.connect() as conn:
+                    async with conn.transaction():
+                        settled_payments = await reconcile_arkade_receive(
+                            account_id, evidence, conn=conn
+                        )
+                for payment in settled_payments:
+                    task_manager.invoice_queue.put_nowait(payment)
+            except ArkadeReceiveError as exc:
+                logger.warning(
+                    f"Task: Arkade receive check failed for account {account_id}: {exc}"
+                )
+                continue
+        logger.info(
+            "Task: Arkade pending check finished for "
+            "settled payments "
+            f"(took {time.time() - start_time:0.3f} s)"
+        )
+        return
+
     funding_source = get_funding_source()
     if funding_source.__class__.__name__ == "VoidWallet":
         logger.warning("Task: skipping pending check for VoidWallet")
@@ -660,6 +833,12 @@ async def check_transaction_status(
 
 
 async def check_payment_status(payment: Payment) -> PaymentStatus:
+    if payment.protocol == "arkade":
+        if payment.success:
+            return PaymentSuccessStatus(fee_msat=payment.fee, preimage=payment.preimage)
+        if payment.failed:
+            return PaymentFailedStatus()
+        return PaymentPendingStatus()
     if payment.is_internal:
         if payment.success:
             return PaymentSuccessStatus(fee_msat=payment.fee, preimage=payment.preimage)
@@ -669,11 +848,12 @@ async def check_payment_status(payment: Payment) -> PaymentStatus:
             fiat_status = await check_fiat_status(payment)
             return PaymentStatus(paid=fiat_status.paid)
         return PaymentPendingStatus()
+    checking_id, _, _ = payment.lightning_identifiers
     funding_source = get_funding_source()
     if payment.is_out:
-        status = await funding_source.get_payment_status(payment.checking_id)
+        status = await funding_source.get_payment_status(checking_id)
     else:
-        status = await funding_source.get_invoice_status(payment.checking_id)
+        status = await funding_source.get_invoice_status(checking_id)
     return status
 
 
@@ -757,29 +937,30 @@ async def _pay_internal_invoice(
     Pay an internal payment.
     returns None if the payment is not internal.
     """
+    payment_hash = create_payment_model.payment_hash
+    bolt11 = create_payment_model.bolt11
+    if not payment_hash or not bolt11:
+        raise PaymentError("Invalid Lightning payment identifiers.", status="failed")
     # check_internal() returns the payment of the invoice we're waiting for
     # (pending only)
-    internal_payment = await check_internal(
-        create_payment_model.payment_hash, conn=conn
-    )
+    internal_payment = await check_internal(payment_hash, conn=conn)
 
     if not internal_payment:
         return None
 
     # perform additional checks on the internal payment
     # the payment hash is not enough to make sure that this is the same invoice
+    checking_id, _, _ = internal_payment.lightning_identifiers
     internal_invoice = await get_standalone_payment(
-        internal_payment.checking_id, incoming=True, conn=conn
+        checking_id, incoming=True, conn=conn
     )
 
     if not internal_invoice:
         raise PaymentError("Internal payment not found.", status="failed")
 
     amount_msat = create_payment_model.amount_msat
-    if (
-        internal_invoice.amount != abs(amount_msat)
-        or internal_invoice.bolt11 != create_payment_model.bolt11.lower()
-    ):
+    _, _, internal_bolt11 = internal_invoice.lightning_identifiers
+    if internal_invoice.amount != abs(amount_msat) or internal_bolt11 != bolt11.lower():
         raise PaymentError("Invalid invoice. Bolt11 changed.", status="failed")
 
     fee_reserve_total_msat = fee_reserve_total(amount_msat, internal=True)
@@ -824,7 +1005,11 @@ async def _pay_external_invoice(
     create_payment_model: CreatePayment,
     conn: Connection | None = None,
 ) -> Payment:
-    checking_id = create_payment_model.payment_hash
+    payment_hash = create_payment_model.payment_hash
+    bolt11 = create_payment_model.bolt11
+    if not payment_hash or not bolt11:
+        raise PaymentError("Invalid Lightning payment identifiers.", status="failed")
+    checking_id = payment_hash
     amount_msat = create_payment_model.amount_msat
 
     fee_reserve_total_msat = fee_reserve_total(amount_msat, internal=False)
@@ -852,7 +1037,7 @@ async def _pay_external_invoice(
     fee_reserve_msat = fee_reserve(amount_msat, internal=False)
 
     task = task_manager.create_task(
-        _fundingsource_pay_invoice(checking_id, payment.bolt11, fee_reserve_msat),
+        _fundingsource_pay_invoice(checking_id, bolt11, fee_reserve_msat),
         f"fundingsource_pay_invoice_{checking_id}",
     )
 
@@ -1081,7 +1266,8 @@ async def _check_fiat_invoice_limits(
 
 
 async def settle_hold_invoice(payment: Payment, preimage: str) -> InvoiceResponse:
-    if verify_preimage(preimage, payment.payment_hash) is False:
+    _, payment_hash, _ = payment.lightning_identifiers
+    if verify_preimage(preimage, payment_hash) is False:
         raise InvoiceError("Invalid preimage.", status="failed")
 
     funding_source = get_funding_source()
@@ -1100,10 +1286,9 @@ async def settle_hold_invoice(payment: Payment, preimage: str) -> InvoiceRespons
 
 
 async def cancel_hold_invoice(payment: Payment) -> InvoiceResponse:
+    _, payment_hash, _ = payment.lightning_identifiers
     funding_source = get_funding_source()
-    response = await funding_source.cancel_hold_invoice(
-        payment_hash=payment.payment_hash
-    )
+    response = await funding_source.cancel_hold_invoice(payment_hash=payment_hash)
 
     if not response.ok:
         raise InvoiceError(

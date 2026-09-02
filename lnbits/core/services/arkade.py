@@ -31,7 +31,13 @@ from lnbits.core.crud.arkade import (
     update_arkade_receive_outpoint_attribution,
     update_arkade_reconciliation,
 )
+from lnbits.core.crud.payments import (
+    compare_and_set_payment_success,
+    get_payment_by_native_id,
+    update_payment,
+)
 from lnbits.core.crud.wallets import get_wallet
+from lnbits.core.db import db
 from lnbits.core.models import (
     ArkadeAccountBinding,
     ArkadeEnrollmentBindingResponse,
@@ -40,6 +46,8 @@ from lnbits.core.models import (
     ArkadeIndexerVtxo,
     ArkadeReceiveAcknowledgement,
     ArkadeReceiveRequest,
+    Payment,
+    PaymentState,
 )
 from lnbits.core.models.users import Account
 from lnbits.db import Connection
@@ -584,7 +592,31 @@ async def create_arkade_receive_request_for_account(
     return request
 
 
-async def acknowledge_arkade_receive(  # noqa: C901
+async def get_arkade_receive_request_for_account(
+    account_id: str,
+    native_request_id: str,
+    conn: Connection | None = None,
+) -> ArkadeReceiveRequest:
+    if settings.lnbits_effective_installation_mode != "arkade_noncustodial":
+        raise ArkadeReceiveError("ARKADE_RECEIVE_UNAVAILABLE")
+    await require_arkade_ready(account_id, conn=conn)
+    request = await get_arkade_receive_request(native_request_id, conn=conn)
+    if not request or request.account_id != account_id:
+        raise ArkadeReceiveError("ARKADE_RECEIVE_NOT_FOUND")
+    return request
+
+
+async def acknowledge_arkade_receive(
+    account_id: str,
+    data: ArkadeReceiveAcknowledgement,
+    conn: Connection | None = None,
+) -> ArkadeReceiveRequest:
+    async with db.reuse_conn(conn) if conn else db.connect() as new_conn:
+        async with new_conn.transaction():
+            return await _acknowledge_arkade_receive(account_id, data, conn=new_conn)
+
+
+async def _acknowledge_arkade_receive(  # noqa: C901
     account_id: str,
     data: ArkadeReceiveAcknowledgement,
     conn: Connection | None = None,
@@ -621,27 +653,41 @@ async def acknowledge_arkade_receive(  # noqa: C901
     )
     verify_receive_proof(data)
     verify_receive_exit_membership(data)
-    if request.state != "pending":
-        return request
-    try:
-        updated = await update_arkade_receive_acknowledgement(
-            request,
-            index=data.index,
-            address=data.address,
-            script=data.script.lower(),
-            child_xonly_pubkey=data.child_xonly_pubkey,
-            conn=conn,
-        )
-    except IntegrityError as exc:
-        raise ArkadeReceiveError("ARKADE_RECEIVE_MAPPING_CONFLICT") from exc
-    if not updated:
-        winner = await get_arkade_receive_request(data.native_request_id, conn=conn)
-        if winner and _request_mapping_matches(winner, data):
-            return winner
-        raise ArkadeReceiveError("ARKADE_RECEIVE_MAPPING_CONFLICT")
-    result = await get_arkade_receive_request(data.native_request_id, conn=conn)
-    if not result:
-        raise ArkadeReceiveError("ARKADE_RECEIVE_UNAVAILABLE")
+    result = request
+    if request.state == "pending":
+        try:
+            updated = await update_arkade_receive_acknowledgement(
+                request,
+                index=data.index,
+                address=data.address,
+                script=data.script.lower(),
+                child_xonly_pubkey=data.child_xonly_pubkey,
+                conn=conn,
+            )
+        except IntegrityError as exc:
+            raise ArkadeReceiveError("ARKADE_RECEIVE_MAPPING_CONFLICT") from exc
+        if not updated:
+            result = await get_arkade_receive_request(data.native_request_id, conn=conn)
+            if not result or not _request_mapping_matches(result, data):
+                raise ArkadeReceiveError("ARKADE_RECEIVE_MAPPING_CONFLICT")
+        else:
+            result = await get_arkade_receive_request(data.native_request_id, conn=conn)
+            if not result:
+                raise ArkadeReceiveError("ARKADE_RECEIVE_UNAVAILABLE")
+    payment = await get_payment_by_native_id(result.native_request_id, conn=conn)
+    if payment:
+        if (
+            payment.protocol != "arkade"
+            or payment.wallet_id != result.wallet_id
+            or payment.amount != result.amount_sat * 1000
+            or payment.native_id != result.native_request_id
+        ):
+            raise ArkadeReceiveError("ARKADE_RECEIVE_MAPPING_CONFLICT")
+        if payment.arkade_address not in (None, result.address):
+            raise ArkadeReceiveError("ARKADE_RECEIVE_MAPPING_CONFLICT")
+        if payment.arkade_address is None:
+            payment.arkade_address = result.address
+            await update_payment(payment, conn=conn)
     return result
 
 
@@ -805,7 +851,7 @@ async def reconcile_arkade_receive(  # noqa: C901
     evidence: list[ArkadeIndexerVtxo],
     *,
     conn: Connection | None = None,
-) -> None:
+) -> list[Payment]:
     if settings.lnbits_effective_installation_mode != "arkade_noncustodial":
         raise ArkadeReceiveError("ARKADE_RECEIVE_UNAVAILABLE")
     await require_arkade_ready(account_id, conn=conn)
@@ -818,6 +864,7 @@ async def reconcile_arkade_receive(  # noqa: C901
         if required and previous_state and previous_state.last_error
         else None
     )
+    settled_payments: list[Payment] = []
     for vtxo in evidence:
         request = await get_arkade_receive_request_by_script(
             account_id, vtxo.script, conn=conn
@@ -929,10 +976,71 @@ async def reconcile_arkade_receive(  # noqa: C901
             "acknowledged",
             "settled",
         }:
+            address = request.address
+            payment = await get_payment_by_native_id(
+                request.native_request_id, conn=conn
+            )
+            if payment:
+                if (
+                    payment.protocol != "arkade"
+                    or payment.native_id != request.native_request_id
+                    or payment.wallet_id != request.wallet_id
+                    or payment.amount != request.amount_sat * 1000
+                    or not address
+                    or payment.arkade_address != address
+                ):
+                    required = True
+                    last_error = "ARKADE_RECONCILIATION_REQUIRED"
+                    await mark_arkade_receive_outpoints_conflict(
+                        request.native_request_id, conn=conn
+                    )
+                    await _mark_receive_reconciliation_required(
+                        account_id,
+                        last_error,
+                        request.native_request_id,
+                        conn,
+                    )
+                    continue
+                if payment.status in {
+                    PaymentState.PENDING.value,
+                    PaymentState.FAILED.value,
+                }:
+                    updated = await compare_and_set_payment_success(
+                        request.native_request_id,
+                        wallet_id=request.wallet_id,
+                        amount_msat=request.amount_sat * 1000,
+                        arkade_address=address,
+                        conn=conn,
+                    )
+                    if updated:
+                        payment.status = PaymentState.SUCCESS.value
+                        settled_payments.append(payment)
+                    else:
+                        current = await get_payment_by_native_id(
+                            request.native_request_id, conn=conn
+                        )
+                        if not current or current.status != PaymentState.SUCCESS.value:
+                            required = True
+                            last_error = "ARKADE_RECONCILIATION_REQUIRED"
+                            await _mark_receive_reconciliation_required(
+                                account_id,
+                                last_error,
+                                request.native_request_id,
+                                conn,
+                            )
+                            continue
+                elif payment.status != PaymentState.SUCCESS.value:
+                    required = True
+                    last_error = "ARKADE_RECONCILIATION_REQUIRED"
+                    await _mark_receive_reconciliation_required(
+                        account_id,
+                        last_error,
+                        request.native_request_id,
+                        conn,
+                    )
+                    continue
             if request.state != "settled":
                 now = datetime.now(timezone.utc)
-                # P2-8 owns the native payment/credit seam. P2-7 only records
-                # accepted indexer evidence and never writes apipayments or balances.
                 await settle_arkade_receive_request(
                     request.native_request_id, now, conn=conn
                 )
@@ -943,3 +1051,4 @@ async def reconcile_arkade_receive(  # noqa: C901
         last_error=last_error if required else None,
         conn=conn,
     )
+    return settled_payments

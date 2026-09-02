@@ -221,6 +221,7 @@ async def test_payment_api_fee_reserve_and_hold_invoice_actions(mocker):
     invoice = await create_wallet_invoice(
         wallet.id, CreateInvoice(out=False, amount=42, memo="reserve")
     )
+    assert invoice.bolt11 is not None
     reserve = await api_payments_fee_reserve(invoice.bolt11)
     assert json.loads(bytes(reserve.body))["fee_reserve"] >= 0
 

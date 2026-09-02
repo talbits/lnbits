@@ -593,3 +593,164 @@ test('generated module rejects vault tampering and restores a lost ready vault',
   expect(JSON.stringify(surfaces)).not.toContain('new correct horse')
   expect(logs).toEqual([])
 })
+
+test('browser receive allocation retries the journaled mapping without reallocating', async ({
+  page
+}) => {
+  const script = await readFile(modulePath, 'utf8')
+  await page.addInitScript(script)
+  await page.route('http://127.0.0.1/receive-test', route =>
+    route.fulfill({contentType: 'text/html', body: '<!doctype html>'})
+  )
+  await page.goto('http://127.0.0.1/receive-test')
+  await page.evaluate(id => {
+    const binding = {
+      account_id: id,
+      enrollment_id: 'abcdefabcdefabcdefabcdefabcdefab',
+      idempotency_key: '11111111111111111111111111111111',
+      network: 'regtest',
+      server_url: 'http://localhost:7070',
+      server_pubkey:
+        '3333333333333333333333333333333333333333333333333333333333333333'
+    }
+    let ready = false
+    const request = {
+      account_id: id,
+      wallet_id: 'wallet-1',
+      native_request_id: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      idempotency_key: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+      amount_sat: 21,
+      ...binding,
+      expires_at: Math.floor(Date.now() / 1000) + 600
+    }
+    const acks: unknown[] = []
+    let mismatchAck = false
+    window.g = {user: {id}, arkadeEnrollmentState: null}
+    window.LNbits = {
+      api: {
+        arkadeEnrollmentChallenge: async (requestedKey: string) => ({
+          data: {
+            ...binding,
+            state: ready ? 'ready' : 'pending',
+            idempotency_key: requestedKey,
+            ...(ready
+              ? {}
+              : {
+                  nonce:
+                    '2222222222222222222222222222222222222222222222222222222222222222',
+                  expires_at: Math.floor(Date.now() / 1000) + 600
+                }),
+            ...(ready ? {identity_xonly_pubkey: ''} : {})
+          }
+        }),
+        arkadeEnrollmentComplete: async data => {
+          ready = true
+          return {
+            data: {
+              ...binding,
+              state: 'ready',
+              idempotency_key: data.idempotency_key,
+              identity_xonly_pubkey: data.identity_xonly_pubkey
+            }
+          }
+        },
+        arkadeReceiveRequest: async () => ({data: request}),
+        arkadeReceiveAck: async (data: unknown) => {
+          acks.push(data)
+          const payload = data as Record<string, unknown>
+          return {
+            data: {
+              ...request,
+              state: 'acknowledged',
+              index: payload.index,
+              address: mismatchAck ? 'ark1wrongaddress' : payload.address,
+              script: payload.script,
+              child_xonly_pubkey: payload.child_xonly_pubkey
+            }
+          }
+        }
+      }
+    }
+    window.__receiveRequest = request
+    window.__receiveAcks = acks
+    window.__receiveControl = {
+      set mismatch(value: boolean) {
+        mismatchAck = value
+      }
+    }
+  }, accountId)
+
+  await page.evaluate(async phrase => {
+    await window.ArkadeEnrollment.enroll(phrase, 'correct horse battery', true)
+  }, mnemonic)
+  await page.evaluate(() => {
+    const request = window.__receiveRequest as Record<string, unknown>
+    const mapping = {
+      action: 'lnbits-arkade-receive-v1',
+      accountId: request.account_id,
+      walletId: request.wallet_id,
+      nativeRequestId: request.native_request_id,
+      idempotencyKey: request.idempotency_key,
+      amountSat: request.amount_sat,
+      index: 7,
+      address: 'ark1receiveaddress',
+      script: '5120' + '11'.repeat(32),
+      childXonlyPubkey: '22'.repeat(32),
+      network: request.network,
+      serverUrl: request.server_url,
+      serverPubkey: request.server_pubkey,
+      expiresAt: request.expires_at,
+      signature: '33'.repeat(64),
+      exitTapleaf: '51c0',
+      exitControlBlock: 'c0' + '44'.repeat(64)
+    }
+    localStorage.setItem(
+      `lnbits-arkade-receive-v1:${location.origin}:${request.account_id}`,
+      JSON.stringify([mapping])
+    )
+    return window.ArkadeEnrollment.allocateReceive('wallet-1', {
+      protocol: 'arkade',
+      native_id: request.native_request_id,
+      wallet_id: 'wallet-1',
+      amount: 21000
+    }).then(async first => {
+      const second = await window.ArkadeEnrollment.allocateReceive('wallet-1', {
+        protocol: 'arkade',
+        native_id: request.native_request_id,
+        wallet_id: 'wallet-1',
+        amount: 21000
+      })
+      return {first, second, acks: window.__receiveAcks}
+    })
+  })
+  const result = await page.evaluate(
+    id => ({
+      acks: window.__receiveAcks,
+      journal: JSON.parse(
+        localStorage.getItem(
+          `lnbits-arkade-receive-v1:${location.origin}:${id}`
+        ) || '[]'
+      )
+    }),
+    accountId
+  )
+  expect(result.acks).toHaveLength(2)
+  expect(result.journal).toHaveLength(1)
+  expect((result.acks[0] as Record<string, unknown>).address).toBe(
+    'ark1receiveaddress'
+  )
+  expect(result.acks[1]).toEqual(result.acks[0])
+  await page.evaluate(() => {
+    window.__receiveControl.mismatch = true
+  })
+  await expect(
+    page.evaluate(() =>
+      window.ArkadeEnrollment.allocateReceive('wallet-1', {
+        protocol: 'arkade',
+        native_id: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        wallet_id: 'wallet-1',
+        amount: 21000
+      })
+    )
+  ).rejects.toThrow('receive acknowledgement conflict')
+})

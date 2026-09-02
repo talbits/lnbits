@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timezone
 from time import time
 from typing import Any
@@ -34,8 +35,28 @@ async def get_payment(checking_id: str, conn: Connection | None = None) -> Payme
     )
 
 
+async def get_payment_by_native_id(
+    native_id: str, conn: Connection | None = None
+) -> Payment | None:
+    return await (conn or db).fetchone(
+        "SELECT * FROM apipayments WHERE native_id = :native_id",
+        {"native_id": native_id},
+        Payment,
+    )
+
+
+async def get_arkade_pending_payments(
+    conn: Connection | None = None,
+) -> list[Payment]:
+    return await (conn or db).fetchall(
+        "SELECT * FROM apipayments "
+        "WHERE protocol = 'arkade' AND amount > 0 AND status = 'pending'",
+        model=Payment,
+    )
+
+
 async def get_standalone_payment(
-    checking_id_or_hash: str,
+    checking_id_or_hash: str | None,
     incoming: bool | None = False,
     wallet_id: str | None = None,
     conn: Connection | None = None,
@@ -241,7 +262,7 @@ async def get_payments_status_count() -> PaymentsStatusCount:
 
 
 async def create_payment(
-    checking_id: str,
+    checking_id: str | None,
     data: CreatePayment,
     status: PaymentState = PaymentState.PENDING,
     conn: Connection | None = None,
@@ -253,7 +274,13 @@ async def create_payment(
 
     # we don't allow the creation of the same invoice twice
     # note: this can be removed if the db uniqueness constraints are set appropriately
-    previous_payment = await get_standalone_payment(checking_id, conn=conn)
+    previous_payment = (
+        await get_standalone_payment(checking_id, conn=conn)
+        if checking_id is not None
+        else None
+    )
+    if previous_payment is None and data.native_id is not None:
+        previous_payment = await get_payment_by_native_id(data.native_id, conn=conn)
     if previous_payment is not None:
         raise ValueError("Payment already exists")
     extra = data.extra or {}
@@ -275,6 +302,9 @@ async def create_payment(
         extra=extra,
         labels=data.labels or [],
         external_id=data.external_id,
+        protocol=data.protocol,
+        native_id=data.native_id or checking_id,
+        arkade_address=data.arkade_address,
     )
 
     await (conn or db).insert("apipayments", payment)
@@ -304,14 +334,77 @@ async def update_payment(
     new_checking_id: str | None = None,
     conn: Connection | None = None,
 ) -> Payment:
+    if (
+        payment.protocol == "arkade"
+        and payment.native_id != payment._original_native_id
+    ):
+        raise ValueError("Arkade native_id is immutable")
     payment.updated_at = datetime.now(timezone.utc)
-    await (conn or db).update(
-        "apipayments", payment, "WHERE checking_id = :checking_id"
-    )
+    where = "WHERE checking_id = :checking_id"
+    if payment.protocol == "arkade":
+        where = "WHERE native_id = :native_id"
+    await (conn or db).update("apipayments", payment, where)
     if new_checking_id and new_checking_id != payment.checking_id:
+        if payment.checking_id is None:
+            raise ValueError("Arkade payments cannot have a checking_id")
         await update_payment_checking_id(payment.checking_id, new_checking_id, conn)
         payment.checking_id = new_checking_id
     return payment
+
+
+async def compare_and_set_payment_success(
+    native_id: str,
+    *,
+    wallet_id: str,
+    amount_msat: int,
+    arkade_address: str,
+    conn: Connection | None = None,
+) -> bool:
+    database = conn or db
+    values = {
+        "native_id": native_id,
+        "wallet_id": wallet_id,
+        "amount": amount_msat,
+        "arkade_address": arkade_address,
+        "updated_at": datetime.now(timezone.utc),
+    }
+    result = await database.execute(
+        f"""
+        UPDATE apipayments
+        SET status = 'success',
+            updated_at = {database.timestamp_placeholder('updated_at')}
+        WHERE protocol = 'arkade' AND native_id = :native_id
+          AND wallet_id = :wallet_id AND amount = :amount
+          AND arkade_address = :arkade_address
+          AND status IN ('pending', 'failed')
+        """,  # noqa: S608
+        values,
+    )
+    return bool(result.rowcount)
+
+
+async def compare_and_set_arkade_payment_failed(
+    payment: Payment, conn: Connection | None = None
+) -> bool:
+    database = conn or db
+    labels = list(payment.labels)
+    if "expired" not in labels:
+        labels.append("expired")
+    result = await database.execute(
+        f"""
+        UPDATE apipayments
+        SET status = 'failed', labels = :labels,
+            updated_at = {database.timestamp_placeholder('updated_at')}
+        WHERE protocol = 'arkade' AND native_id = :native_id
+          AND status = 'pending'
+        """,  # noqa: S608
+        {
+            "native_id": payment.native_id,
+            "labels": json.dumps(labels),
+            "updated_at": datetime.now(timezone.utc),
+        },
+    )
+    return bool(result.rowcount)
 
 
 async def get_payments_history(
@@ -594,7 +687,7 @@ async def mark_webhook_sent(payment_hash: str, status: str) -> None:
     await db.execute(
         """
         UPDATE apipayments SET webhook_status = :status
-        WHERE payment_hash = :hash
+        WHERE payment_hash = :hash OR native_id = :hash
         """,
         {"status": status, "hash": payment_hash},
     )

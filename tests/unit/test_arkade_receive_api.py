@@ -92,3 +92,30 @@ async def test_receive_api_requires_auth_and_sanitizes_errors(monkeypatch):
         not_ready = await client.post("/api/v1/arkade/receive/ack", json=_ack_payload())
     assert not_ready.status_code == 400
     assert not_ready.json()["detail"] == "ARKADE_ENROLLMENT_REQUIRED"
+
+
+@pytest.mark.anyio
+async def test_receive_api_get_is_authenticated_and_owner_scoped(monkeypatch):
+    app = _app(Account(id=ACCOUNT_ID))
+    monkeypatch.setattr(
+        "lnbits.core.views.arkade_api.get_arkade_receive_request_for_account",
+        AsyncMock(return_value=_request()),
+    )
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get(f"/api/v1/arkade/receive/{REQUEST_ID}")
+    assert response.status_code == 200
+    assert response.json()["native_request_id"] == REQUEST_ID
+
+    other_app = _app(Account(id="99" * 16))
+    monkeypatch.setattr(
+        "lnbits.core.views.arkade_api.get_arkade_receive_request_for_account",
+        AsyncMock(side_effect=ArkadeReceiveError("ARKADE_RECEIVE_NOT_FOUND")),
+    )
+    async with AsyncClient(
+        transport=ASGITransport(app=other_app), base_url="http://test"
+    ) as client:
+        response = await client.get(f"/api/v1/arkade/receive/{REQUEST_ID}")
+    assert response.status_code == 400
+    assert response.json()["detail"] == "ARKADE_RECEIVE_NOT_FOUND"

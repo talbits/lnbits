@@ -133,7 +133,8 @@ async def wallet_lightning_address_callback(
         unhashed_description=metadata.encode(),
         extra=extra,
     )
-    invoice = parse_obj_as(LightningInvoice, LightningInvoice(payment.bolt11))
+    _, _, bolt11 = payment.lightning_identifiers
+    invoice = parse_obj_as(LightningInvoice, LightningInvoice(bolt11))
     return LnurlPayActionResponse(pr=invoice, disposable=False)
 
 
@@ -211,10 +212,11 @@ async def _charge_for_lightning_address(wallet: Wallet) -> None:
             },
         ),
     )
+    _, _, bolt11 = invoice.lightning_identifiers
     try:
         await pay_invoice(
             wallet_id=wallet.source_wallet_id,
-            payment_request=invoice.bolt11,
+            payment_request=bolt11,
             description="Lightning Address fee",
             tag="wallet_lightning_address_fee",
             extra={

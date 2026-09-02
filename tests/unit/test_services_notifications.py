@@ -399,6 +399,7 @@ async def test_dispatch_webhook_marks_missing_invalid_and_failed_requests(
 
     payment = await _create_payment(wallet, webhook=None)
     await dispatch_webhook(payment)
+    assert payment.checking_id is not None
     assert (await get_payment(payment.checking_id)).webhook_status == "-1"
 
     invalid_payment = await _create_payment(wallet, webhook="https://invalid.example")
@@ -420,6 +421,7 @@ async def test_dispatch_webhook_marks_missing_invalid_and_failed_requests(
     )
 
     await dispatch_webhook(invalid_payment)
+    assert invalid_payment.checking_id is not None
     assert (await get_payment(invalid_payment.checking_id)).webhook_status == "-1"
     assert invalid_client.posts == []
 
@@ -445,6 +447,7 @@ async def test_dispatch_webhook_marks_missing_invalid_and_failed_requests(
     )
 
     await dispatch_webhook(error_payment)
+    assert error_payment.checking_id is not None
     assert (await get_payment(error_payment.checking_id)).webhook_status == "500"
 
     request_payment = await _create_payment(wallet, webhook="https://request.example")
@@ -460,6 +463,7 @@ async def test_dispatch_webhook_marks_missing_invalid_and_failed_requests(
     )
 
     await dispatch_webhook(request_payment)
+    assert request_payment.checking_id is not None
     assert (await get_payment(request_payment.checking_id)).webhook_status == "-1"
 
 
@@ -484,6 +488,7 @@ async def test_dispatch_webhook_blocks_private_targets(
     )
     await dispatch_webhook(direct_payment)
 
+    assert direct_payment.checking_id is not None
     assert (await get_payment(direct_payment.checking_id)).webhook_status == "-1"
     assert client.posts == []
 
@@ -501,6 +506,7 @@ async def test_dispatch_webhook_blocks_private_targets(
     )
     await dispatch_webhook(dns_payment)
 
+    assert dns_payment.checking_id is not None
     assert (await get_payment(dns_payment.checking_id)).webhook_status == "-1"
     assert client.posts == []
 
@@ -511,6 +517,7 @@ async def test_dispatch_webhook_blocks_private_targets(
     )
     await dispatch_webhook(allowed_payment)
 
+    assert allowed_payment.checking_id is not None
     assert (await get_payment(allowed_payment.checking_id)).webhook_status == "200"
     assert str(client.posts[0][0]) == "https://10.0.0.1/internal"
 
@@ -541,6 +548,7 @@ async def test_dispatch_webhook_pins_allowed_target(
 
     await dispatch_webhook(payment)
 
+    assert payment.checking_id is not None
     assert (await get_payment(payment.checking_id)).webhook_status == "200"
     assert str(client.posts[0][0]) == "https://93.184.216.34:8443/paid"
     assert client.posts[0][1]["headers"]["Host"] == "callback.example:8443"

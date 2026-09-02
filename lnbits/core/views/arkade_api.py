@@ -16,6 +16,7 @@ from lnbits.core.services.arkade import (
     acknowledge_arkade_receive,
     complete_enrollment,
     create_enrollment_challenge,
+    get_arkade_receive_request_for_account,
 )
 from lnbits.decorators import check_authenticated_account
 
@@ -67,6 +68,25 @@ async def api_arkade_enrollment_complete(
         return await complete_enrollment(account, data)
     except ArkadeEnrollmentError as exc:
         raise _public_error(exc) from exc
+
+
+@arkade_router.get("/receive/{native_request_id}", response_model=ArkadeReceiveRequest)
+async def api_arkade_receive_request(
+    native_request_id: str,
+    account: Account = Depends(check_authenticated_account),
+):
+    try:
+        return await get_arkade_receive_request_for_account(
+            account.id, native_request_id
+        )
+    except ArkadeEnrollmentError as exc:
+        if str(exc) == "ARKADE_ENROLLMENT_REQUIRED":
+            raise HTTPException(
+                HTTPStatus.BAD_REQUEST, "ARKADE_ENROLLMENT_REQUIRED"
+            ) from exc
+        raise _public_error(exc) from exc
+    except ArkadeReceiveError as exc:
+        raise _public_receive_error(exc) from exc
 
 
 @arkade_router.post("/receive/ack", response_model=ArkadeReceiveRequest)
