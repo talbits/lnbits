@@ -1,11 +1,13 @@
 import {execFile} from 'node:child_process'
+import {createHash} from 'node:crypto'
 import {mkdtemp, readFile, rm} from 'node:fs/promises'
 import {tmpdir} from 'node:os'
 import {join, resolve} from 'node:path'
 import {promisify} from 'node:util'
 
 import {expect, test, type BrowserContext, type Page} from '@playwright/test'
-import {ArkAddress} from '@arkade-os/sdk'
+import {schnorr} from '@noble/curves/secp256k1.js'
+import {ArkAddress, P2A, RestIndexerProvider, Transaction} from '@arkade-os/sdk'
 import {build} from 'esbuild'
 
 const execFileAsync = promisify(execFile)
@@ -29,6 +31,25 @@ const zeroIntentFees = {
 
 const toHex = (bytes: Uint8Array): string =>
   Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('')
+
+const canonicalChangeStatement = (
+  proof: NonNullable<ProofResult['normalChangeProof']>
+): string =>
+  [
+    'action=lnbits-arkade-change-proof',
+    'version=1',
+    `intent_id=${proof.intentId}`,
+    `input_outpoint=${proof.selectedInput.txid}:${proof.selectedInput.vout}`,
+    `input_value=${proof.selectedInput.value}`,
+    `input_script=${proof.selectedInput.script}`,
+    `destination_script=${proof.destination.script}`,
+    `destination_amount=${proof.destination.amount}`,
+    `change_script=${proof.change.script}`,
+    `change_amount=${proof.change.amount}`,
+    `network=${proof.network}`,
+    `server_url=${proof.serverUrl}`,
+    `server_pubkey=${proof.serverPubkey}`
+  ].join('\n')
 
 type IntentFees = Record<string, string>
 
@@ -86,6 +107,26 @@ type ProofResult = {
   persistedState: unknown
   contracts: unknown[]
   sendTxid?: string
+  normalChangeProof?: {
+    intentId: string
+    statement: string
+    digest: string
+    signature: string
+    childXonlyPubkey: string
+    network: string
+    serverUrl: string
+    serverPubkey: string
+    arkTxid: string
+    contract: {type: string; script: string; address: string}
+    selectedInput: {
+      txid: string
+      vout: number
+      value: number
+      script: string
+    }
+    destination: {script: string; amount: number}
+    change: {script: string; amount: number}
+  }
 }
 
 type ProofInput = {
@@ -98,10 +139,12 @@ type ProofInput = {
   arkServerUrl: string
   esploraUrl: string
   restore?: boolean
-  mode?: 'start' | 'final' | 'send' | 'dispose' | 'restore'
+  mode?: 'start' | 'final' | 'send' | 'dispose' | 'restore' | 'change-proof'
   receives?: ProofResult['receives']
   sendRecipientAddress?: string
   sendAmount?: number
+  changeProofRecipientAddress?: string
+  changeProofAmount?: number
 }
 
 declare global {
@@ -706,6 +749,126 @@ test('receives, sends, and restores native regtest Arkade funds', async ({
       expect(freshRestored.vtxos).toEqual(restored.vtxos)
       expect(freshRestored.balance).toEqual(restored.balance)
       expect(requests.join('\n')).not.toContain(mnemonic)
+      const changeProof = await loadProof(
+        freshPage,
+        bundlePath,
+        {
+          ...input,
+          mode: 'change-proof',
+          changeProofRecipientAddress: recipientAddress,
+          changeProofAmount: 10_000
+        },
+        false,
+        true
+      )
+      const normalChangeProof = changeProof.normalChangeProof
+      expect(normalChangeProof).toBeDefined()
+      const proof = normalChangeProof!
+      expect(proof.intentId).toMatch(/^[0-9a-f]{32}$/)
+      expect(proof.arkTxid).toMatch(/^[0-9a-f]{64}$/)
+      expect(proof.network).toBe('regtest')
+      expect(proof.serverUrl).toBe(arkServerUrl)
+      expect(proof.contract).toMatchObject({type: 'default'})
+      expect(proof.contract.script).toBe(proof.change.script)
+      expect(toHex(ArkAddress.decode(proof.contract.address).pkScript)).toBe(
+        proof.contract.script
+      )
+      expect(proof.destination).toMatchObject({
+        script: recipientScript,
+        amount: 10_000
+      })
+      expect(proof.change.amount).toBeGreaterThan(0)
+      expect(proof.change.script).not.toBe(recipientScript)
+      expect(proof.selectedInput.value).toBe(
+        proof.destination.amount + proof.change.amount
+      )
+
+      const statement = canonicalChangeStatement(proof)
+      const digest = createHash('sha256').update(statement).digest()
+      expect(proof.statement).toBe(statement)
+      expect(proof.digest).toBe(digest.toString('hex'))
+      expect(proof.signature).toMatch(/^[0-9a-f]{128}$/)
+      expect(proof.childXonlyPubkey).toMatch(/^[0-9a-f]{64}$/)
+      expect(
+        schnorr.verify(
+          Buffer.from(proof.signature, 'hex'),
+          digest,
+          Buffer.from(proof.childXonlyPubkey, 'hex')
+        )
+      ).toBe(true)
+
+      const indexer = new RestIndexerProvider(arkServerUrl)
+      let rawVirtualTx: Transaction | undefined
+      await expect
+        .poll(
+          async () => {
+            const {txs} = await indexer.getVirtualTxs([proof.arkTxid])
+            const encoded = txs[0]
+            if (!encoded) return false
+            const decoded = Transaction.fromPSBT(
+              Uint8Array.from(Buffer.from(encoded, 'base64'))
+            )
+            if (decoded.id !== proof.arkTxid) return false
+            rawVirtualTx = decoded
+            return true
+          },
+          {timeout: 30_000}
+        )
+        .toBe(true)
+      expect(rawVirtualTx).toBeDefined()
+      const rawTx = rawVirtualTx!
+      expect(rawTx.id).toBe(proof.arkTxid)
+
+      let indexedInput:
+        | Awaited<ReturnType<typeof indexer.getVtxos>>['vtxos'][number]
+        | undefined
+      await expect
+        .poll(
+          async () => {
+            indexedInput = (
+              await indexer.getVtxos({
+                outpoints: [
+                  {
+                    txid: proof.selectedInput.txid,
+                    vout: proof.selectedInput.vout
+                  }
+                ]
+              })
+            ).vtxos[0]
+            return indexedInput?.isSpent === true && !!indexedInput.spentBy
+          },
+          {timeout: 30_000}
+        )
+        .toBe(true)
+      expect(indexedInput).toMatchObject({
+        value: proof.selectedInput.value,
+        script: proof.selectedInput.script,
+        isSpent: true
+      })
+      expect(indexedInput?.spentBy).toBeTruthy()
+
+      const rawInputs = Array.from({length: rawTx.inputsLength}, (_, index) => {
+        const input = rawTx.getInput(index)
+        return {txid: toHex(input.txid!), vout: input.index}
+      })
+      expect(rawInputs).toEqual([{txid: indexedInput!.spentBy, vout: 0}])
+      const rawOutputs = Array.from(
+        {length: rawTx.outputsLength},
+        (_, index) => {
+          const output = rawTx.getOutput(index)
+          return {script: toHex(output.script), amount: Number(output.amount)}
+        }
+      )
+      expect(rawOutputs).toHaveLength(3)
+      expect(rawOutputs[0]).toEqual(proof.destination)
+      expect(rawOutputs[1]).toEqual(proof.change)
+      expect(rawOutputs[2]).toEqual({script: toHex(P2A.script), amount: 0})
+      expect(rawTx.fee).toBe(0n)
+
+      const forbidden =
+        /(?:mnemonic|secret|seed|private|xpub|signingDescriptor)/i
+      expect(JSON.stringify(proof)).not.toMatch(forbidden)
+      expect(requests.join('\n')).not.toMatch(forbidden)
       await freshContext.close()
       freshContext = undefined
     } finally {

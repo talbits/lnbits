@@ -1,4 +1,5 @@
 import {
+  ArkAddress,
   CSVMultisigTapscript,
   DefaultVtxo,
   deriveDescriptorLeafPubKey,
@@ -16,6 +17,44 @@ const toHex = (bytes: Uint8Array): string =>
 
 const fromHex = (value: string): Uint8Array =>
   Uint8Array.from(value.match(/../g) ?? [], byte => parseInt(byte, 16))
+
+const sha256 = async (value: string): Promise<Uint8Array> =>
+  new Uint8Array(
+    await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value))
+  )
+
+const canonicalChangeStatement = ({
+  intentId,
+  selectedInput,
+  destination,
+  change,
+  network,
+  serverUrl,
+  serverPubkey
+}: {
+  intentId: string
+  selectedInput: {txid: string; vout: number; value: number; script: string}
+  destination: {script: string; amount: number}
+  change: {script: string; amount: number}
+  network: string
+  serverUrl: string
+  serverPubkey: string
+}): string =>
+  [
+    'action=lnbits-arkade-change-proof',
+    'version=1',
+    `intent_id=${intentId}`,
+    `input_outpoint=${selectedInput.txid}:${selectedInput.vout}`,
+    `input_value=${selectedInput.value}`,
+    `input_script=${selectedInput.script}`,
+    `destination_script=${destination.script}`,
+    `destination_amount=${destination.amount}`,
+    `change_script=${change.script}`,
+    `change_amount=${change.amount}`,
+    `network=${network}`,
+    `server_url=${serverUrl}`,
+    `server_pubkey=${serverPubkey}`
+  ].join('\n')
 
 type RepositoryInputs = {
   installationId: string
@@ -43,7 +82,8 @@ type Receive = {
   signingDescriptor: string
 }
 
-type RegtestMode = 'start' | 'final' | 'send' | 'dispose' | 'restore'
+type RegtestMode =
+  'start' | 'final' | 'send' | 'dispose' | 'restore' | 'change-proof'
 
 const requireText = (name: string, value: string): string => {
   if (typeof value !== 'string' || !value.trim()) {
@@ -238,7 +278,9 @@ const runRegtestProof = async ({
   mode = restore ? 'restore' : 'start',
   receives = [],
   sendRecipientAddress,
-  sendAmount
+  sendAmount,
+  changeProofRecipientAddress,
+  changeProofAmount
 }: RepositoryInputs & {
   mnemonic: string
   passphrase?: string
@@ -249,6 +291,8 @@ const runRegtestProof = async ({
   receives?: Receive[]
   sendRecipientAddress?: string
   sendAmount?: number
+  changeProofRecipientAddress?: string
+  changeProofAmount?: number
 }) => {
   const repositoryName = repositoryNameFor({
     installationId,
@@ -328,6 +372,161 @@ const runRegtestProof = async ({
       liveWallet = undefined
     }
     return result
+  }
+
+  if (mode === 'change-proof') {
+    if (
+      !changeProofRecipientAddress ||
+      typeof changeProofAmount !== 'number' ||
+      !Number.isSafeInteger(changeProofAmount) ||
+      changeProofAmount <= 0
+    ) {
+      throw new Error('change-proof requires a positive safe amount')
+    }
+    const identity = MnemonicIdentity.fromMnemonic(mnemonic, {
+      isMainnet: false,
+      passphrase
+    })
+    const walletRepository = new IndexedDBWalletRepository(repositoryName)
+    const contractRepository = new IndexedDBContractRepository(repositoryName)
+    const wallet = await Wallet.create({
+      identity,
+      arkServerUrl,
+      esploraUrl,
+      storage: {walletRepository, contractRepository},
+      walletMode: 'hd',
+      settlementConfig: false
+    })
+    try {
+      const serverInfo = await wallet.arkProvider.getInfo()
+      const spendable = await wallet.getSpendableVtxos()
+      const selectedCandidate = spendable.find(
+        vtxo => vtxo.value > changeProofAmount + Number(serverInfo.dust)
+      )
+      if (!selectedCandidate) {
+        throw new Error('change-proof found no suitable spendable VTXO')
+      }
+      const [newAddress] = await wallet.getNewAddresses({forceNew: true})
+      if (!newAddress)
+        throw new Error('change-proof did not allocate an address')
+      const changeContract = newAddress.contract
+      const changeSigningDescriptor = newAddress.signingDescriptor
+      if (
+        changeContract.type !== 'default' ||
+        changeContract.address !== newAddress.address ||
+        changeContract.metadata?.signingDescriptor !== changeSigningDescriptor
+      ) {
+        throw new Error('change-proof address contract metadata mismatch')
+      }
+      const changeScript = changeContract.script
+      const destinationScript = toHex(
+        ArkAddress.decode(changeProofRecipientAddress).pkScript
+      )
+      const selected = (await wallet.getSpendableVtxos()).find(
+        vtxo =>
+          vtxo.txid === selectedCandidate.txid &&
+          vtxo.vout === selectedCandidate.vout
+      )
+      if (!selected || selected.value !== selectedCandidate.value) {
+        throw new Error('change-proof selected VTXO changed before signing')
+      }
+      const changeAmount = selected.value - changeProofAmount
+      const intentId = toHex(crypto.getRandomValues(new Uint8Array(16)))
+      const serverPubkey = serverInfo.signerPubkey
+      const destination = {script: destinationScript, amount: changeProofAmount}
+      const change = {script: changeScript, amount: changeAmount}
+      const statement = canonicalChangeStatement({
+        intentId,
+        selectedInput: {
+          txid: selected.txid,
+          vout: selected.vout,
+          value: selected.value,
+          script: selected.script
+        },
+        destination,
+        change,
+        network: networkName,
+        serverUrl: arkServerUrl,
+        serverPubkey
+      })
+      const digest = await sha256(statement)
+      const descriptorProvider = await HDDescriptorProvider.create(
+        identity,
+        walletRepository
+      )
+      const signature = await descriptorProvider.signMessageWithDescriptor(
+        changeSigningDescriptor,
+        digest,
+        'schnorr'
+      )
+      const childXonlyPubkey = toHex(
+        deriveDescriptorLeafPubKey(changeSigningDescriptor)
+      )
+      const manager = await wallet.getContractManager()
+      const publicMetadata = {
+        ...changeContract.metadata,
+        proof: 'p2-11-normal-change',
+        intentId,
+        statement,
+        digest: toHex(digest),
+        signature: toHex(signature),
+        childXonlyPubkey,
+        network: networkName,
+        serverUrl: arkServerUrl,
+        serverPubkey,
+        destinationScript,
+        destinationAmount: changeProofAmount,
+        changeScript,
+        changeAmount,
+        reservedOutpoint: `${selected.txid}:${selected.vout}`
+      }
+      const updatedContract = await manager.updateContract(changeScript, {
+        metadata: publicMetadata
+      })
+      if (
+        updatedContract.metadata?.signingDescriptor !== changeSigningDescriptor
+      ) {
+        throw new Error('change-proof update dropped signing descriptor')
+      }
+      const {arkTxid} = await wallet.buildAndSubmitOffchainTx(
+        [selected],
+        [
+          {
+            script: ArkAddress.decode(changeProofRecipientAddress).pkScript,
+            amount: BigInt(changeProofAmount)
+          },
+          {script: fromHex(changeScript), amount: BigInt(changeAmount)}
+        ]
+      )
+      return {
+        normalChangeProof: {
+          intentId,
+          arkTxid,
+          statement,
+          digest: toHex(digest),
+          signature: toHex(signature),
+          childXonlyPubkey,
+          network: networkName,
+          serverUrl: arkServerUrl,
+          serverPubkey,
+          contract: {
+            type: updatedContract.type,
+            script: updatedContract.script,
+            address: updatedContract.address
+          },
+          selectedInput: {
+            txid: selected.txid,
+            vout: selected.vout,
+            value: selected.value,
+            script: selected.script
+          },
+          destination,
+          change
+        }
+      }
+    } finally {
+      await wallet.dispose()
+    }
   }
 
   if (mode !== 'restore') {
