@@ -1177,3 +1177,58 @@ async def _m054_add_payment_protocol_identity(
         )
         GROUP BY apipayments.wallet_id
     """)
+
+
+async def m055_create_arkade_outgoing_tables(db: Connection):
+    """Store browser-authorized Arkade outgoing intent state and input claims."""
+    await db.execute(f"""
+        CREATE TABLE IF NOT EXISTS arkade_outgoing_intents (
+            intent_id TEXT PRIMARY KEY,
+            account_id TEXT NOT NULL REFERENCES accounts (id),
+            wallet_id TEXT NOT NULL REFERENCES wallets (id),
+            amount_msat {db.big_int} NOT NULL CHECK (
+                amount_msat > 0 AND amount_msat / 1000 * 1000 = amount_msat
+            ),
+            max_fee_msat {db.big_int} NOT NULL CHECK (max_fee_msat = 0),
+            destination TEXT NOT NULL,
+            destination_kind TEXT NOT NULL CHECK (destination_kind = 'arkade_address'),
+            status TEXT NOT NULL DEFAULT 'reserved' CHECK (
+                status IN ('reserved', 'submitted', 'settled', 'released', 'disputed')
+            ),
+            arkade_txid TEXT,
+            actual_fee_msat {db.big_int},
+            expires_at TIMESTAMP NOT NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT {db.timestamp_now},
+            updated_at TIMESTAMP NOT NULL DEFAULT {db.timestamp_now},
+            reserved_at TIMESTAMP NOT NULL DEFAULT {db.timestamp_now},
+            submitted_at TIMESTAMP,
+            settled_at TIMESTAMP,
+            released_at TIMESTAMP,
+            disputed_at TIMESTAMP,
+            CHECK (actual_fee_msat IS NULL OR actual_fee_msat >= 0),
+            CHECK (
+                actual_fee_msat IS NULL OR actual_fee_msat <= max_fee_msat
+            ),
+            CHECK (expires_at > reserved_at)
+        )
+        """)
+    await db.execute(f"""
+        CREATE TABLE IF NOT EXISTS arkade_outgoing_intent_inputs (
+            intent_id TEXT NOT NULL REFERENCES arkade_outgoing_intents (intent_id),
+            txid TEXT NOT NULL,
+            vout {db.big_int} NOT NULL CHECK (vout >= 0 AND vout <= 4294967295),
+            amount_sat {db.big_int} NOT NULL
+                CHECK (amount_sat > 0 AND amount_sat <= 2100000000000000),
+            claimed_at TIMESTAMP NOT NULL DEFAULT {db.timestamp_now},
+            PRIMARY KEY (intent_id, txid, vout),
+            UNIQUE (txid, vout)
+        )
+        """)
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_arkade_outgoing_intents_account_status "
+        "ON arkade_outgoing_intents (account_id, status)"
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_arkade_outgoing_intents_wallet_status "
+        "ON arkade_outgoing_intents (wallet_id, status)"
+    )

@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, root_validator
 
 ArkadeBindingState = Literal["pending", "ready"]
 ArkadeReceiveState = Literal[
@@ -119,3 +119,46 @@ class ArkadeReconciliation(BaseModel):
     last_error: str | None = None
     observed_at: datetime | None = None
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+ArkadeOutgoingStatus = Literal[
+    "reserved", "submitted", "settled", "released", "disputed"
+]
+ArkadeOutgoingDestinationKind = Literal["arkade_address"]
+
+
+class ArkadeOutgoingIntent(BaseModel):
+    intent_id: str = Field(regex=r"^[0-9a-f]{32}$")
+    account_id: str
+    wallet_id: str
+    amount_msat: int = Field(gt=0, multiple_of=1000)
+    max_fee_msat: Literal[0] = 0
+    destination: str = Field(min_length=1, max_length=1023)
+    destination_kind: ArkadeOutgoingDestinationKind = "arkade_address"
+    status: ArkadeOutgoingStatus = "reserved"
+    arkade_txid: str | None = Field(default=None, regex=r"^[0-9a-f]{64}$")
+    actual_fee_msat: Literal[0] | None = None
+    expires_at: datetime
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    reserved_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    submitted_at: datetime | None = None
+    settled_at: datetime | None = None
+    released_at: datetime | None = None
+    disputed_at: datetime | None = None
+
+    @root_validator
+    def validate_expiry(cls, values):
+        expires_at = values.get("expires_at")
+        reserved_at = values.get("reserved_at")
+        if expires_at and reserved_at and expires_at <= reserved_at:
+            raise ValueError("Arkade outgoing intent must expire after reservation")
+        return values
+
+
+class ArkadeOutgoingIntentInput(BaseModel):
+    intent_id: str = Field(regex=r"^[0-9a-f]{32}$")
+    txid: str = Field(regex=r"^[0-9a-f]{64}$")
+    vout: int = Field(ge=0, le=4_294_967_295)
+    amount_sat: int = Field(gt=0, le=2_100_000_000_000_000)
+    claimed_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
