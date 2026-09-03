@@ -7,7 +7,7 @@ from uuid import uuid4
 import httpx
 from bech32 import CHARSET, bech32_hrp_expand, bech32_polymod, convertbits
 from coincurve import PublicKeyXOnly
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from lnbits.core.crud.arkade import (
     complete_arkade_binding,
@@ -31,8 +31,14 @@ from lnbits.core.crud.arkade import (
     update_arkade_receive_outpoint_attribution,
     update_arkade_reconciliation,
 )
+from lnbits.core.crud.arkade_outgoing import (
+    create_arkade_outgoing_intent,
+    get_arkade_outgoing_intent,
+    release_arkade_outgoing_intent,
+)
 from lnbits.core.crud.payments import (
     compare_and_set_payment_success,
+    create_payment,
     get_payment_by_native_id,
     update_payment,
 )
@@ -49,6 +55,8 @@ from lnbits.core.models import (
     Payment,
     PaymentState,
 )
+from lnbits.core.models.arkade import ArkadeOutgoingIntent
+from lnbits.core.models.payments import CreatePayment
 from lnbits.core.models.users import Account
 from lnbits.db import Connection
 from lnbits.settings import settings
@@ -82,6 +90,226 @@ class ArkadeEnrollmentError(ValueError):
 
 class ArkadeReceiveError(ValueError):
     pass
+
+
+class ArkadeOutgoingError(ValueError):
+    pass
+
+
+def _is_database_busy(exc: OperationalError) -> bool:
+    original = getattr(exc, "orig", None)
+    states = {
+        str(getattr(original, "sqlstate", "")),
+        str(getattr(original, "pgcode", "")),
+    }
+    return bool(states & {"40001", "40P01", "55P03"}) or any(
+        word in str(exc).lower() for word in ("locked", "busy")
+    )
+
+
+async def reserve_arkade_outgoing_intent(  # noqa: C901
+    account_id: str,
+    intent: ArkadeOutgoingIntent,
+    conn: Connection | None = None,
+) -> tuple[ArkadeOutgoingIntent, Payment]:
+    """Reserve one logical-wallet Arkade outgoing payment atomically."""
+    if settings.lnbits_effective_installation_mode != "arkade_noncustodial":
+        raise ArkadeOutgoingError("ARKADE_OUTGOING_UNAVAILABLE")
+    if intent.account_id != account_id:
+        raise ArkadeOutgoingError("ARKADE_OUTGOING_ACCOUNT_MISMATCH")
+    if intent.status != "reserved" or intent.max_fee_msat != 0:
+        raise ArkadeOutgoingError("ARKADE_OUTGOING_INVALID_REQUEST")
+
+    try:
+        existing_intent = await get_arkade_outgoing_intent(intent.intent_id, conn=conn)
+        existing_payment = await get_payment_by_native_id(intent.intent_id, conn=conn)
+    except OperationalError as exc:
+        if _is_database_busy(exc):
+            raise ArkadeOutgoingError("ARKADE_OUTGOING_BUSY") from None
+        raise
+    if existing_intent or existing_payment:
+        return _existing_outgoing_pair(intent, existing_intent, existing_payment)
+
+    # The public observation must not share the reservation transaction.
+    evidence = await fetch_arkade_indexer_vtxos(account_id)
+    unique_vtxos: dict[tuple[str, int], ArkadeIndexerVtxo] = {}
+    for vtxo in evidence:
+        key = (vtxo.txid, vtxo.vout)
+        if key in unique_vtxos and unique_vtxos[key] != vtxo:
+            raise ArkadeOutgoingError("ARKADE_INDEXER_INVALID_RESPONSE")
+        unique_vtxos[key] = vtxo
+    backing_msat = sum(
+        vtxo.amount_sat * 1000
+        for vtxo in unique_vtxos.values()
+        if not vtxo.is_spent and not vtxo.is_swept
+    )
+
+    try:
+        async with db.reuse_conn(conn) if conn else db.connect() as database:
+            async with database.transaction():
+                return await _reserve_arkade_outgoing_intent(
+                    account_id, intent, backing_msat, database
+                )
+    except OperationalError as exc:
+        if _is_database_busy(exc):
+            raise ArkadeOutgoingError("ARKADE_OUTGOING_BUSY") from None
+        raise
+
+
+async def _reserve_arkade_outgoing_intent(
+    account_id: str,
+    intent: ArkadeOutgoingIntent,
+    backing_msat: int,
+    conn: Connection,
+) -> tuple[ArkadeOutgoingIntent, Payment]:
+    await conn.execute(
+        "UPDATE arkade_account_bindings SET account_id = account_id "
+        "WHERE account_id = :account_id AND state = 'ready'",
+        {"account_id": account_id},
+    )
+    binding = await get_arkade_binding(account_id, conn=conn)
+    if not binding or binding.state != "ready":
+        raise ArkadeOutgoingError("ARKADE_ENROLLMENT_REQUIRED")
+
+    wallet = await get_wallet(intent.wallet_id, conn=conn)
+    if not wallet or wallet.id != intent.wallet_id or wallet.user != account_id:
+        raise ArkadeOutgoingError("ARKADE_WALLET_NOT_OWNED")
+    if not wallet.can_send_payments:
+        raise ArkadeOutgoingError("ARKADE_OUTGOING_NOT_ALLOWED")
+
+    existing_intent = await get_arkade_outgoing_intent(intent.intent_id, conn=conn)
+    existing_payment = await get_payment_by_native_id(intent.intent_id, conn=conn)
+    if existing_intent:
+        return _existing_outgoing_pair(intent, existing_intent, existing_payment)
+    if existing_payment:
+        raise ArkadeOutgoingError("ARKADE_OUTGOING_CORRUPT")
+
+    if wallet.balance_msat < intent.amount_msat:
+        raise ArkadeOutgoingError("ARKADE_INSUFFICIENT_FUNDS")
+    balances = await conn.fetchone(
+        "SELECT COALESCE(SUM(b.balance), 0) AS balance_msat "
+        "FROM wallets w LEFT JOIN balances b ON b.wallet_id = w.id "
+        'WHERE w."user" = :account_id',
+        {"account_id": account_id},
+    )
+    reservations = await conn.fetchone(
+        "SELECT COALESCE(SUM(amount_msat + max_fee_msat), 0) AS obligations_msat "
+        "FROM arkade_outgoing_intents "
+        "WHERE account_id = :account_id AND status IN ('reserved', 'submitted')",
+        {"account_id": account_id},
+    )
+    gross_obligations = int(balances["balance_msat"]) + int(
+        reservations["obligations_msat"]
+    )
+    if gross_obligations > backing_msat:
+        raise ArkadeOutgoingError("ARKADE_BACKING_DEFICIT")
+
+    created_intent = await create_arkade_outgoing_intent(intent, conn=conn)
+    payment = await create_payment(
+        None,
+        CreatePayment(
+            wallet_id=intent.wallet_id,
+            amount_msat=-intent.amount_msat,
+            memo="Arkade outgoing payment",
+            protocol="arkade",
+            native_id=intent.intent_id,
+            arkade_address=intent.destination,
+        ),
+        status=PaymentState.PENDING,
+        conn=conn,
+    )
+    return created_intent, payment
+
+
+def _outgoing_intent_matches(
+    current: ArkadeOutgoingIntent, requested: ArkadeOutgoingIntent
+) -> bool:
+    return all(
+        getattr(current, field) == getattr(requested, field)
+        for field in (
+            "intent_id",
+            "account_id",
+            "wallet_id",
+            "amount_msat",
+            "max_fee_msat",
+            "destination",
+            "destination_kind",
+            "expires_at",
+        )
+    )
+
+
+def _existing_outgoing_pair(
+    intent: ArkadeOutgoingIntent,
+    existing_intent: ArkadeOutgoingIntent | None,
+    existing_payment: Payment | None,
+) -> tuple[ArkadeOutgoingIntent, Payment]:
+    if not existing_intent:
+        raise ArkadeOutgoingError("ARKADE_OUTGOING_CORRUPT")
+    if not _outgoing_intent_matches(existing_intent, intent):
+        raise ArkadeOutgoingError("ARKADE_OUTGOING_IDEMPOTENCY_CONFLICT")
+    if not existing_payment or not _outgoing_payment_matches(existing_payment, intent):
+        raise ArkadeOutgoingError("ARKADE_OUTGOING_CORRUPT")
+    expected_status = {
+        "reserved": PaymentState.PENDING.value,
+        "submitted": PaymentState.PENDING.value,
+        "disputed": PaymentState.PENDING.value,
+        "released": PaymentState.FAILED.value,
+        "settled": PaymentState.SUCCESS.value,
+    }[existing_intent.status]
+    if existing_payment.status != expected_status:
+        raise ArkadeOutgoingError("ARKADE_OUTGOING_CORRUPT")
+    return existing_intent, existing_payment
+
+
+def _outgoing_payment_matches(payment: Payment, intent: ArkadeOutgoingIntent) -> bool:
+    return (
+        payment.protocol == "arkade"
+        and payment.native_id == intent.intent_id
+        and payment.wallet_id == intent.wallet_id
+        and payment.amount == -intent.amount_msat
+        and payment.fee == 0
+        and payment.arkade_address == intent.destination
+        and payment.checking_id is None
+        and payment.payment_hash is None
+        and payment.bolt11 is None
+    )
+
+
+async def release_arkade_outgoing_payment(
+    account_id: str, intent_id: str, conn: Connection | None = None
+) -> bool:
+    """Release a reserved intent and refund its linked pending payment."""
+    try:
+        async with db.reuse_conn(conn) if conn else db.connect() as database:
+            async with database.transaction():
+                intent = await get_arkade_outgoing_intent(intent_id, conn=database)
+                if not intent or intent.account_id != account_id:
+                    raise ArkadeOutgoingError("ARKADE_OUTGOING_NOT_FOUND")
+                payment = await get_payment_by_native_id(intent_id, conn=database)
+                if not payment:
+                    raise ArkadeOutgoingError("ARKADE_OUTGOING_CORRUPT")
+                if not _outgoing_payment_matches(payment, intent):
+                    raise ArkadeOutgoingError("ARKADE_OUTGOING_CORRUPT")
+                if (
+                    intent.status == "released"
+                    and payment.status == PaymentState.FAILED.value
+                ):
+                    return False
+                if (
+                    intent.status != "reserved"
+                    or payment.status != PaymentState.PENDING.value
+                ):
+                    raise ArkadeOutgoingError("ARKADE_INTENT_INVALID_TRANSITION")
+                released = await release_arkade_outgoing_intent(intent_id, database)
+                if released:
+                    payment.status = PaymentState.FAILED.value
+                    await update_payment(payment, conn=database)
+                return released
+    except OperationalError as exc:
+        if _is_database_busy(exc):
+            raise ArkadeOutgoingError("ARKADE_OUTGOING_BUSY") from None
+        raise
 
 
 def canonical_enrollment_statement(
