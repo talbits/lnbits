@@ -32,8 +32,10 @@ from lnbits.core.crud.arkade import (
     update_arkade_reconciliation,
 )
 from lnbits.core.crud.arkade_outgoing import (
+    authorize_arkade_outgoing_intent,
     create_arkade_outgoing_intent,
     get_arkade_outgoing_intent,
+    get_arkade_outgoing_intent_inputs,
     release_arkade_outgoing_intent,
 )
 from lnbits.core.crud.payments import (
@@ -50,12 +52,15 @@ from lnbits.core.models import (
     ArkadeEnrollmentChallenge,
     ArkadeEnrollmentCompletion,
     ArkadeIndexerVtxo,
+    ArkadeOutgoingIntent,
+    ArkadeOutgoingIntentInput,
+    ArkadeOutgoingIntentResponse,
+    ArkadeOutgoingSelectedInput,
     ArkadeReceiveAcknowledgement,
     ArkadeReceiveRequest,
     Payment,
     PaymentState,
 )
-from lnbits.core.models.arkade import ArkadeOutgoingIntent
 from lnbits.core.models.payments import CreatePayment
 from lnbits.core.models.users import Account
 from lnbits.db import Connection
@@ -72,6 +77,7 @@ _SCRIPT = re.compile(r"^[0-9a-fA-F]+$")
 RECEIVE_ACTION = "lnbits-arkade-receive-v1"
 MAX_AMOUNT_SAT = 2_100_000_000_000_000
 MAX_VOUT = 4_294_967_295
+_INDEXER_TIMESTAMP_BOUNDARY_MS = 1_735_689_600_000
 _TAPROOT_UNSPENDABLE_KEY = bytes.fromhex(
     "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0"
 )
@@ -131,7 +137,7 @@ async def reserve_arkade_outgoing_intent(  # noqa: C901
         return _existing_outgoing_pair(intent, existing_intent, existing_payment)
 
     # The public observation must not share the reservation transaction.
-    evidence = await fetch_arkade_indexer_vtxos(account_id)
+    evidence = await fetch_arkade_indexer_vtxos(account_id, spendable_only=True)
     unique_vtxos: dict[tuple[str, int], ArkadeIndexerVtxo] = {}
     for vtxo in evidence:
         key = (vtxo.txid, vtxo.vout)
@@ -141,7 +147,7 @@ async def reserve_arkade_outgoing_intent(  # noqa: C901
     backing_msat = sum(
         vtxo.amount_sat * 1000
         for vtxo in unique_vtxos.values()
-        if not vtxo.is_spent and not vtxo.is_swept
+        if _is_spendable_vtxo(vtxo)
     )
 
     try:
@@ -306,6 +312,250 @@ async def release_arkade_outgoing_payment(
                     payment.status = PaymentState.FAILED.value
                     await update_payment(payment, conn=database)
                 return released
+    except OperationalError as exc:
+        if _is_database_busy(exc):
+            raise ArkadeOutgoingError("ARKADE_OUTGOING_BUSY") from None
+        raise
+
+
+def _outgoing_response(
+    intent: ArkadeOutgoingIntent,
+    binding: ArkadeAccountBinding,
+    inputs: list[ArkadeOutgoingIntentInput],
+) -> ArkadeOutgoingIntentResponse:
+    return ArkadeOutgoingIntentResponse(
+        intent_id=intent.intent_id,
+        account_id=intent.account_id,
+        wallet_id=intent.wallet_id,
+        amount_msat=intent.amount_msat,
+        max_fee_msat=intent.max_fee_msat,
+        destination=intent.destination,
+        destination_kind=intent.destination_kind,
+        status=intent.status,
+        expires_at=intent.expires_at,
+        network=binding.network,
+        server_url=binding.server_url,
+        server_pubkey=binding.server_pubkey,
+        inputs=sorted(inputs, key=lambda item: (item.txid, item.vout)),
+    )
+
+
+async def get_arkade_outgoing_intent_for_account(
+    account_id: str, intent_id: str, conn: Connection | None = None
+) -> ArkadeOutgoingIntentResponse:
+    if settings.lnbits_effective_installation_mode != "arkade_noncustodial":
+        raise ArkadeOutgoingError("ARKADE_OUTGOING_UNAVAILABLE")
+    intent = await get_arkade_outgoing_intent(intent_id, conn=conn)
+    if not intent or intent.account_id != account_id:
+        raise ArkadeOutgoingError("ARKADE_OUTGOING_NOT_FOUND")
+    binding = await get_arkade_binding(account_id, conn=conn)
+    if not binding or binding.state != "ready":
+        raise ArkadeOutgoingError("ARKADE_ENROLLMENT_REQUIRED")
+    inputs = await get_arkade_outgoing_intent_inputs(intent_id, conn=conn)
+    return _outgoing_response(intent, binding, inputs)
+
+
+def _outgoing_input_key(item: ArkadeOutgoingSelectedInput) -> tuple[str, int]:
+    return item.txid, item.vout
+
+
+def _outgoing_claim_key(item: ArkadeOutgoingIntentInput) -> tuple[str, int]:
+    return item.txid, item.vout
+
+
+def _authorize_indexer_error(exc: ArkadeReceiveError) -> ArkadeOutgoingError:
+    code = str(exc)
+    if code == "ARKADE_INDEXER_INVALID_RESPONSE":
+        return ArkadeOutgoingError("ARKADE_OUTGOING_INDEXER_INVALID")
+    return ArkadeOutgoingError("ARKADE_OUTGOING_INDEXER_UNAVAILABLE")
+
+
+def _is_spendable_vtxo(vtxo: ArkadeIndexerVtxo) -> bool:
+    return not (
+        vtxo.is_spent
+        or vtxo.is_swept
+        or vtxo.is_unrolled
+        or vtxo.settled_by
+        or vtxo.expires_at_height is not None
+        or (
+            vtxo.expires_at is not None
+            and vtxo.expires_at <= datetime.now(timezone.utc)
+        )
+    )
+
+
+def _validate_outgoing_evidence(  # noqa: C901
+    selected: list[ArkadeOutgoingSelectedInput],
+    evidence: list[ArkadeIndexerVtxo],
+    scripts: set[str],
+    amount_msat: int,
+) -> None:
+    selected_by_key: dict[tuple[str, int], ArkadeOutgoingSelectedInput] = {}
+    for item in selected:
+        key = _outgoing_input_key(item)
+        if key in selected_by_key:
+            raise ArkadeOutgoingError("ARKADE_OUTGOING_INPUTS_INVALID")
+        selected_by_key[key] = item
+
+    observed: dict[tuple[str, int], ArkadeIndexerVtxo] = {}
+    for vtxo in evidence:
+        key = (vtxo.txid, vtxo.vout)
+        if key in observed and observed[key] != vtxo:
+            raise ArkadeOutgoingError("ARKADE_OUTGOING_INDEXER_INVALID")
+        observed[key] = vtxo
+    if set(selected_by_key) - set(observed):
+        raise ArkadeOutgoingError("ARKADE_OUTGOING_INPUTS_MISSING")
+    if set(observed) - set(selected_by_key):
+        raise ArkadeOutgoingError("ARKADE_OUTGOING_INDEXER_INVALID")
+
+    total_sat = 0
+    for item in selected:
+        vtxo = observed.get(_outgoing_input_key(item))
+        if not vtxo:
+            raise ArkadeOutgoingError("ARKADE_OUTGOING_INPUTS_MISSING")
+        if vtxo.amount_sat != item.amount_sat:
+            raise ArkadeOutgoingError("ARKADE_OUTGOING_INPUT_VALUE_MISMATCH")
+        if not _is_spendable_vtxo(vtxo):
+            raise ArkadeOutgoingError("ARKADE_OUTGOING_INPUT_UNAVAILABLE")
+        if vtxo.script.lower() not in scripts:
+            raise ArkadeOutgoingError("ARKADE_OUTGOING_INPUT_UNREGISTERED")
+        total_sat += vtxo.amount_sat
+    if total_sat * 1000 < amount_msat:
+        raise ArkadeOutgoingError("ARKADE_INSUFFICIENT_FUNDS")
+
+
+def _same_outgoing_inputs(
+    requested: list[ArkadeOutgoingSelectedInput],
+    claimed: list[ArkadeOutgoingIntentInput],
+) -> bool:
+    return sorted(
+        (_outgoing_input_key(item), item.amount_sat) for item in requested
+    ) == sorted((_outgoing_claim_key(item), item.amount_sat) for item in claimed)
+
+
+async def authorize_arkade_outgoing(  # noqa: C901
+    account_id: str,
+    intent_id: str,
+    selected: list[ArkadeOutgoingSelectedInput],
+    conn: Connection | None = None,
+) -> ArkadeOutgoingIntentResponse:
+    """Validate public VTXO evidence and CAS a reservation to submitted."""
+    if settings.lnbits_effective_installation_mode != "arkade_noncustodial":
+        raise ArkadeOutgoingError("ARKADE_OUTGOING_UNAVAILABLE")
+    if not 1 <= len(selected) <= 100:
+        raise ArkadeOutgoingError("ARKADE_OUTGOING_INPUTS_INVALID")
+
+    try:
+        intent = await get_arkade_outgoing_intent(intent_id, conn=conn)
+        if not intent or intent.account_id != account_id:
+            raise ArkadeOutgoingError("ARKADE_OUTGOING_NOT_FOUND")
+        binding = await get_arkade_binding(account_id, conn=conn)
+        if not binding or binding.state != "ready":
+            raise ArkadeOutgoingError("ARKADE_ENROLLMENT_REQUIRED")
+        payment = await get_payment_by_native_id(intent_id, conn=conn)
+        claims = await get_arkade_outgoing_intent_inputs(intent_id, conn=conn)
+        if intent.status == "submitted":
+            if not payment or not _outgoing_payment_matches(payment, intent):
+                raise ArkadeOutgoingError("ARKADE_OUTGOING_CORRUPT")
+            if payment.status != PaymentState.PENDING.value:
+                raise ArkadeOutgoingError("ARKADE_OUTGOING_CORRUPT")
+            if not _same_outgoing_inputs(selected, claims):
+                raise ArkadeOutgoingError("ARKADE_OUTGOING_IDEMPOTENCY_CONFLICT")
+            return _outgoing_response(intent, binding, claims)
+        if intent.status != "reserved":
+            raise ArkadeOutgoingError("ARKADE_INTENT_INVALID_TRANSITION")
+        if intent.expires_at <= datetime.now(timezone.utc):
+            raise ArkadeOutgoingError("ARKADE_OUTGOING_EXPIRED")
+        if claims and not _same_outgoing_inputs(selected, claims):
+            raise ArkadeOutgoingError("ARKADE_OUTGOING_IDEMPOTENCY_CONFLICT")
+        if len({_outgoing_input_key(item) for item in selected}) != len(selected):
+            raise ArkadeOutgoingError("ARKADE_OUTGOING_INPUTS_INVALID")
+
+        receive_requests = await get_arkade_receive_requests(account_id, conn=conn)
+        scripts = {
+            request.script.lower() for request in receive_requests if request.script
+        }
+        if not scripts:
+            raise ArkadeOutgoingError("ARKADE_OUTGOING_INPUT_UNREGISTERED")
+        try:
+            evidence = await fetch_arkade_indexer_vtxos_for_outpoints(
+                account_id, [_outgoing_input_key(item) for item in selected]
+            )
+        except ArkadeReceiveError as exc:
+            raise _authorize_indexer_error(exc) from None
+        _validate_outgoing_evidence(selected, evidence, scripts, intent.amount_msat)
+
+        async with db.reuse_conn(conn) if conn else db.connect() as database:
+            async with database.transaction():
+                await database.execute(
+                    "UPDATE arkade_account_bindings SET account_id = account_id "
+                    "WHERE account_id = :account_id AND state = 'ready'",
+                    {"account_id": account_id},
+                )
+                current = await get_arkade_outgoing_intent(intent_id, conn=database)
+                if not current or current.account_id != account_id:
+                    raise ArkadeOutgoingError("ARKADE_OUTGOING_NOT_FOUND")
+                current_binding = await get_arkade_binding(account_id, conn=database)
+                if not current_binding or current_binding.state != "ready":
+                    raise ArkadeOutgoingError("ARKADE_ENROLLMENT_REQUIRED")
+                current_claims = await get_arkade_outgoing_intent_inputs(
+                    intent_id, conn=database
+                )
+                current_payment = await get_payment_by_native_id(
+                    intent_id, conn=database
+                )
+                if current.status == "submitted":
+                    if not current_payment or not _outgoing_payment_matches(
+                        current_payment, current
+                    ):
+                        raise ArkadeOutgoingError("ARKADE_OUTGOING_CORRUPT")
+                    if current_payment.status != PaymentState.PENDING.value:
+                        raise ArkadeOutgoingError("ARKADE_OUTGOING_CORRUPT")
+                    if not _same_outgoing_inputs(selected, current_claims):
+                        raise ArkadeOutgoingError(
+                            "ARKADE_OUTGOING_IDEMPOTENCY_CONFLICT"
+                        )
+                    return _outgoing_response(current, current_binding, current_claims)
+                if current.status != "reserved":
+                    raise ArkadeOutgoingError("ARKADE_INTENT_INVALID_TRANSITION")
+                if current.expires_at <= datetime.now(timezone.utc):
+                    raise ArkadeOutgoingError("ARKADE_OUTGOING_EXPIRED")
+                if (
+                    not current_payment
+                    or not _outgoing_payment_matches(current_payment, current)
+                    or current_payment.status != PaymentState.PENDING.value
+                ):
+                    raise ArkadeOutgoingError("ARKADE_OUTGOING_CORRUPT")
+                input_rows = [
+                    ArkadeOutgoingIntentInput(
+                        intent_id=intent_id,
+                        txid=item.txid,
+                        vout=item.vout,
+                        amount_sat=item.amount_sat,
+                    )
+                    for item in selected
+                ]
+                try:
+                    await authorize_arkade_outgoing_intent(input_rows, database)
+                except ValueError as exc:
+                    code = str(exc)
+                    if code in {
+                        "ARKADE_INPUT_ALREADY_CLAIMED",
+                        "ARKADE_INTENT_MISMATCH",
+                    }:
+                        raise ArkadeOutgoingError(
+                            "ARKADE_OUTGOING_INPUT_CONFLICT"
+                        ) from None
+                    if code == "ARKADE_INTENT_INVALID_TRANSITION":
+                        raise ArkadeOutgoingError(code) from None
+                    raise ArkadeOutgoingError("ARKADE_OUTGOING_CORRUPT") from None
+                submitted = await get_arkade_outgoing_intent(intent_id, conn=database)
+                submitted_claims = await get_arkade_outgoing_intent_inputs(
+                    intent_id, conn=database
+                )
+                if not submitted or submitted.status != "submitted":
+                    raise ArkadeOutgoingError("ARKADE_INTENT_INVALID_TRANSITION")
+                return _outgoing_response(submitted, current_binding, submitted_claims)
     except OperationalError as exc:
         if _is_database_busy(exc):
             raise ArkadeOutgoingError("ARKADE_OUTGOING_BUSY") from None
@@ -919,7 +1169,17 @@ async def _acknowledge_arkade_receive(  # noqa: C901
     return result
 
 
-def parse_indexer_vtxos(body: object) -> list[ArkadeIndexerVtxo]:
+def _positive_decimal(value: object) -> int | None:
+    if not isinstance(value, str) or not value.isdecimal():
+        return None
+    try:
+        number = int(value)
+    except (OverflowError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def parse_indexer_vtxos(body: object) -> list[ArkadeIndexerVtxo]:  # noqa: C901
     if not isinstance(body, dict) or not isinstance(body.get("vtxos"), list):
         raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
     _validate_indexer_page(body.get("page"))
@@ -934,6 +1194,7 @@ def parse_indexer_vtxos(body: object) -> list[ArkadeIndexerVtxo]:
             raw.get("amount"),
             raw.get("script"),
         )
+        amount_sat = _positive_decimal(amount)
         if (
             not isinstance(txid, str)
             or not _TXID.fullmatch(txid)
@@ -941,37 +1202,77 @@ def parse_indexer_vtxos(body: object) -> list[ArkadeIndexerVtxo]:
             or not isinstance(vout, int)
             or vout < 0
             or vout > MAX_VOUT
-            or not isinstance(amount, str)
-            or not amount.isdecimal()
-            or not 0 < int(amount) <= MAX_AMOUNT_SAT
+            or amount_sat is None
+            or amount_sat > MAX_AMOUNT_SAT
             or not isinstance(script, str)
             or len(script) % 2
             or not _SCRIPT.fullmatch(script)
         ):
             raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
-        status_keys = ("isPreconfirmed", "isSpent", "isSwept")
+        status_keys = ("isPreconfirmed", "isSpent", "isSwept", "isUnrolled")
         if any(key not in raw for key in status_keys):
             raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
         flags = {key: raw[key] for key in status_keys}
         if any(not isinstance(value, bool) for value in flags.values()):
             raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
-        raw_spent_by = raw.get("spentBy")
-        if raw_spent_by is None or raw_spent_by == "":
-            spent_by = None
-        elif isinstance(raw_spent_by, str) and _TXID.fullmatch(raw_spent_by):
-            spent_by = raw_spent_by
-        else:
+        raw_created_at = raw.get("createdAt")
+        created_timestamp = _positive_decimal(raw_created_at)
+        if created_timestamp is None:
             raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
+        try:
+            created_at = datetime.fromtimestamp(created_timestamp, timezone.utc)
+        except (OverflowError, OSError, ValueError) as exc:
+            raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE") from exc
+        raw_expires_at = raw.get("expiresAt")
+        expires_at = None
+        expires_at_height = None
+        if "expiresAt" not in raw:
+            raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
+        if raw_expires_at is not None:
+            expiry = _positive_decimal(raw_expires_at)
+            if expiry is None:
+                raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
+            if expiry * 1000 >= _INDEXER_TIMESTAMP_BOUNDARY_MS:
+                try:
+                    expires_at = datetime.fromtimestamp(expiry, timezone.utc)
+                except (OverflowError, OSError, ValueError) as exc:
+                    raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE") from exc
+            else:
+                expires_at_height = expiry
+        raw_commitment_txids = raw.get("commitmentTxids")
+        if not isinstance(raw_commitment_txids, list) or any(
+            not isinstance(txid, str) or not _TXID.fullmatch(txid)
+            for txid in raw_commitment_txids
+        ):
+            raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
+        terminal_ids = {}
+        for wire_name, field_name in (
+            ("spentBy", "spent_by"),
+            ("settledBy", "settled_by"),
+            ("arkTxid", "arkade_txid"),
+        ):
+            value = raw.get(wire_name)
+            if value is None or value == "":
+                terminal_ids[field_name] = None
+            elif isinstance(value, str) and _TXID.fullmatch(value):
+                terminal_ids[field_name] = value
+            else:
+                raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
         parsed.append(
             ArkadeIndexerVtxo(
                 txid=txid,
                 vout=vout,
-                amount_sat=int(amount),
+                amount_sat=amount_sat,
                 script=script.lower(),
                 is_preconfirmed=flags["isPreconfirmed"],
-                is_spent=flags["isSpent"] or bool(spent_by),
+                is_spent=flags["isSpent"] or bool(terminal_ids["spent_by"]),
                 is_swept=flags["isSwept"],
-                spent_by=spent_by,
+                is_unrolled=flags["isUnrolled"],
+                created_at=created_at,
+                expires_at=expires_at,
+                expires_at_height=expires_at_height,
+                commitment_txids=raw_commitment_txids,
+                **terminal_ids,
             )
         )
     return parsed
@@ -1005,7 +1306,9 @@ def _validate_indexer_page(page: object) -> None:
 
 
 async def fetch_arkade_indexer_vtxos(  # noqa: C901
-    account_id: str, conn: Connection | None = None
+    account_id: str,
+    conn: Connection | None = None,
+    spendable_only: bool = False,
 ) -> list[ArkadeIndexerVtxo]:
     binding = await get_arkade_binding(account_id, conn=conn)
     if not binding or binding.state != "ready":
@@ -1027,6 +1330,7 @@ async def fetch_arkade_indexer_vtxos(  # noqa: C901
                     seen_pages.add(page_index)
                     params = tuple(
                         [("scripts", script) for script in chunk]
+                        + ([("spendableOnly", "true")] if spendable_only else [])
                         + [("page.index", str(page_index)), ("page.size", "500")]
                     )
                     response = await client.get(
@@ -1056,6 +1360,56 @@ async def fetch_arkade_indexer_vtxos(  # noqa: C901
             )
         raise
     return result
+
+
+async def fetch_arkade_indexer_vtxos_for_outpoints(  # noqa: C901
+    account_id: str, outpoints: list[tuple[str, int]]
+) -> list[ArkadeIndexerVtxo]:
+    """Fetch only the requested public outpoints from the Arkade indexer."""
+    binding = await get_arkade_binding(account_id)
+    if not binding or binding.state != "ready":
+        raise ArkadeReceiveError("ARKADE_ENROLLMENT_REQUIRED")
+    if not 1 <= len(outpoints) <= 100 or len(set(outpoints)) != len(outpoints):
+        raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
+    result: list[ArkadeIndexerVtxo] = []
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            page_index = 0
+            seen_pages: set[int] = set()
+            while True:
+                if page_index in seen_pages:
+                    raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
+                seen_pages.add(page_index)
+                if len(seen_pages) > 2:
+                    raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
+                params = tuple(
+                    [("outpoints", f"{txid}:{vout}") for txid, vout in outpoints]
+                    + [
+                        ("spendableOnly", "true"),
+                        ("page.index", str(page_index)),
+                        ("page.size", "500"),
+                    ]
+                )
+                response = await client.get(
+                    f"{binding.server_url}/v1/indexer/vtxos", params=params
+                )
+                response.raise_for_status()
+                try:
+                    body = response.json()
+                except ValueError as exc:
+                    raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE") from exc
+                result.extend(parse_indexer_vtxos(body))
+                if len(result) > len(outpoints):
+                    raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
+                page = body.get("page") if isinstance(body, dict) else None
+                if page is None:
+                    raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
+                _validate_indexer_page(page)
+                if page["current"] >= page["total"]:
+                    return result
+                page_index = page["next"]
+    except httpx.HTTPError as exc:
+        raise ArkadeReceiveError("ARKADE_INDEXER_UNAVAILABLE") from exc
 
 
 async def _mark_receive_reconciliation_required(

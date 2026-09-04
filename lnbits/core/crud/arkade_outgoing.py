@@ -148,6 +148,25 @@ async def claim_arkade_outgoing_inputs(
     return result
 
 
+async def authorize_arkade_outgoing_intent(
+    inputs: list[ArkadeOutgoingIntentInput], conn: Connection
+) -> ArkadeOutgoingIntent:
+    database = _require_active_transaction(conn)
+    await claim_arkade_outgoing_inputs(inputs, conn=database)
+    transitioned = await _transition_arkade_outgoing_intent(
+        inputs[0].intent_id,
+        "reserved",
+        "submitted",
+        conn=database,
+    )
+    if not transitioned:
+        raise ValueError("ARKADE_INTENT_INVALID_TRANSITION")
+    intent = await get_arkade_outgoing_intent(inputs[0].intent_id, conn=database)
+    if not intent:
+        raise ValueError("ARKADE_INTENT_UNAVAILABLE")
+    return intent
+
+
 async def _claim_arkade_outgoing_inputs(
     inputs: list[ArkadeOutgoingIntentInput], conn: Connection
 ) -> list[ArkadeOutgoingIntentInput]:

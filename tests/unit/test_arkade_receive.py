@@ -499,6 +499,10 @@ async def test_indexer_pages_use_pinned_page_parameters(
                         "isPreconfirmed": False,
                         "isSpent": False,
                         "isSwept": False,
+                        "isUnrolled": False,
+                        "createdAt": "1735689600",
+                        "expiresAt": None,
+                        "commitmentTxids": [],
                     }
                 ],
                 "page": {"current": 1, "next": 2, "total": 2},
@@ -512,6 +516,10 @@ async def test_indexer_pages_use_pinned_page_parameters(
                         "isPreconfirmed": False,
                         "isSpent": False,
                         "isSwept": False,
+                        "isUnrolled": False,
+                        "createdAt": "1735689600",
+                        "expiresAt": None,
+                        "commitmentTxids": [],
                     }
                 ],
                 "page": {"current": 2, "next": 2, "total": 2},
@@ -694,6 +702,10 @@ def test_indexer_parser_rejects_unpinned_shapes():
                     "isPreconfirmed": False,
                     "isSpent": False,
                     "isSwept": False,
+                    "isUnrolled": False,
+                    "createdAt": "1735689600",
+                    "expiresAt": None,
+                    "commitmentTxids": [],
                     "spentBy": "",
                 }
             ]

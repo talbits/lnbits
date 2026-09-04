@@ -7,15 +7,20 @@ from lnbits.core.models import (
     ArkadeEnrollmentBindingResponse,
     ArkadeEnrollmentChallenge,
     ArkadeEnrollmentCompletion,
+    ArkadeOutgoingAuthorizeRequest,
+    ArkadeOutgoingIntentResponse,
     ArkadeReceiveAcknowledgement,
     ArkadeReceiveRequest,
 )
 from lnbits.core.services.arkade import (
     ArkadeEnrollmentError,
+    ArkadeOutgoingError,
     ArkadeReceiveError,
     acknowledge_arkade_receive,
+    authorize_arkade_outgoing,
     complete_enrollment,
     create_enrollment_challenge,
+    get_arkade_outgoing_intent_for_account,
     get_arkade_receive_request_for_account,
 )
 from lnbits.decorators import check_authenticated_account
@@ -39,6 +44,33 @@ def _public_receive_error(exc: ArkadeReceiveError) -> HTTPException:
         "ARKADE_ENROLLMENT_REQUIRED",
     }:
         code = "ARKADE_RECEIVE_ERROR"
+    return HTTPException(HTTPStatus.BAD_REQUEST, code)
+
+
+def _public_outgoing_error(exc: ArkadeOutgoingError) -> HTTPException:
+    code = str(exc)
+    if code not in {
+        "ARKADE_ENROLLMENT_REQUIRED",
+        "ARKADE_INTENT_INVALID_TRANSITION",
+        "ARKADE_OUTGOING_ACCOUNT_MISMATCH",
+        "ARKADE_OUTGOING_BUSY",
+        "ARKADE_OUTGOING_CORRUPT",
+        "ARKADE_OUTGOING_EXPIRED",
+        "ARKADE_OUTGOING_IDEMPOTENCY_CONFLICT",
+        "ARKADE_OUTGOING_INDEXER_INVALID",
+        "ARKADE_OUTGOING_INDEXER_UNAVAILABLE",
+        "ARKADE_OUTGOING_INPUT_CONFLICT",
+        "ARKADE_OUTGOING_INPUT_UNAVAILABLE",
+        "ARKADE_OUTGOING_INPUT_UNREGISTERED",
+        "ARKADE_OUTGOING_INPUT_VALUE_MISMATCH",
+        "ARKADE_OUTGOING_INPUTS_INVALID",
+        "ARKADE_OUTGOING_INPUTS_MISSING",
+        "ARKADE_OUTGOING_NOT_ALLOWED",
+        "ARKADE_OUTGOING_NOT_FOUND",
+        "ARKADE_OUTGOING_UNAVAILABLE",
+        "ARKADE_INSUFFICIENT_FUNDS",
+    }:
+        code = "ARKADE_OUTGOING_ERROR"
     return HTTPException(HTTPStatus.BAD_REQUEST, code)
 
 
@@ -104,3 +136,29 @@ async def api_arkade_receive_ack(
         raise _public_error(exc) from exc
     except ArkadeReceiveError as exc:
         raise _public_receive_error(exc) from exc
+
+
+@arkade_router.get("/outgoing/{intent_id}", response_model=ArkadeOutgoingIntentResponse)
+async def api_arkade_outgoing_intent(
+    intent_id: str,
+    account: Account = Depends(check_authenticated_account),
+):
+    try:
+        return await get_arkade_outgoing_intent_for_account(account.id, intent_id)
+    except ArkadeOutgoingError as exc:
+        raise _public_outgoing_error(exc) from exc
+
+
+@arkade_router.post(
+    "/outgoing/{intent_id}/authorize",
+    response_model=ArkadeOutgoingIntentResponse,
+)
+async def api_arkade_outgoing_authorize(
+    intent_id: str,
+    data: ArkadeOutgoingAuthorizeRequest,
+    account: Account = Depends(check_authenticated_account),
+):
+    try:
+        return await authorize_arkade_outgoing(account.id, intent_id, data.inputs)
+    except ArkadeOutgoingError as exc:
+        raise _public_outgoing_error(exc) from exc

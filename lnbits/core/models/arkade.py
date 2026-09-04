@@ -111,6 +111,13 @@ class ArkadeIndexerVtxo(BaseModel):
     is_spent: bool = False
     is_swept: bool = False
     spent_by: str | None = None
+    settled_by: str | None = None
+    arkade_txid: str | None = None
+    is_unrolled: bool = False
+    created_at: datetime | None = None
+    expires_at: datetime | None = None
+    expires_at_height: int | None = None
+    commitment_txids: list[str] = Field(default_factory=list)
 
 
 class ArkadeReconciliation(BaseModel):
@@ -162,3 +169,37 @@ class ArkadeOutgoingIntentInput(BaseModel):
     vout: int = Field(ge=0, le=4_294_967_295)
     amount_sat: int = Field(gt=0, le=2_100_000_000_000_000)
     claimed_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class ArkadeOutgoingSelectedInput(BaseModel):
+    txid: str = Field(regex=r"^[0-9a-f]{64}$")
+    vout: int = Field(ge=0, le=4_294_967_295)
+    amount_sat: int = Field(gt=0, le=2_100_000_000_000_000)
+
+    class Config:
+        extra = "forbid"
+
+
+class ArkadeOutgoingAuthorizeRequest(BaseModel):
+    inputs: list[ArkadeOutgoingSelectedInput] = Field(..., min_items=1, max_items=100)
+
+    class Config:
+        extra = "forbid"
+
+
+class ArkadeOutgoingIntentResponse(BaseModel):
+    action: Literal["lnbits-arkade-outgoing-v1"] = "lnbits-arkade-outgoing-v1"
+    version: Literal[1] = 1
+    intent_id: str
+    account_id: str
+    wallet_id: str
+    amount_msat: int
+    max_fee_msat: Literal[0] = 0
+    destination: str
+    destination_kind: ArkadeOutgoingDestinationKind = "arkade_address"
+    status: ArkadeOutgoingStatus
+    expires_at: datetime
+    network: str
+    server_url: str
+    server_pubkey: str
+    inputs: list[ArkadeOutgoingIntentInput]
