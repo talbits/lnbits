@@ -24,6 +24,7 @@ from lnbits.core.crud.arkade_outgoing import (
 )
 from lnbits.core.crud.payments import get_payment_by_native_id
 from lnbits.core.models.arkade import (
+    ArkadeOutgoingChangeCommitment,
     ArkadeOutgoingIntent,
     ArkadeOutgoingIntentInput,
     ArkadeOutgoingSelectedInput,
@@ -110,6 +111,7 @@ async def connection(monkeypatch):
             "challenge_expires_at TIMESTAMP, "
             "network TEXT, server_url TEXT, server_pubkey TEXT, "
             "identity_xonly_pubkey TEXT, "
+            "identity_descriptor TEXT, "
             "backup_acknowledged_at TIMESTAMP, created_at TIMESTAMP, "
             "updated_at TIMESTAMP, "
             "ready_at TIMESTAMP)"
@@ -117,17 +119,26 @@ async def connection(monkeypatch):
         await connection.execute(
             "INSERT INTO arkade_account_bindings (account_id, state, enrollment_id, "
             "network, server_url, server_pubkey, identity_xonly_pubkey, "
+            "identity_descriptor, "
             "backup_acknowledged_at, ready_at) "
             "VALUES (:account_id, 'ready', :enrollment_id, "
-            "'regtest', 'http://indexer', :server_pubkey, :identity, 1, 1)",
+            "'regtest', 'http://indexer', :server_pubkey, :identity, "
+            ":descriptor, 1, 1)",
             {
                 "account_id": ACCOUNT_ID,
                 "enrollment_id": "33" * 16,
                 "server_pubkey": "44" * 32,
-                "identity": "55" * 32,
+                "identity": IDENTITY_XONLY,
+                "descriptor": IDENTITY_DESCRIPTOR,
             },
         )
+        await connection.execute(
+            "CREATE TABLE arkade_receive_requests ("
+            "native_request_id TEXT PRIMARY KEY, account_id TEXT NOT NULL, "
+            '"index" INTEGER, script TEXT)'
+        )
         await migrations.m055_create_arkade_outgoing_tables(connection)
+        await migrations.m057_add_arkade_outgoing_outputs(connection)
         yield connection
     await engine.dispose()
 
@@ -138,6 +149,12 @@ OTHER_WALLET_ID = "66" * 16
 SECOND_WALLET_ID = "88" * 16
 NO_SEND_WALLET_ID = "aa" * 16
 INTENT_ID = "22" * 16
+IDENTITY_XONLY = "ea7e6686484c82084359642815cdcc7e99e68e97026d8d266f192671e31285df"
+IDENTITY_DESCRIPTOR = (
+    "tr([00000000/86'/1'/0']"
+    "tpubDDG8vJgmngBej3WYjjomDbJkb5kmpiFbQbGeb5m4pnKrT4pv7U7kzwmMfSCPaiJ8ZuJdxFTgPungFZ9gj"
+    "kLU98ruqahEYmUu68WPizuo9s1/0/*)"
+)
 
 
 def _intent(*, expires_at: datetime | None = None, amount_msat: int = 10_000):
@@ -147,7 +164,7 @@ def _intent(*, expires_at: datetime | None = None, amount_msat: int = 10_000):
         wallet_id=WALLET_ID,
         amount_msat=amount_msat,
         max_fee_msat=0,
-        destination="tark1destination",
+        destination="tark1qpzyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyf242424242424242424242424242424242424242424242424242uer577",
         expires_at=expires_at
         or (datetime.now(timezone.utc) + timedelta(hours=1)).replace(microsecond=0),
     )
@@ -197,6 +214,34 @@ async def _exact_backing(_account_id, **_kwargs):
 
 def _selected(txid: str = "97" * 32, amount_sat: int = 40):
     return [ArkadeOutgoingSelectedInput(txid=txid, vout=0, amount_sat=amount_sat)]
+
+
+DESTINATION_SCRIPT = "5120" + "aa" * 32
+CHANGE_SCRIPT = "512045710c478a9202033ccf0ffbb0a27e8883d4cb3f6957460a8f7f4cbc800eec1f"
+CHANGE_ADDRESS = (
+    "tark1qpzyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3"
+    "zyg3t3p3rc4yszqv7v7rlmkz38azyr6n9n762hgc9g7l6vhjqqamqlwpa9fv"
+)
+CHANGE_CHILD = "ea7e6686484c82084359642815cdcc7e99e68e97026d8d266f192671e31285df"
+CHANGE_TAPLEAF = (
+    "51b27520ea7e6686484c82084359642815cdcc7e99e68e97026d8d266f192671e31285dfacc0"
+)
+CHANGE_CONTROL = (
+    "c150929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0"
+    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+)
+
+
+def _change():
+    return ArkadeOutgoingChangeCommitment(
+        index=0,
+        address=CHANGE_ADDRESS,
+        script=CHANGE_SCRIPT,
+        child_xonly_pubkey=CHANGE_CHILD,
+        amount_sat=30,
+        exit_tapleaf=CHANGE_TAPLEAF,
+        exit_control_block=CHANGE_CONTROL,
+    )
 
 
 def _observed(
@@ -514,6 +559,16 @@ async def test_create_is_idempotent_and_immutable(connection):
                 _intent().copy(update={"intent_id": "33" * 16, "status": "settled"}),
                 conn=connection,
             )
+        with pytest.raises(ValueError, match="INITIAL_STATE_INVALID"):
+            await create_arkade_outgoing_intent(
+                _intent().copy(
+                    update={
+                        "intent_id": "55" * 16,
+                        "destination_script": DESTINATION_SCRIPT,
+                    }
+                ),
+                conn=connection,
+            )
         with pytest.raises(ValueError, match="WALLET_ACCOUNT_MISMATCH"):
             await create_arkade_outgoing_intent(
                 _intent().copy(
@@ -650,7 +705,10 @@ async def test_input_claims_are_unique_across_intents(connection):
 
 
 @pytest.mark.anyio
-async def test_authorize_exact_inputs_and_submitted_replay(connection, monkeypatch):
+@pytest.mark.parametrize("with_change", [False, True])
+async def test_authorize_exact_inputs_and_submitted_replay(
+    connection, monkeypatch, with_change
+):
     monkeypatch.setattr(
         settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
     )
@@ -664,23 +722,46 @@ async def test_authorize_exact_inputs_and_submitted_replay(connection, monkeypat
     async def exact(_account_id, outpoints):
         assert outpoints == [("97" * 32, 0)]
         return [
-            arkade.ArkadeIndexerVtxo(txid="97" * 32, vout=0, amount_sat=40, script="aa")
+            arkade.ArkadeIndexerVtxo(
+                txid="97" * 32,
+                vout=0,
+                amount_sat=10 if not with_change else 40,
+                script="aa",
+            )
         ]
 
     monkeypatch.setattr(arkade, "get_arkade_receive_requests", registered)
     monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos_for_outpoints", exact)
+    selected = _selected(amount_sat=40 if with_change else 10)
+    change = _change() if with_change else None
     result = await arkade.authorize_arkade_outgoing(
-        ACCOUNT_ID, INTENT_ID, _selected(), conn=connection
+        ACCOUNT_ID,
+        INTENT_ID,
+        selected,
+        conn=connection,
+        destination_script=DESTINATION_SCRIPT,
+        change=change,
     )
     assert result.status == "submitted"
     assert result.inputs[0].txid == "97" * 32
+    stored = await get_arkade_outgoing_intent(INTENT_ID, conn=connection)
+    assert stored
+    assert stored.destination_script == DESTINATION_SCRIPT
+    assert stored.change_index == (0 if with_change else None)
+    assert stored.change_script == (CHANGE_SCRIPT if with_change else None)
+    assert stored.change_amount_sat == (30 if with_change else None)
 
     async def unavailable(_account_id, outpoints):
         raise AssertionError("submitted replay must not fetch indexer evidence")
 
     monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos_for_outpoints", unavailable)
     replay = await arkade.authorize_arkade_outgoing(
-        ACCOUNT_ID, INTENT_ID, _selected(), conn=connection
+        ACCOUNT_ID,
+        INTENT_ID,
+        selected,
+        conn=connection,
+        destination_script=DESTINATION_SCRIPT,
+        change=change,
     )
     assert replay == result
 
@@ -753,7 +834,11 @@ async def test_authorize_rejects_public_evidence_cases(  # noqa: C901
     )
     with pytest.raises(arkade.ArkadeOutgoingError, match=expected):
         await arkade.authorize_arkade_outgoing(
-            ACCOUNT_ID, INTENT_ID, selected, conn=connection
+            ACCOUNT_ID,
+            INTENT_ID,
+            selected,
+            conn=connection,
+            destination_script=DESTINATION_SCRIPT,
         )
     current = await get_arkade_outgoing_intent(INTENT_ID, conn=connection)
     assert current and current.status == "reserved"
@@ -794,11 +879,15 @@ async def test_authorize_rejects_corrupt_payment_pair(
     monkeypatch.setattr(
         arkade,
         "fetch_arkade_indexer_vtxos_for_outpoints",
-        AsyncMock(return_value=[_observed()]),
+        AsyncMock(return_value=[_observed(amount_sat=10)]),
     )
     with pytest.raises(arkade.ArkadeOutgoingError, match="CORRUPT"):
         await arkade.authorize_arkade_outgoing(
-            ACCOUNT_ID, INTENT_ID, _selected(), conn=connection
+            ACCOUNT_ID,
+            INTENT_ID,
+            _selected(amount_sat=10),
+            conn=connection,
+            destination_script=DESTINATION_SCRIPT,
         )
     current = await get_arkade_outgoing_intent(INTENT_ID, conn=connection)
     assert current and current.status == "reserved"
@@ -815,7 +904,7 @@ async def test_authorize_competing_claim_rolls_back(connection, monkeypatch):
     await arkade.reserve_arkade_outgoing_intent(ACCOUNT_ID, _intent(), conn=connection)
     competing_id = "44" * 16
     competing_input = ArkadeOutgoingIntentInput(
-        intent_id=competing_id, txid="97" * 32, vout=0, amount_sat=40
+        intent_id=competing_id, txid="97" * 32, vout=0, amount_sat=10
     )
     async with connection.transaction():
         await create_arkade_outgoing_intent(
@@ -830,11 +919,15 @@ async def test_authorize_competing_claim_rolls_back(connection, monkeypatch):
     monkeypatch.setattr(
         arkade,
         "fetch_arkade_indexer_vtxos_for_outpoints",
-        AsyncMock(return_value=[_observed()]),
+        AsyncMock(return_value=[_observed(amount_sat=10)]),
     )
     with pytest.raises(arkade.ArkadeOutgoingError, match="INPUT_CONFLICT"):
         await arkade.authorize_arkade_outgoing(
-            ACCOUNT_ID, INTENT_ID, _selected(), conn=connection
+            ACCOUNT_ID,
+            INTENT_ID,
+            _selected(amount_sat=10),
+            conn=connection,
+            destination_script=DESTINATION_SCRIPT,
         )
     assert not await get_arkade_outgoing_intent_inputs(INTENT_ID, conn=connection)
 
@@ -858,7 +951,43 @@ async def test_authorize_crud_rejects_false_transition(connection, monkeypatch):
                     )
                 ],
                 connection,
+                destination_script=DESTINATION_SCRIPT,
             )
+
+
+@pytest.mark.anyio
+async def test_authorize_requires_descriptor_before_indexer_work(
+    connection, monkeypatch
+):
+    monkeypatch.setattr(
+        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
+    )
+    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", _backing)
+    await _credit(connection, WALLET_ID, 20_000)
+    await arkade.reserve_arkade_outgoing_intent(ACCOUNT_ID, _intent(), conn=connection)
+    await connection.execute(
+        "UPDATE arkade_account_bindings SET identity_descriptor = NULL "
+        "WHERE account_id = :account_id",
+        {"account_id": ACCOUNT_ID},
+    )
+    indexer = AsyncMock(side_effect=AssertionError("descriptor must be checked first"))
+    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos_for_outpoints", indexer)
+
+    with pytest.raises(
+        arkade.ArkadeOutgoingError, match="ARKADE_DESCRIPTOR_REENROLLMENT_REQUIRED"
+    ):
+        await arkade.authorize_arkade_outgoing(
+            ACCOUNT_ID,
+            INTENT_ID,
+            _selected(),
+            conn=connection,
+            destination_script=DESTINATION_SCRIPT,
+        )
+
+    current = await get_arkade_outgoing_intent(INTENT_ID, conn=connection)
+    assert current and current.status == "reserved"
+    assert not await get_arkade_outgoing_intent_inputs(INTENT_ID, conn=connection)
+    indexer.assert_not_awaited()
 
 
 @pytest.mark.anyio
@@ -878,8 +1007,20 @@ async def test_authorize_expired_intent_fails_closed(connection, monkeypatch):
     await arkade.reserve_arkade_outgoing_intent(ACCOUNT_ID, expired, conn=connection)
     with pytest.raises(arkade.ArkadeOutgoingError, match="EXPIRED"):
         await arkade.authorize_arkade_outgoing(
-            ACCOUNT_ID, INTENT_ID, _selected(), conn=connection
+            ACCOUNT_ID,
+            INTENT_ID,
+            _selected(),
+            conn=connection,
+            destination_script=DESTINATION_SCRIPT,
         )
+
+
+def test_outgoing_evidence_requires_exact_destination_and_change_amount():
+    selected = _selected(amount_sat=40)
+    evidence = [_observed(amount_sat=40)]
+    arkade._validate_outgoing_evidence(selected, evidence, {"aa"}, 10_000, 30)
+    with pytest.raises(arkade.ArkadeOutgoingError, match="OUTPUT_INVALID"):
+        arkade._validate_outgoing_evidence(selected, evidence, {"aa"}, 10_000, 29)
 
 
 @pytest.mark.anyio
@@ -888,6 +1029,81 @@ async def test_outgoing_get_is_unavailable_in_custodial_mode(connection, monkeyp
     with pytest.raises(arkade.ArkadeOutgoingError, match="OUTGOING_UNAVAILABLE"):
         await arkade.get_arkade_outgoing_intent_for_account(
             ACCOUNT_ID, INTENT_ID, conn=connection
+        )
+
+
+@pytest.mark.anyio
+async def test_outgoing_reserved_response_has_no_output_script(connection, monkeypatch):
+    monkeypatch.setattr(
+        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
+    )
+    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", _backing)
+    await _credit(connection, WALLET_ID, 20_000)
+    await arkade.reserve_arkade_outgoing_intent(ACCOUNT_ID, _intent(), conn=connection)
+    response = await arkade.get_arkade_outgoing_intent_for_account(
+        ACCOUNT_ID, INTENT_ID, conn=connection
+    )
+    assert response.status == "reserved"
+    assert response.destination_script is None
+
+
+@pytest.mark.anyio
+async def test_outgoing_output_validation_rejects_wrong_destination_and_child(
+    connection,
+):
+    intent = _intent()
+    binding = await arkade.get_arkade_binding(ACCOUNT_ID, conn=connection)
+    assert binding
+    with pytest.raises(arkade.ArkadeOutgoingError, match="OUTPUT_INVALID"):
+        arkade._validate_outgoing_outputs(intent, binding, "5120" + "bb" * 32, None)
+    with pytest.raises(arkade.ArkadeOutgoingError, match="OUTPUT_INVALID"):
+        arkade._validate_outgoing_outputs(
+            intent,
+            binding,
+            DESTINATION_SCRIPT,
+            _change().copy(update={"child_xonly_pubkey": "bb" * 32}),
+        )
+
+
+@pytest.mark.anyio
+async def test_authorize_rejects_change_index_used_by_receive_mapping(
+    connection, monkeypatch
+):
+    monkeypatch.setattr(
+        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
+    )
+    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", _backing)
+    await _credit(connection, WALLET_ID, 20_000)
+    await arkade.reserve_arkade_outgoing_intent(ACCOUNT_ID, _intent(), conn=connection)
+    await connection.execute(
+        "INSERT INTO arkade_receive_requests "
+        '(native_request_id, account_id, "index", script) '
+        "VALUES (:id, :account_id, :index, :script)",
+        {
+            "id": "66" * 16,
+            "account_id": ACCOUNT_ID,
+            "index": 0,
+            "script": "5120" + "cc" * 32,
+        },
+    )
+    monkeypatch.setattr(
+        arkade,
+        "get_arkade_receive_requests",
+        AsyncMock(return_value=[SimpleNamespace(script="aa")]),
+    )
+    monkeypatch.setattr(
+        arkade,
+        "fetch_arkade_indexer_vtxos_for_outpoints",
+        AsyncMock(return_value=[_observed(amount_sat=40)]),
+    )
+    with pytest.raises(arkade.ArkadeOutgoingError, match="OUTPUT_CONFLICT"):
+        await arkade.authorize_arkade_outgoing(
+            ACCOUNT_ID,
+            INTENT_ID,
+            _selected(),
+            conn=connection,
+            destination_script=DESTINATION_SCRIPT,
+            change=_change(),
         )
 
 

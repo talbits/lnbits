@@ -85,6 +85,10 @@ async def create_arkade_outgoing_intent(
             "settled_at",
             "released_at",
             "disputed_at",
+            "destination_script",
+            "change_index",
+            "change_script",
+            "change_amount_sat",
         )
     ):
         raise ValueError("ARKADE_INTENT_INITIAL_STATE_INVALID")
@@ -149,10 +153,33 @@ async def claim_arkade_outgoing_inputs(
 
 
 async def authorize_arkade_outgoing_intent(
-    inputs: list[ArkadeOutgoingIntentInput], conn: Connection
+    inputs: list[ArkadeOutgoingIntentInput],
+    conn: Connection,
+    *,
+    destination_script: str,
+    change_index: int | None = None,
+    change_script: str | None = None,
+    change_amount_sat: int | None = None,
 ) -> ArkadeOutgoingIntent:
     database = _require_active_transaction(conn)
     await claim_arkade_outgoing_inputs(inputs, conn=database)
+    if destination_script is not None:
+        result = await database.execute(
+            "UPDATE arkade_outgoing_intents SET "
+            "destination_script = :destination_script, "
+            "change_index = :change_index, change_script = :change_script, "
+            "change_amount_sat = :change_amount_sat "
+            "WHERE intent_id = :intent_id AND status = 'reserved'",
+            {
+                "intent_id": inputs[0].intent_id,
+                "destination_script": destination_script,
+                "change_index": change_index,
+                "change_script": change_script,
+                "change_amount_sat": change_amount_sat,
+            },
+        )
+        if not result.rowcount:
+            raise ValueError("ARKADE_INTENT_INVALID_TRANSITION")
     transitioned = await _transition_arkade_outgoing_intent(
         inputs[0].intent_id,
         "reserved",

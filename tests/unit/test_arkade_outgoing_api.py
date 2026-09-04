@@ -36,6 +36,7 @@ def _response() -> ArkadeOutgoingIntentResponse:
         wallet_id=WALLET_ID,
         amount_msat=10_000,
         destination="tark1destination",
+        destination_script="5120" + "aa" * 32,
         status="reserved",
         expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
         network="regtest",
@@ -50,7 +51,10 @@ def _response() -> ArkadeOutgoingIntentResponse:
 
 
 def _authorize_body() -> dict:
-    return {"inputs": [{"txid": TXID, "vout": 0, "amount_sat": 40}]}
+    return {
+        "inputs": [{"txid": TXID, "vout": 0, "amount_sat": 40}],
+        "destination_script": "5120" + "aa" * 32,
+    }
 
 
 @pytest.mark.anyio

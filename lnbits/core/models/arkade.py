@@ -144,6 +144,10 @@ class ArkadeOutgoingIntent(BaseModel):
     amount_msat: int = Field(gt=0, multiple_of=1000)
     max_fee_msat: Literal[0] = 0
     destination: str = Field(min_length=1, max_length=1023)
+    destination_script: str | None = None
+    change_index: int | None = Field(default=None, ge=0, le=2_147_483_647)
+    change_script: str | None = None
+    change_amount_sat: int | None = Field(default=None, gt=0, le=2_100_000_000_000_000)
     destination_kind: ArkadeOutgoingDestinationKind = "arkade_address"
     status: ArkadeOutgoingStatus = "reserved"
     arkade_txid: str | None = Field(default=None, regex=r"^[0-9a-f]{64}$")
@@ -183,8 +187,25 @@ class ArkadeOutgoingSelectedInput(BaseModel):
         extra = "forbid"
 
 
+class ArkadeOutgoingChangeCommitment(BaseModel):
+    index: int = Field(ge=0, le=2_147_483_647)
+    address: str = Field(min_length=1, max_length=1023)
+    script: str = Field(regex=r"^[0-9a-fA-F]+$", min_length=2, max_length=4096)
+    child_xonly_pubkey: str = Field(regex=r"^[0-9a-f]{64}$")
+    amount_sat: int = Field(gt=0, le=2_100_000_000_000_000)
+    exit_tapleaf: str = Field(regex=r"^[0-9a-f]{76,86}$")
+    exit_control_block: str = Field(regex=r"^[0-9a-f]{130}$")
+
+    class Config:
+        extra = "forbid"
+
+
 class ArkadeOutgoingAuthorizeRequest(BaseModel):
     inputs: list[ArkadeOutgoingSelectedInput] = Field(..., min_items=1, max_items=100)
+    destination_script: str = Field(
+        regex=r"^[0-9a-fA-F]+$", min_length=2, max_length=4096
+    )
+    change: ArkadeOutgoingChangeCommitment | None = None
 
     class Config:
         extra = "forbid"
@@ -199,6 +220,7 @@ class ArkadeOutgoingIntentResponse(BaseModel):
     amount_msat: int
     max_fee_msat: Literal[0] = 0
     destination: str
+    destination_script: str | None = None
     destination_kind: ArkadeOutgoingDestinationKind = "arkade_address"
     status: ArkadeOutgoingStatus
     expires_at: datetime
@@ -206,3 +228,6 @@ class ArkadeOutgoingIntentResponse(BaseModel):
     server_url: str
     server_pubkey: str
     inputs: list[ArkadeOutgoingIntentInput]
+    change_index: int | None = None
+    change_script: str | None = None
+    change_amount_sat: int | None = None

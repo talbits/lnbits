@@ -1244,3 +1244,27 @@ async def m056_add_arkade_account_descriptor(db: Connection):
         "idx_arkade_account_bindings_identity_descriptor "
         "ON arkade_account_bindings (identity_descriptor)"
     )
+
+
+async def m057_add_arkade_outgoing_outputs(db: Connection):
+    """Store the exact public output contract committed by the browser."""
+    for column, definition in (
+        ("destination_script", "TEXT"),
+        ("change_index", f"{db.big_int}"),
+        ("change_script", "TEXT"),
+        ("change_amount_sat", f"{db.big_int}"),
+    ):
+        await db.execute(
+            f"ALTER TABLE arkade_outgoing_intents ADD COLUMN {column} {definition}"
+        )
+    await db.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS "
+        "idx_arkade_outgoing_change_account_index "
+        "ON arkade_outgoing_intents (account_id, change_index) "
+        "WHERE change_index IS NOT NULL"
+    )
+    await db.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_arkade_outgoing_change_script "
+        "ON arkade_outgoing_intents (change_script) "
+        "WHERE change_script IS NOT NULL"
+    )

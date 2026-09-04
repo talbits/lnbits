@@ -54,6 +54,7 @@ from lnbits.core.models import (
     ArkadeEnrollmentChallenge,
     ArkadeEnrollmentCompletion,
     ArkadeIndexerVtxo,
+    ArkadeOutgoingChangeCommitment,
     ArkadeOutgoingIntent,
     ArkadeOutgoingIntentInput,
     ArkadeOutgoingIntentResponse,
@@ -342,6 +343,10 @@ def _outgoing_response(
         server_url=binding.server_url,
         server_pubkey=binding.server_pubkey,
         inputs=sorted(inputs, key=lambda item: (item.txid, item.vout)),
+        destination_script=intent.destination_script,
+        change_index=intent.change_index,
+        change_script=intent.change_script,
+        change_amount_sat=intent.change_amount_sat,
     )
 
 
@@ -394,6 +399,7 @@ def _validate_outgoing_evidence(  # noqa: C901
     evidence: list[ArkadeIndexerVtxo],
     scripts: set[str],
     amount_msat: int,
+    change_amount_sat: int | None = None,
 ) -> None:
     selected_by_key: dict[tuple[str, int], ArkadeOutgoingSelectedInput] = {}
     for item in selected:
@@ -425,8 +431,80 @@ def _validate_outgoing_evidence(  # noqa: C901
         if vtxo.script.lower() not in scripts:
             raise ArkadeOutgoingError("ARKADE_OUTGOING_INPUT_UNREGISTERED")
         total_sat += vtxo.amount_sat
-    if total_sat * 1000 < amount_msat:
+    expected_sat = amount_msat // 1000 + (change_amount_sat or 0)
+    if total_sat < expected_sat:
         raise ArkadeOutgoingError("ARKADE_INSUFFICIENT_FUNDS")
+    if total_sat > expected_sat:
+        raise ArkadeOutgoingError("ARKADE_OUTGOING_OUTPUT_INVALID")
+
+
+def _same_outgoing_outputs(
+    intent: ArkadeOutgoingIntent,
+    destination_script: str,
+    change: ArkadeOutgoingChangeCommitment | None,
+) -> bool:
+    return intent.destination_script == destination_script and (
+        (
+            change is None
+            and intent.change_index is None
+            and intent.change_script is None
+            and intent.change_amount_sat is None
+        )
+        or (
+            change is not None
+            and intent.change_index == change.index
+            and intent.change_script == change.script.lower()
+            and intent.change_amount_sat == change.amount_sat
+        )
+    )
+
+
+def _validate_outgoing_outputs(
+    intent: ArkadeOutgoingIntent,
+    binding: ArkadeAccountBinding,
+    destination_script: str,
+    change: ArkadeOutgoingChangeCommitment | None,
+) -> None:
+    if not binding.identity_descriptor or not binding.identity_xonly_pubkey:
+        raise ArkadeOutgoingError("ARKADE_DESCRIPTOR_REENROLLMENT_REQUIRED")
+    try:
+        validate_arkade_identity_descriptor(
+            binding.identity_descriptor,
+            binding.identity_xonly_pubkey,
+            binding.network,
+        )
+        validate_arkade_address_script(
+            intent.destination,
+            destination_script.lower(),
+            binding.server_pubkey,
+            ARKADE_HRPS[binding.network],
+        )
+    except (ArkadeEnrollmentError, ArkadeReceiveError, KeyError):
+        raise ArkadeOutgoingError("ARKADE_OUTGOING_OUTPUT_INVALID") from None
+    if not change:
+        return
+    try:
+        derived = (
+            Descriptor.from_string(binding.identity_descriptor).derive(change.index).key
+        )
+        if not derived or derived.xonly().hex() != change.child_xonly_pubkey:
+            raise ValueError
+        validate_arkade_address_script(
+            change.address,
+            change.script.lower(),
+            binding.server_pubkey,
+            ARKADE_HRPS[binding.network],
+        )
+        verify_receive_exit_membership(
+            ArkadeReceiveAcknowledgement.construct(
+                child_xonly_pubkey=change.child_xonly_pubkey,
+                script=change.script.lower(),
+                exit_tapleaf=change.exit_tapleaf,
+                exit_control_block=change.exit_control_block,
+            )
+        )
+    except (AttributeError, EmbitError, TypeError, ValueError, ArkadeReceiveError):
+        raise ArkadeOutgoingError("ARKADE_OUTGOING_OUTPUT_INVALID") from None
 
 
 def _same_outgoing_inputs(
@@ -443,6 +521,8 @@ async def authorize_arkade_outgoing(  # noqa: C901
     intent_id: str,
     selected: list[ArkadeOutgoingSelectedInput],
     conn: Connection | None = None,
+    destination_script: str | None = None,
+    change: ArkadeOutgoingChangeCommitment | None = None,
 ) -> ArkadeOutgoingIntentResponse:
     """Validate public VTXO evidence and CAS a reservation to submitted."""
     if settings.lnbits_effective_installation_mode != "arkade_noncustodial":
@@ -457,6 +537,10 @@ async def authorize_arkade_outgoing(  # noqa: C901
         binding = await get_arkade_binding(account_id, conn=conn)
         if not binding or binding.state != "ready":
             raise ArkadeOutgoingError("ARKADE_ENROLLMENT_REQUIRED")
+        if destination_script is None:
+            raise ArkadeOutgoingError("ARKADE_OUTGOING_OUTPUT_INVALID")
+        destination_script = destination_script.lower()
+        _validate_outgoing_outputs(intent, binding, destination_script, change)
         payment = await get_payment_by_native_id(intent_id, conn=conn)
         claims = await get_arkade_outgoing_intent_inputs(intent_id, conn=conn)
         if intent.status == "submitted":
@@ -464,7 +548,9 @@ async def authorize_arkade_outgoing(  # noqa: C901
                 raise ArkadeOutgoingError("ARKADE_OUTGOING_CORRUPT")
             if payment.status != PaymentState.PENDING.value:
                 raise ArkadeOutgoingError("ARKADE_OUTGOING_CORRUPT")
-            if not _same_outgoing_inputs(selected, claims):
+            if not _same_outgoing_inputs(
+                selected, claims
+            ) or not _same_outgoing_outputs(intent, destination_script, change):
                 raise ArkadeOutgoingError("ARKADE_OUTGOING_IDEMPOTENCY_CONFLICT")
             return _outgoing_response(intent, binding, claims)
         if intent.status != "reserved":
@@ -488,7 +574,13 @@ async def authorize_arkade_outgoing(  # noqa: C901
             )
         except ArkadeReceiveError as exc:
             raise _authorize_indexer_error(exc) from None
-        _validate_outgoing_evidence(selected, evidence, scripts, intent.amount_msat)
+        _validate_outgoing_evidence(
+            selected,
+            evidence,
+            scripts,
+            intent.amount_msat,
+            change.amount_sat if change else None,
+        )
 
         async with db.reuse_conn(conn) if conn else db.connect() as database:
             async with database.transaction():
@@ -516,7 +608,11 @@ async def authorize_arkade_outgoing(  # noqa: C901
                         raise ArkadeOutgoingError("ARKADE_OUTGOING_CORRUPT")
                     if current_payment.status != PaymentState.PENDING.value:
                         raise ArkadeOutgoingError("ARKADE_OUTGOING_CORRUPT")
-                    if not _same_outgoing_inputs(selected, current_claims):
+                    if not _same_outgoing_inputs(
+                        selected, current_claims
+                    ) or not _same_outgoing_outputs(
+                        current, destination_script, change
+                    ):
                         raise ArkadeOutgoingError(
                             "ARKADE_OUTGOING_IDEMPOTENCY_CONFLICT"
                         )
@@ -531,6 +627,20 @@ async def authorize_arkade_outgoing(  # noqa: C901
                     or current_payment.status != PaymentState.PENDING.value
                 ):
                     raise ArkadeOutgoingError("ARKADE_OUTGOING_CORRUPT")
+                if change:
+                    collision = await database.fetchone(
+                        "SELECT 1 FROM arkade_receive_requests "
+                        "WHERE account_id = :account_id AND "
+                        '(("index" = :change_index) OR script = :change_script) '
+                        "AND script IS NOT NULL",
+                        {
+                            "account_id": account_id,
+                            "change_index": change.index,
+                            "change_script": change.script.lower(),
+                        },
+                    )
+                    if collision:
+                        raise ArkadeOutgoingError("ARKADE_OUTGOING_OUTPUT_CONFLICT")
                 input_rows = [
                     ArkadeOutgoingIntentInput(
                         intent_id=intent_id,
@@ -541,7 +651,14 @@ async def authorize_arkade_outgoing(  # noqa: C901
                     for item in selected
                 ]
                 try:
-                    await authorize_arkade_outgoing_intent(input_rows, database)
+                    await authorize_arkade_outgoing_intent(
+                        input_rows,
+                        database,
+                        destination_script=destination_script.lower(),
+                        change_index=change.index if change else None,
+                        change_script=change.script.lower() if change else None,
+                        change_amount_sat=change.amount_sat if change else None,
+                    )
                 except ValueError as exc:
                     code = str(exc)
                     if code in {
@@ -554,6 +671,10 @@ async def authorize_arkade_outgoing(  # noqa: C901
                     if code == "ARKADE_INTENT_INVALID_TRANSITION":
                         raise ArkadeOutgoingError(code) from None
                     raise ArkadeOutgoingError("ARKADE_OUTGOING_CORRUPT") from None
+                except IntegrityError:
+                    raise ArkadeOutgoingError(
+                        "ARKADE_OUTGOING_OUTPUT_CONFLICT"
+                    ) from None
                 submitted = await get_arkade_outgoing_intent(intent_id, conn=database)
                 submitted_claims = await get_arkade_outgoing_intent_inputs(
                     intent_id, conn=database
@@ -1165,6 +1286,13 @@ async def _acknowledge_arkade_receive(  # noqa: C901
     if settings.lnbits_effective_installation_mode != "arkade_noncustodial":
         raise ArkadeReceiveError("ARKADE_RECEIVE_UNAVAILABLE")
     await require_arkade_ready(account_id, conn=conn)
+    if conn is None:
+        raise RuntimeError("ARKADE_MUTATION_REQUIRES_TRANSACTION")
+    await conn.execute(
+        "UPDATE arkade_account_bindings SET account_id = account_id "
+        "WHERE account_id = :account_id AND state = 'ready'",
+        {"account_id": account_id},
+    )
     if data.account_id != account_id:
         raise ArkadeReceiveError("ARKADE_RECEIVE_ACCOUNT_MISMATCH")
     request = await get_arkade_receive_request(data.native_request_id, conn=conn)
@@ -1196,6 +1324,14 @@ async def _acknowledge_arkade_receive(  # noqa: C901
     verify_receive_exit_membership(data)
     result = request
     if request.state == "pending":
+        collision = await conn.fetchone(
+            "SELECT 1 FROM arkade_outgoing_intents "
+            "WHERE account_id = :account_id AND "
+            "((change_index = :index) OR change_script = :script)",
+            {"account_id": account_id, "index": data.index, "script": data.script},
+        )
+        if collision:
+            raise ArkadeReceiveError("ARKADE_RECEIVE_MAPPING_CONFLICT")
         try:
             updated = await update_arkade_receive_acknowledgement(
                 request,

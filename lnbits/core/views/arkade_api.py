@@ -67,7 +67,10 @@ def _public_outgoing_error(exc: ArkadeOutgoingError) -> HTTPException:
         "ARKADE_OUTGOING_INPUTS_MISSING",
         "ARKADE_OUTGOING_NOT_ALLOWED",
         "ARKADE_OUTGOING_NOT_FOUND",
+        "ARKADE_OUTGOING_OUTPUT_CONFLICT",
+        "ARKADE_OUTGOING_OUTPUT_INVALID",
         "ARKADE_OUTGOING_UNAVAILABLE",
+        "ARKADE_DESCRIPTOR_REENROLLMENT_REQUIRED",
         "ARKADE_INSUFFICIENT_FUNDS",
     }:
         code = "ARKADE_OUTGOING_ERROR"
@@ -159,6 +162,12 @@ async def api_arkade_outgoing_authorize(
     account: Account = Depends(check_authenticated_account),
 ):
     try:
-        return await authorize_arkade_outgoing(account.id, intent_id, data.inputs)
+        return await authorize_arkade_outgoing(
+            account.id,
+            intent_id,
+            data.inputs,
+            destination_script=data.destination_script,
+            change=data.change,
+        )
     except ArkadeOutgoingError as exc:
         raise _public_outgoing_error(exc) from exc
