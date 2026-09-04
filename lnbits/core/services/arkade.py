@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import re
 from datetime import datetime, timedelta, timezone
@@ -9,6 +10,7 @@ from bech32 import CHARSET, bech32_hrp_expand, bech32_polymod, convertbits
 from coincurve import PublicKeyXOnly
 from embit.base import EmbitError
 from embit.descriptor import Descriptor
+from embit.psbt import PSBT
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from lnbits.core.crud.arkade import (
@@ -55,6 +57,8 @@ from lnbits.core.models import (
     ArkadeEnrollmentCompletion,
     ArkadeIndexerVtxo,
     ArkadeOutgoingChangeCommitment,
+    ArkadeOutgoingEvidenceResult,
+    ArkadeOutgoingEvidenceStatus,
     ArkadeOutgoingIntent,
     ArkadeOutgoingIntentInput,
     ArkadeOutgoingIntentResponse,
@@ -84,6 +88,8 @@ RECEIVE_ACTION = "lnbits-arkade-receive-v1"
 MAX_AMOUNT_SAT = 2_100_000_000_000_000
 MAX_VOUT = 4_294_967_295
 _INDEXER_TIMESTAMP_BOUNDARY_MS = 1_735_689_600_000
+_MAX_INDEXER_PSBT_BYTES = 4 * 1024 * 1024
+_MAX_INDEXER_PSBT_BASE64_LENGTH = 4 * ((_MAX_INDEXER_PSBT_BYTES + 2) // 3)
 _TAPROOT_UNSPENDABLE_KEY = bytes.fromhex(
     "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0"
 )
@@ -1562,7 +1568,9 @@ async def fetch_arkade_indexer_vtxos(  # noqa: C901
 
 
 async def fetch_arkade_indexer_vtxos_for_outpoints(  # noqa: C901
-    account_id: str, outpoints: list[tuple[str, int]]
+    account_id: str,
+    outpoints: list[tuple[str, int]],
+    spendable_only: bool = True,
 ) -> list[ArkadeIndexerVtxo]:
     """Fetch only the requested public outpoints from the Arkade indexer."""
     binding = await get_arkade_binding(account_id)
@@ -1584,7 +1592,7 @@ async def fetch_arkade_indexer_vtxos_for_outpoints(  # noqa: C901
                 params = tuple(
                     [("outpoints", f"{txid}:{vout}") for txid, vout in outpoints]
                     + [
-                        ("spendableOnly", "true"),
+                        ("spendableOnly", "true" if spendable_only else "false"),
                         ("page.index", str(page_index)),
                         ("page.size", "500"),
                     ]
@@ -1609,6 +1617,282 @@ async def fetch_arkade_indexer_vtxos_for_outpoints(  # noqa: C901
                 page_index = page["next"]
     except httpx.HTTPError as exc:
         raise ArkadeReceiveError("ARKADE_INDEXER_UNAVAILABLE") from exc
+
+
+async def fetch_arkade_indexer_virtual_tx(  # noqa: C901
+    account_id: str, arkade_txid: str
+) -> str | None:
+    """Fetch one public Ark virtual transaction PSBT from the pinned indexer."""
+    if not _TXID.fullmatch(arkade_txid):
+        raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
+    binding = await get_arkade_binding(account_id)
+    if not binding or binding.state != "ready":
+        raise ArkadeReceiveError("ARKADE_ENROLLMENT_REQUIRED")
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            page_index = 0
+            seen_pages: set[int] = set()
+            while True:
+                if page_index in seen_pages or len(seen_pages) >= 2:
+                    raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
+                seen_pages.add(page_index)
+                response = await client.get(
+                    f"{binding.server_url}/v1/indexer/virtualTx/{arkade_txid}",
+                    params={"page.index": page_index, "page.size": 2},
+                )
+                response.raise_for_status()
+                try:
+                    body = response.json()
+                except ValueError as exc:
+                    raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE") from exc
+                if (
+                    not isinstance(body, dict)
+                    or not isinstance(body.get("txs"), list)
+                    or any(not isinstance(tx, str) for tx in body["txs"])
+                ):
+                    raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
+                page = body.get("page")
+                if page is not None:
+                    _validate_indexer_page(page)
+                if len(body["txs"]) > 1:
+                    raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
+                if body["txs"]:
+                    tx = body["txs"][0]
+                    if len(tx) > _MAX_INDEXER_PSBT_BASE64_LENGTH:
+                        raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
+                    try:
+                        raw = base64.b64decode(tx, validate=True)
+                    except Exception as exc:
+                        raise ArkadeReceiveError(
+                            "ARKADE_INDEXER_INVALID_RESPONSE"
+                        ) from exc
+                    if not 1 <= len(raw) <= _MAX_INDEXER_PSBT_BYTES:
+                        raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
+                    return tx
+                if page is None:
+                    return None
+                if page["current"] >= page["total"]:
+                    return None
+                page_index = page["next"]
+    except httpx.HTTPError as exc:
+        raise ArkadeReceiveError("ARKADE_INDEXER_UNAVAILABLE") from exc
+
+
+def _outgoing_evidence_result(
+    status: ArkadeOutgoingEvidenceStatus,
+    arkade_txid: str | None = None,
+    code: str | None = None,
+) -> ArkadeOutgoingEvidenceResult:
+    return ArkadeOutgoingEvidenceResult(
+        status=status, arkade_txid=arkade_txid, code=code
+    )
+
+
+def classify_arkade_outgoing_evidence(  # noqa: C901
+    claims: list[ArkadeOutgoingIntentInput],
+    evidence: list[ArkadeIndexerVtxo],
+) -> ArkadeOutgoingEvidenceResult:
+    """Classify indexer facts before fetching the corresponding virtual tx."""
+    expected = {(claim.txid, claim.vout) for claim in claims}
+    if len(expected) != len(claims):
+        return _outgoing_evidence_result(
+            "contradictory", code="ARKADE_OUTGOING_EVIDENCE_DUPLICATE"
+        )
+    observed: dict[tuple[str, int], ArkadeIndexerVtxo] = {}
+    for vtxo in evidence:
+        key = (vtxo.txid, vtxo.vout)
+        if key in observed:
+            return _outgoing_evidence_result(
+                "contradictory", code="ARKADE_OUTGOING_EVIDENCE_DUPLICATE"
+            )
+        observed[key] = vtxo
+    if expected - set(observed):
+        return _outgoing_evidence_result(
+            "pending", code="ARKADE_OUTGOING_EVIDENCE_INCOMPLETE"
+        )
+    if set(observed) - expected:
+        return _outgoing_evidence_result(
+            "contradictory", code="ARKADE_OUTGOING_EVIDENCE_EXTRA_INPUT"
+        )
+
+    claims_by_outpoint = {(claim.txid, claim.vout): claim for claim in claims}
+    ark_txids: set[str] = set()
+    checkpoint_ids: list[str] = []
+    for vtxo in evidence:
+        claim = claims_by_outpoint[(vtxo.txid, vtxo.vout)]
+        if vtxo.amount_sat != claim.amount_sat:
+            return _outgoing_evidence_result(
+                "contradictory", code="ARKADE_OUTGOING_EVIDENCE_INPUT_VALUE_INVALID"
+            )
+        if (vtxo.spent_by and not _TXID.fullmatch(vtxo.spent_by)) or (
+            vtxo.arkade_txid and not _TXID.fullmatch(vtxo.arkade_txid)
+        ):
+            raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
+        if vtxo.is_swept or vtxo.is_unrolled or vtxo.settled_by:
+            return _outgoing_evidence_result(
+                "contradictory", code="ARKADE_OUTGOING_EVIDENCE_TERMINAL_CONFLICT"
+            )
+        if not vtxo.is_spent or not vtxo.spent_by or not vtxo.arkade_txid:
+            return _outgoing_evidence_result(
+                "pending", code="ARKADE_OUTGOING_EVIDENCE_NOT_SPENT"
+            )
+        ark_txids.add(vtxo.arkade_txid)
+        checkpoint_ids.append(vtxo.spent_by)
+    if len(checkpoint_ids) != len(set(checkpoint_ids)):
+        return _outgoing_evidence_result(
+            "contradictory", code="ARKADE_OUTGOING_EVIDENCE_DUPLICATE"
+        )
+    if len(ark_txids) != 1:
+        return _outgoing_evidence_result(
+            "contradictory", code="ARKADE_OUTGOING_EVIDENCE_ARK_TXID_CONFLICT"
+        )
+    return _outgoing_evidence_result("verified", arkade_txid=ark_txids.pop())
+
+
+def verify_arkade_outgoing_virtual_tx(  # noqa: C901
+    *,
+    arkade_txid: str,
+    psbt_base64: str,
+    claims: list[ArkadeOutgoingIntentInput],
+    evidence: list[ArkadeIndexerVtxo],
+    destination_script: str,
+    amount_msat: int,
+    change_script: str | None = None,
+    change_amount_sat: int | None = None,
+) -> ArkadeOutgoingEvidenceResult:
+    """Independently verify the exact zero-fee virtual transaction."""
+    preliminary = classify_arkade_outgoing_evidence(claims, evidence)
+    if preliminary.status != "verified":
+        return preliminary
+    if preliminary.arkade_txid != arkade_txid:
+        return _outgoing_evidence_result(
+            "contradictory", code="ARKADE_OUTGOING_EVIDENCE_ARK_TXID_CONFLICT"
+        )
+    if (
+        amount_msat <= 0
+        or amount_msat % 1000
+        or not _SCRIPT.fullmatch(destination_script)
+        or len(destination_script) % 2
+    ):
+        return _outgoing_evidence_result(
+            "contradictory", code="ARKADE_OUTGOING_EVIDENCE_OUTPUT_INVALID"
+        )
+    if (change_script is None) != (change_amount_sat is None) or (
+        change_script is not None
+        and (
+            not _SCRIPT.fullmatch(change_script)
+            or len(change_script) % 2
+            or not change_amount_sat
+        )
+    ):
+        return _outgoing_evidence_result(
+            "contradictory", code="ARKADE_OUTGOING_EVIDENCE_OUTPUT_INVALID"
+        )
+    try:
+        if len(psbt_base64) > _MAX_INDEXER_PSBT_BASE64_LENGTH:
+            raise ValueError
+        raw = base64.b64decode(psbt_base64, validate=True)
+        if not 1 <= len(raw) <= _MAX_INDEXER_PSBT_BYTES:
+            raise ValueError
+        parsed = PSBT.parse(raw)
+    except Exception as exc:
+        raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE") from exc
+
+    tx = parsed.tx
+    expected_inputs = {(vtxo.spent_by, 0) for vtxo in evidence}
+    actual_inputs = {(vin.txid.hex(), vin.vout) for vin in tx.vin}
+    if (
+        len(tx.vin) != len(expected_inputs)
+        or None in {item[0] for item in expected_inputs}
+        or actual_inputs != expected_inputs
+    ):
+        return _outgoing_evidence_result(
+            "contradictory", code="ARKADE_OUTGOING_EVIDENCE_INPUT_INVALID"
+        )
+
+    claims_by_checkpoint = {
+        vtxo.spent_by: vtxo.amount_sat for vtxo in evidence if vtxo.spent_by
+    }
+    input_total = 0
+    try:
+        for index, vin in enumerate(tx.vin):
+            if vin.txid.hex() not in claims_by_checkpoint:
+                return _outgoing_evidence_result(
+                    "contradictory", code="ARKADE_OUTGOING_EVIDENCE_INPUT_INVALID"
+                )
+            utxo = parsed.utxo(index)
+            if utxo.value != claims_by_checkpoint[vin.txid.hex()]:
+                return _outgoing_evidence_result(
+                    "contradictory", code="ARKADE_OUTGOING_EVIDENCE_INPUT_VALUE_INVALID"
+                )
+            input_total += utxo.value
+    except Exception as exc:
+        raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE") from exc
+
+    expected_outputs: list[tuple[int, str]] = [
+        (amount_msat // 1000, destination_script.lower())
+    ]
+    if change_script is not None:
+        assert change_amount_sat is not None
+        expected_outputs.append((change_amount_sat, change_script.lower()))
+    expected_outputs.append((0, "51024e73"))
+    actual_outputs = [
+        (output.value, output.script_pubkey.data.hex()) for output in tx.vout
+    ]
+    if actual_outputs != expected_outputs:
+        return _outgoing_evidence_result(
+            "contradictory", code="ARKADE_OUTGOING_EVIDENCE_OUTPUT_INVALID"
+        )
+    if input_total != sum(value for value, _ in expected_outputs):
+        return _outgoing_evidence_result(
+            "contradictory", code="ARKADE_OUTGOING_EVIDENCE_FEE_INVALID"
+        )
+    if tx.txid().hex() != arkade_txid:
+        return _outgoing_evidence_result(
+            "contradictory", code="ARKADE_OUTGOING_EVIDENCE_TXID_MISMATCH"
+        )
+    return preliminary
+
+
+async def verify_arkade_outgoing_evidence(
+    account_id: str,
+    claims: list[ArkadeOutgoingIntentInput],
+    destination_script: str,
+    amount_msat: int,
+    change_script: str | None = None,
+    change_amount_sat: int | None = None,
+) -> ArkadeOutgoingEvidenceResult:
+    """Fetch and verify public settlement evidence without mutating state."""
+    if not 1 <= len(claims) <= 100:
+        raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
+    evidence = await fetch_arkade_indexer_vtxos_for_outpoints(
+        account_id,
+        [(claim.txid, claim.vout) for claim in claims],
+        spendable_only=False,
+    )
+    preliminary = classify_arkade_outgoing_evidence(claims, evidence)
+    if preliminary.status != "verified":
+        return preliminary
+    assert preliminary.arkade_txid is not None
+    psbt_base64 = await fetch_arkade_indexer_virtual_tx(
+        account_id, preliminary.arkade_txid
+    )
+    if psbt_base64 is None:
+        return _outgoing_evidence_result(
+            "pending",
+            arkade_txid=preliminary.arkade_txid,
+            code="ARKADE_OUTGOING_EVIDENCE_UNINDEXED",
+        )
+    return verify_arkade_outgoing_virtual_tx(
+        arkade_txid=preliminary.arkade_txid,
+        psbt_base64=psbt_base64,
+        claims=claims,
+        evidence=evidence,
+        destination_script=destination_script,
+        amount_msat=amount_msat,
+        change_script=change_script,
+        change_amount_sat=change_amount_sat,
+    )
 
 
 async def _mark_receive_reconciliation_required(

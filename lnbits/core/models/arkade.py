@@ -134,6 +134,7 @@ class ArkadeReconciliation(BaseModel):
 ArkadeOutgoingStatus = Literal[
     "reserved", "submitted", "settled", "released", "disputed"
 ]
+ArkadeOutgoingEvidenceStatus = Literal["verified", "pending", "contradictory"]
 ArkadeOutgoingDestinationKind = Literal["arkade_address"]
 
 
@@ -185,6 +186,12 @@ class ArkadeOutgoingSelectedInput(BaseModel):
 
     class Config:
         extra = "forbid"
+
+
+class ArkadeOutgoingEvidenceResult(BaseModel):
+    status: ArkadeOutgoingEvidenceStatus
+    arkade_txid: str | None = Field(default=None, regex=r"^[0-9a-f]{64}$")
+    code: str | None = None
 
 
 class ArkadeOutgoingChangeCommitment(BaseModel):
