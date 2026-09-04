@@ -17,6 +17,8 @@ const IDLE_TIMEOUT_MS = 15 * 60 * 1000
 const HEX32 = /^[0-9a-f]{32}$/
 const HEX64 = /^[0-9a-f]{64}$/
 const NETWORK = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/
+const IDENTITY_DESCRIPTOR =
+  /^tr\(\[[0-9a-f]{8}\/86'\/[01]'\/0'\](?:xpub|tpub)[1-9A-HJ-NP-Za-km-z]+\/0\/\*\)$/
 const PASSWORD_MIN_LENGTH = 12
 const MAX_CIPHERTEXT_BYTES = 1024 * 1024
 const RECEIVE_JOURNAL_PREFIX = 'lnbits-arkade-receive-v1'
@@ -123,6 +125,7 @@ const validateBinding = (
   expected?: {
     idempotencyKey?: string
     identityXonlyPubkey?: string
+    identityDescriptor?: string
     previous?: any
   }
 ) => {
@@ -149,8 +152,12 @@ const validateBinding = (
   } else if (
     value.state === 'ready' &&
     (!HEX64.test(value.identity_xonly_pubkey || '') ||
+      (value.identity_descriptor != null &&
+        !IDENTITY_DESCRIPTOR.test(value.identity_descriptor)) ||
       (expected?.identityXonlyPubkey &&
-        value.identity_xonly_pubkey !== expected.identityXonlyPubkey))
+        value.identity_xonly_pubkey !== expected.identityXonlyPubkey) ||
+      (expected?.identityDescriptor &&
+        value.identity_descriptor !== expected.identityDescriptor))
   )
     throw new Error('invalid enrollment response')
   else if (value.state !== 'ready')
@@ -282,7 +289,7 @@ const strictRecord = (
 const makeIdentity = (mnemonic: string, network: string) => {
   if (!validateMnemonic(mnemonic, wordlist)) throw new Error('invalid mnemonic')
   return MnemonicIdentity.fromMnemonic(mnemonic, {
-    isMainnet: network === 'mainnet'
+    isMainnet: network === 'bitcoin'
   })
 }
 
@@ -361,7 +368,7 @@ const decryptVault = async (
   return mnemonic
 }
 
-const statement = (challenge: any, xonly: string) =>
+const statement = (challenge: any, xonly: string, descriptor: string) =>
   [
     `action=lnbits-arkade-enrollment-v1`,
     `account_id=${challenge.account_id}`,
@@ -373,6 +380,7 @@ const statement = (challenge: any, xonly: string) =>
     `server_url=${challenge.server_url}`,
     `server_pubkey=${challenge.server_pubkey}`,
     'identity_kind=mnemonic_hd',
+    `identity_descriptor=${descriptor}`,
     `identity_xonly_pubkey=${xonly}`,
     'backup_acknowledged=1'
   ].join('\n')
@@ -633,7 +641,11 @@ const finish = async () => {
   })
   if (challenge.state === 'ready') {
     const xonly = bytesToHex(await identity.xOnlyPublicKey())
-    if (challenge.identity_xonly_pubkey !== xonly)
+    if (
+      challenge.identity_xonly_pubkey !== xonly ||
+      (challenge.identity_descriptor &&
+        challenge.identity_descriptor !== identity.descriptor)
+    )
       throw new Error('wallet mismatch')
     activeBinding = challenge
     window.g.arkadeEnrollmentState = 'ready_unlocked'
@@ -641,9 +653,10 @@ const finish = async () => {
   }
   if (challenge.state !== 'pending') throw new Error('enrollment changed')
   const xonly = bytesToHex(await identity.xOnlyPublicKey())
+  const descriptor = identity.descriptor
   const sig = bytesToHex(
     await identity.signMessage(
-      await digest(statement(challenge, xonly)),
+      await digest(statement(challenge, xonly, descriptor)),
       'schnorr'
     )
   )
@@ -651,11 +664,13 @@ const finish = async () => {
     enrollment_id: challenge.enrollment_id,
     idempotency_key: challenge.idempotency_key,
     identity_xonly_pubkey: xonly,
+    identity_descriptor: descriptor,
     signature: sig
   })
   activeBinding = validateBinding(result.data, window.g.user.id, {
     idempotencyKey: challenge.idempotency_key,
     identityXonlyPubkey: xonly,
+    identityDescriptor: descriptor,
     previous: challenge
   })
   if (activeBinding.state !== 'ready')
@@ -681,7 +696,9 @@ const unlock = async (password: string) => {
   if (
     xonly !== record.identityXonlyPubkey ||
     (activeBinding?.state === 'ready' &&
-      xonly !== activeBinding.identity_xonly_pubkey)
+      (xonly !== activeBinding.identity_xonly_pubkey ||
+        (activeBinding.identity_descriptor &&
+          next.descriptor !== activeBinding.identity_descriptor)))
   )
     throw new Error('wallet mismatch')
   identity = next
@@ -744,7 +761,11 @@ window.ArkadeEnrollment = {
     const next = makeIdentity(clean, challenge.network)
     const xonly = bytesToHex(await next.xOnlyPublicKey())
     if (challenge.state === 'ready') {
-      if (xonly !== challenge.identity_xonly_pubkey)
+      if (
+        xonly !== challenge.identity_xonly_pubkey ||
+        (challenge.identity_descriptor &&
+          next.descriptor !== challenge.identity_descriptor)
+      )
         throw new Error('wallet mismatch')
       await encryptVault(
         accountId,

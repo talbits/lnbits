@@ -21,6 +21,7 @@ class ArkadeAccountBinding(BaseModel):
     server_url: str
     server_pubkey: str
     identity_xonly_pubkey: str | None = None
+    identity_descriptor: str | None = Field(default=None, max_length=512)
     backup_acknowledged_at: datetime | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -45,6 +46,7 @@ class ArkadeEnrollmentCompletion(BaseModel):
     enrollment_id: str = Field(regex=r"^[0-9a-f]{32}$")
     idempotency_key: str = Field(regex=r"^[0-9a-f]{32}$")
     identity_xonly_pubkey: str = Field(regex=r"^[0-9a-f]{64}$")
+    identity_descriptor: str = Field(min_length=1, max_length=512)
     signature: str = Field(regex=r"^[0-9a-f]{128}$")
 
 
@@ -57,6 +59,7 @@ class ArkadeEnrollmentBindingResponse(BaseModel):
     server_url: str
     server_pubkey: str
     identity_xonly_pubkey: str | None = None
+    identity_descriptor: str | None = Field(default=None, max_length=512)
     backup_acknowledged_at: datetime | None = None
     created_at: datetime
     updated_at: datetime

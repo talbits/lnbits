@@ -7,6 +7,8 @@ from uuid import uuid4
 import httpx
 from bech32 import CHARSET, bech32_hrp_expand, bech32_polymod, convertbits
 from coincurve import PublicKeyXOnly
+from embit.base import EmbitError
+from embit.descriptor import Descriptor
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from lnbits.core.crud.arkade import (
@@ -72,6 +74,9 @@ CHALLENGE_TTL_SECONDS = 10 * 60
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _ID = re.compile(r"^[0-9a-f]{32}$")
 _IDEMPOTENCY = re.compile(r"^[0-9a-f]{32}$")
+_IDENTITY_DESCRIPTOR = re.compile(
+    r"^tr\(\[[0-9a-f]{8}/86'/(0|1)'/0'\](xpub|tpub)" r"[1-9A-HJ-NP-Za-km-z]+/0/\*\)$"
+)
 _TXID = re.compile(r"^[0-9a-f]{64}$")
 _SCRIPT = re.compile(r"^[0-9a-fA-F]+$")
 RECEIVE_ACTION = "lnbits-arkade-receive-v1"
@@ -573,6 +578,7 @@ def canonical_enrollment_statement(
     server_url: str,
     server_pubkey: str,
     identity_xonly_pubkey: str,
+    identity_descriptor: str,
 ) -> str:
     values = {
         "account_id": account_id,
@@ -584,6 +590,7 @@ def canonical_enrollment_statement(
         "server_url": server_url,
         "server_pubkey": server_pubkey,
         "identity_kind": IDENTITY_KIND,
+        "identity_descriptor": identity_descriptor,
         "identity_xonly_pubkey": identity_xonly_pubkey,
         "backup_acknowledged": "1",
     }
@@ -595,6 +602,10 @@ def canonical_enrollment_statement(
         raise ArkadeEnrollmentError("Invalid enrollment challenge.")
     if not _HEX64.fullmatch(identity_xonly_pubkey):
         raise ArkadeEnrollmentError("Invalid identity key.")
+    if not isinstance(identity_descriptor, str) or not _IDENTITY_DESCRIPTOR.fullmatch(
+        identity_descriptor
+    ):
+        raise ArkadeEnrollmentError("Invalid enrollment descriptor.")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,31}", network):
         raise ArkadeEnrollmentError("Invalid Arkade network.")
     if any("\n" in value or "\r" in value for value in values.values()):
@@ -606,6 +617,50 @@ def canonical_enrollment_statement(
     return "\n".join(
         [f"action={ENROLLMENT_ACTION}"] + [f"{k}={v}" for k, v in values.items()]
     )
+
+
+def validate_arkade_identity_descriptor(
+    identity_descriptor: str, identity_xonly_pubkey: str, network: str
+) -> None:
+    """Require the SDK's canonical BIP86 /0 wildcard and bind index zero."""
+    match = _IDENTITY_DESCRIPTOR.fullmatch(identity_descriptor)
+    expected_prefix = "xpub" if network == "bitcoin" else "tpub"
+    expected_coin_type = "0" if network == "bitcoin" else "1"
+    if (
+        not match
+        or match.group(1) != expected_coin_type
+        or match.group(2) != expected_prefix
+    ):
+        raise ArkadeEnrollmentError("Invalid enrollment descriptor.")
+    try:
+        parsed = Descriptor.from_string(identity_descriptor)
+        key = parsed.key
+        expected_origin = [
+            86 | 0x80000000,
+            int(expected_coin_type) | 0x80000000,
+            0x80000000,
+        ]
+        if (
+            not parsed.is_taproot
+            or parsed.miniscript is not None
+            or parsed.taptree
+            or key is None
+            or not key.is_extended
+            or key.is_private
+            or key.key.depth != 3
+            or key.origin is None
+            or key.origin.derivation != expected_origin
+            or str(key.allowed_derivation) != "/0/*"
+        ):
+            raise ArkadeEnrollmentError("Invalid enrollment descriptor.")
+        derived_key = parsed.derive(0).key
+        if derived_key is None:
+            raise ArkadeEnrollmentError("Invalid enrollment descriptor.")
+        derived = derived_key.xonly().hex()
+    except (AttributeError, EmbitError, TypeError, ValueError):
+        raise ArkadeEnrollmentError("Invalid enrollment descriptor.") from None
+    if derived != identity_xonly_pubkey:
+        raise ArkadeEnrollmentError("Invalid enrollment descriptor.")
 
 
 def verify_enrollment_proof(
@@ -638,6 +693,7 @@ def _response(binding: ArkadeAccountBinding) -> ArkadeEnrollmentBindingResponse:
         server_url=binding.server_url,
         server_pubkey=binding.server_pubkey,
         identity_xonly_pubkey=binding.identity_xonly_pubkey,
+        identity_descriptor=binding.identity_descriptor,
         backup_acknowledged_at=binding.backup_acknowledged_at,
         created_at=binding.created_at,
         updated_at=binding.updated_at,
@@ -757,6 +813,8 @@ async def complete_enrollment(
             binding.enrollment_id != data.enrollment_id
             or binding.idempotency_key != data.idempotency_key
             or binding.identity_xonly_pubkey != data.identity_xonly_pubkey
+            or not binding.identity_descriptor
+            or binding.identity_descriptor != data.identity_descriptor
         ):
             raise ArkadeEnrollmentError("Enrollment binding mismatch.")
         return _response(binding)
@@ -772,6 +830,9 @@ async def complete_enrollment(
     now = datetime.now(timezone.utc)
     if binding.challenge_expires_at <= now:
         raise ArkadeEnrollmentError("Enrollment challenge expired.")
+    validate_arkade_identity_descriptor(
+        data.identity_descriptor, data.identity_xonly_pubkey, binding.network
+    )
     statement = canonical_enrollment_statement(
         account_id=account.id,
         enrollment_id=binding.enrollment_id,
@@ -782,6 +843,7 @@ async def complete_enrollment(
         server_url=binding.server_url,
         server_pubkey=binding.server_pubkey,
         identity_xonly_pubkey=data.identity_xonly_pubkey,
+        identity_descriptor=data.identity_descriptor,
     )
     verify_enrollment_proof(statement, data.identity_xonly_pubkey, data.signature)
     try:
@@ -792,6 +854,7 @@ async def complete_enrollment(
             nonce=binding.challenge_nonce,
             expires_at=binding.challenge_expires_at,
             identity_xonly_pubkey=data.identity_xonly_pubkey,
+            identity_descriptor=data.identity_descriptor,
             acknowledged_at=now,
             server_utc_now=now,
             conn=conn,

@@ -4,10 +4,9 @@ import {resolve} from 'node:path'
 import {createHash} from 'node:crypto'
 import {schnorr} from '@noble/curves/secp256k1.js'
 
-const modulePath = resolve(
-  __dirname,
-  '../../lnbits/static/js/pages/arkade-enrollment.js'
-)
+const modulePath = process.env.ARKADE_ENROLLMENT_BUNDLE
+  ? resolve(process.env.ARKADE_ENROLLMENT_BUNDLE)
+  : resolve(__dirname, '../../lnbits/static/js/pages/arkade-enrollment.js')
 const accountId = '0123456789abcdef0123456789abcdef'
 const mnemonic =
   'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about'
@@ -70,7 +69,8 @@ test('browser enrollment signs only the public proof and unlocks after reload', 
               ...challenge,
               state: 'ready',
               idempotency_key: data.idempotency_key,
-              identity_xonly_pubkey: data.identity_xonly_pubkey
+              identity_xonly_pubkey: data.identity_xonly_pubkey,
+              identity_descriptor: data.identity_descriptor
             }
           }
         }
@@ -132,6 +132,10 @@ test('browser enrollment signs only the public proof and unlocks after reload', 
   expect(JSON.stringify(result.record)).not.toContain(mnemonic)
 
   const proof = result.requests[0] as Record<string, string | number>
+  expect(proof.identity_descriptor).toMatch(
+    /^tr\(\[[0-9a-f]{8}\/86'\/1'\/0'\]tpub[1-9A-HJ-NP-Za-km-z]+\/0\/\*\)$/
+  )
+  expect(JSON.stringify(result.record)).not.toContain(proof.identity_descriptor)
   const canonical = [
     'action=lnbits-arkade-enrollment-v1',
     `account_id=${result.challenge.account_id}`,
@@ -143,6 +147,7 @@ test('browser enrollment signs only the public proof and unlocks after reload', 
     `server_url=${result.challenge.server_url}`,
     `server_pubkey=${result.challenge.server_pubkey}`,
     'identity_kind=mnemonic_hd',
+    `identity_descriptor=${proof.identity_descriptor}`,
     `identity_xonly_pubkey=${proof.identity_xonly_pubkey}`,
     'backup_acknowledged=1'
   ].join('\n')
@@ -277,6 +282,65 @@ test('browser enrollment signs only the public proof and unlocks after reload', 
   expect(logs).toEqual([])
 })
 
+test('browser enrollment derives the mainnet account descriptor', async ({
+  page
+}) => {
+  const script = await readFile(modulePath, 'utf8')
+  await page.addInitScript(script)
+  await page.route('http://127.0.0.1/enrollment-mainnet-test', route =>
+    route.fulfill({contentType: 'text/html', body: '<!doctype html>'})
+  )
+  await page.goto('http://127.0.0.1/enrollment-mainnet-test')
+  const proof = await page.evaluate(
+    async ({id, phrase}) => {
+      const challenge = {
+        account_id: id,
+        state: 'pending',
+        enrollment_id: 'abcdefabcdefabcdefabcdefabcdefab',
+        idempotency_key: '11111111111111111111111111111111',
+        nonce:
+          '2222222222222222222222222222222222222222222222222222222222222222',
+        expires_at: Math.floor(Date.now() / 1000) + 600,
+        network: 'bitcoin',
+        server_url: 'https://ark.example',
+        server_pubkey:
+          '3333333333333333333333333333333333333333333333333333333333333333'
+      }
+      let completion: any
+      window.g = {user: {id}, arkadeEnrollmentState: null}
+      window.LNbits = {
+        api: {
+          arkadeEnrollmentChallenge: async (requestedKey: string) => ({
+            data: {...challenge, idempotency_key: requestedKey}
+          }),
+          arkadeEnrollmentComplete: async data => {
+            completion = data
+            return {
+              data: {
+                ...challenge,
+                state: 'ready',
+                idempotency_key: data.idempotency_key,
+                identity_xonly_pubkey: data.identity_xonly_pubkey,
+                identity_descriptor: data.identity_descriptor
+              }
+            }
+          }
+        }
+      }
+      await window.ArkadeEnrollment.enroll(
+        phrase,
+        'correct horse battery',
+        true
+      )
+      return completion
+    },
+    {id: accountId, phrase: mnemonic}
+  )
+  expect(proof.identity_descriptor).toMatch(
+    /^tr\(\[[0-9a-f]{8}\/86'\/0'\/0'\]xpub[1-9A-HJ-NP-Za-km-z]+\/0\/\*\)$/
+  )
+})
+
 test('generated module rejects vault tampering and restores a lost ready vault', async ({
   page
 }) => {
@@ -303,6 +367,7 @@ test('generated module rejects vault tampering and restores a lost ready vault',
     }
     let state = 'pending'
     let identityKey = ''
+    let identityDescriptor = ''
     let challengeCalls = 0
     let mutateServerOnCall = 0
     let mutateIdempotencyOnCall = 0
@@ -322,6 +387,9 @@ test('generated module rejects vault tampering and restores a lost ready vault',
                   ? '44444444444444444444444444444444'
                   : requestedKey,
               identity_xonly_pubkey: identityKey,
+              ...(identityDescriptor
+                ? {identity_descriptor: identityDescriptor}
+                : {}),
               ...(challengeCalls === mutateServerOnCall
                 ? {server_url: 'http://other.example:7070'}
                 : {})
@@ -333,12 +401,14 @@ test('generated module rejects vault tampering and restores a lost ready vault',
           if (failCompletion) throw new Error('temporary completion failure')
           state = 'ready'
           identityKey = data.identity_xonly_pubkey
+          identityDescriptor = data.identity_descriptor
           return {
             data: {
               ...base,
               state,
               idempotency_key: data.idempotency_key,
-              identity_xonly_pubkey: identityKey
+              identity_xonly_pubkey: identityKey,
+              identity_descriptor: identityDescriptor
             }
           }
         }
@@ -650,7 +720,8 @@ test('browser receive allocation retries the journaled mapping without reallocat
               ...binding,
               state: 'ready',
               idempotency_key: data.idempotency_key,
-              identity_xonly_pubkey: data.identity_xonly_pubkey
+              identity_xonly_pubkey: data.identity_xonly_pubkey,
+              identity_descriptor: data.identity_descriptor
             }
           }
         },

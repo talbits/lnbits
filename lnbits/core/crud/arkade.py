@@ -436,6 +436,7 @@ async def complete_arkade_binding(
     expires_at: datetime,
     server_utc_now: datetime,
     identity_xonly_pubkey: str,
+    identity_descriptor: str,
     acknowledged_at: datetime,
     conn: Connection | None = None,
 ) -> bool:
@@ -447,6 +448,7 @@ async def complete_arkade_binding(
         UPDATE arkade_account_bindings SET
             state = 'ready',
             identity_xonly_pubkey = :identity_xonly_pubkey,
+            identity_descriptor = :identity_descriptor,
             backup_acknowledged_at = {
                 database.timestamp_placeholder('acknowledged_at')
             },
@@ -470,6 +472,7 @@ async def complete_arkade_binding(
             "expires_at": expires_at,
             "server_utc_now": server_utc_now,
             "identity_xonly_pubkey": identity_xonly_pubkey,
+            "identity_descriptor": identity_descriptor,
             "acknowledged_at": acknowledged_at,
             "ready_at": now,
             "updated_at": now,

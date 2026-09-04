@@ -1232,3 +1232,15 @@ async def m055_create_arkade_outgoing_tables(db: Connection):
         "CREATE INDEX IF NOT EXISTS idx_arkade_outgoing_intents_wallet_status "
         "ON arkade_outgoing_intents (wallet_id, status)"
     )
+
+
+async def m056_add_arkade_account_descriptor(db: Connection):
+    """Store the enrolled account's watch-only Arkade descriptor."""
+    await db.execute(
+        "ALTER TABLE arkade_account_bindings ADD COLUMN identity_descriptor TEXT"
+    )
+    await db.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS "
+        "idx_arkade_account_bindings_identity_descriptor "
+        "ON arkade_account_bindings (identity_descriptor)"
+    )

@@ -26,10 +26,36 @@ from lnbits.core.services.arkade import (
     complete_enrollment,
     require_arkade_payments_unavailable,
     require_arkade_ready,
+    validate_arkade_identity_descriptor,
     verify_enrollment_proof,
 )
 from lnbits.db import SQLITE, Connection
 from lnbits.settings import settings
+
+TESTNET_IDENTITY_DESCRIPTOR = (
+    "tr([73c5da0a/86'/1'/0']"
+    "tpubDDfvzhdVV4unsoKt5aE6dcsNsfeWbTgmLZPi8LQDYU2xixrYemMfWJ3BaVne"
+    "H3u7DBQePdTwhpybaKRU95pi6PMUtLPBJLVQRpzEnjfjZzX/0/*)"
+)
+TESTNET_IDENTITY_XONLY = (
+    "55355ca83c973f1d97ce0e3843c85d78905af16b4dc531bc488e57212d230116"
+)
+TESTNET_IDENTITY_SECRET = (
+    "dff1c8c2c016a572914b4c5adb8791d62b4768ae9d0a61be8ab94cf5038d7d90"
+)
+TESTNET_PRIVATE_DESCRIPTOR = (
+    "tr([73c5da0a/86'/1'/0']"
+    "tprv8gytrHbFLhE7zLJ6BvZWEDDGJe8aS8VrmFnvqpMv8CEZtUbn2NY5KoRKQNpkc"
+    "L1yniyCBRi7dAPy4kUxHkcSvd9jzLmLMEG96TPwant2jbX/0/*)"
+)
+MAINNET_IDENTITY_DESCRIPTOR = (
+    "tr([73c5da0a/86'/0'/0']"
+    "xpub6BgBgsespWvERF3LHQu6CnqdvfEvtMcQjYrcRzx53QJjSxarj2afYWcLteoGV"
+    "ky7D3UKDP9QyrLprQ3VCECoY49yfdDEHGCtMMj92pReUsQ/0/*)"
+)
+MAINNET_IDENTITY_XONLY = (
+    "cc8a4bc64d897bddc5fbc2f670f7a8ba0b386779106cf1223c6fc5d7cd6fc115"
+)
 
 
 def test_enrollment_proof_uses_the_canonical_digest():
@@ -45,6 +71,7 @@ def test_enrollment_proof_uses_the_canonical_digest():
         server_url="http://localhost:7070",
         server_pubkey="22" * 32,
         identity_xonly_pubkey=identity_key,
+        identity_descriptor=TESTNET_IDENTITY_DESCRIPTOR,
     )
     signature = private_key.sign_schnorr(
         hashlib.sha256(statement.encode("ascii")).digest()
@@ -67,6 +94,42 @@ def test_enrollment_statement_rejects_line_breaks():
             server_url="http://localhost:7070",
             server_pubkey="22" * 32,
             identity_xonly_pubkey="33" * 32,
+            identity_descriptor=TESTNET_IDENTITY_DESCRIPTOR,
+        )
+
+
+def test_identity_descriptor_matches_sdk_vectors_and_network():
+    validate_arkade_identity_descriptor(
+        TESTNET_IDENTITY_DESCRIPTOR, TESTNET_IDENTITY_XONLY, "regtest"
+    )
+    validate_arkade_identity_descriptor(
+        MAINNET_IDENTITY_DESCRIPTOR, MAINNET_IDENTITY_XONLY, "bitcoin"
+    )
+    with pytest.raises(ArkadeEnrollmentError, match="descriptor"):
+        validate_arkade_identity_descriptor(
+            TESTNET_IDENTITY_DESCRIPTOR, TESTNET_IDENTITY_XONLY, "bitcoin"
+        )
+    with pytest.raises(ArkadeEnrollmentError, match="descriptor"):
+        validate_arkade_identity_descriptor(
+            TESTNET_IDENTITY_DESCRIPTOR, "00" * 32, "regtest"
+        )
+
+
+@pytest.mark.parametrize(
+    "descriptor",
+    [
+        TESTNET_PRIVATE_DESCRIPTOR,
+        TESTNET_IDENTITY_DESCRIPTOR.replace("/0/*)", "/1/*)"),
+        TESTNET_IDENTITY_DESCRIPTOR.replace("/86'/1'/0'", "/86'/0'/0'"),
+        TESTNET_IDENTITY_DESCRIPTOR.replace("/86'/1'/0'", "/86'/1'/1'"),
+        TESTNET_IDENTITY_DESCRIPTOR.replace("tr(", "wpkh("),
+        TESTNET_IDENTITY_DESCRIPTOR[:-1] + ",{pk(00)})",
+    ],
+)
+def test_identity_descriptor_rejects_non_sdk_shapes(descriptor):
+    with pytest.raises(ArkadeEnrollmentError, match="descriptor"):
+        validate_arkade_identity_descriptor(
+            descriptor, TESTNET_IDENTITY_XONLY, "regtest"
         )
 
 
@@ -170,6 +233,7 @@ async def sqlite_connection():
         )
         await connection.execute("CREATE TABLE accounts (id TEXT PRIMARY KEY)")
         await migrations.m052_create_arkade_account_bindings_table(connection)
+        await migrations.m056_add_arkade_account_descriptor(connection)
         yield connection
     await engine.dispose()
 
@@ -326,6 +390,37 @@ async def test_m052_enforces_unique_enrollment_idempotency_and_identity(
 
 
 @pytest.mark.anyio
+async def test_m056_descriptor_is_nullable_and_unique(sqlite_connection):
+    await sqlite_connection.execute(
+        "INSERT INTO accounts (id) VALUES (:first), (:second)",
+        {"first": "6" * 32, "second": "7" * 32},
+    )
+    for account_id, enrollment_id in (("6" * 32, "8" * 32), ("7" * 32, "9" * 32)):
+        await sqlite_connection.execute(
+            "INSERT INTO arkade_account_bindings "
+            "(account_id, state, enrollment_id, network, server_url, server_pubkey) "
+            "VALUES (:account_id, 'pending', :enrollment_id, 'regtest', "
+            "'http://localhost', :server_pubkey)",
+            {
+                "account_id": account_id,
+                "enrollment_id": enrollment_id,
+                "server_pubkey": "a" * 64,
+            },
+        )
+    await sqlite_connection.execute(
+        "UPDATE arkade_account_bindings SET identity_descriptor = :descriptor "
+        "WHERE account_id = :account_id",
+        {"descriptor": TESTNET_IDENTITY_DESCRIPTOR, "account_id": "6" * 32},
+    )
+    with pytest.raises(IntegrityError):
+        await sqlite_connection.execute(
+            "UPDATE arkade_account_bindings SET identity_descriptor = :descriptor "
+            "WHERE account_id = :account_id",
+            {"descriptor": TESTNET_IDENTITY_DESCRIPTOR, "account_id": "7" * 32},
+        )
+
+
+@pytest.mark.anyio
 async def test_require_authenticated_enrollment_dependency_rejects_missing_token():
     from fastapi import Request
 
@@ -427,8 +522,8 @@ async def test_custodial_payment_guard_is_noop(monkeypatch):
 async def test_complete_binding_reconstructs_statement_and_is_idempotent(monkeypatch):
     import lnbits.core.services.arkade as service
 
-    private_key = PrivateKey.from_int(2)
-    identity = private_key.public_key_xonly.format().hex()
+    private_key = PrivateKey(bytes.fromhex(TESTNET_IDENTITY_SECRET))
+    identity = TESTNET_IDENTITY_XONLY
     binding = _binding_model(
         idempotency_key="aa" * 16,
         challenge_nonce="bb" * 32,
@@ -441,6 +536,7 @@ async def test_complete_binding_reconstructs_statement_and_is_idempotent(monkeyp
         state="ready",
         idempotency_key=binding.idempotency_key,
         identity_xonly_pubkey=identity,
+        identity_descriptor=TESTNET_IDENTITY_DESCRIPTOR,
         backup_acknowledged_at=binding.updated_at,
         ready_at=binding.updated_at,
     )
@@ -462,11 +558,13 @@ async def test_complete_binding_reconstructs_statement_and_is_idempotent(monkeyp
         server_url=binding.server_url,
         server_pubkey=binding.server_pubkey,
         identity_xonly_pubkey=identity,
+        identity_descriptor=TESTNET_IDENTITY_DESCRIPTOR,
     )
     data = ArkadeEnrollmentCompletion(
         enrollment_id=binding.enrollment_id,
         idempotency_key=idempotency_key,
         identity_xonly_pubkey=identity,
+        identity_descriptor=TESTNET_IDENTITY_DESCRIPTOR,
         signature=private_key.sign_schnorr(
             hashlib.sha256(statement.encode("ascii")).digest()
         ).hex(),
@@ -495,6 +593,7 @@ async def test_complete_binding_rejects_expired_challenge_and_mismatch(monkeypat
         enrollment_id=binding.enrollment_id,
         idempotency_key=idempotency_key,
         identity_xonly_pubkey=_server_key(),
+        identity_descriptor=TESTNET_IDENTITY_DESCRIPTOR,
         signature="00" * 64,
     )
     with pytest.raises(ArkadeEnrollmentError, match="expired"):
@@ -546,12 +645,14 @@ async def test_complete_arkade_binding_real_sql_cas_and_expiry(sqlite_connection
         expires_at=expiry,
         server_utc_now=now,
         identity_xonly_pubkey="4" * 64,
+        identity_descriptor=TESTNET_IDENTITY_DESCRIPTOR,
         acknowledged_at=now,
         conn=sqlite_connection,
     )
     ready = await sqlite_connection.fetchone(
         "SELECT state, challenge_nonce, challenge_expires_at, "
-        "identity_xonly_pubkey, backup_acknowledged_at, ready_at "
+        "identity_xonly_pubkey, identity_descriptor, "
+        "backup_acknowledged_at, ready_at "
         "FROM arkade_account_bindings WHERE account_id=:id",
         {"id": "a" * 32},
     )
@@ -559,6 +660,7 @@ async def test_complete_arkade_binding_real_sql_cas_and_expiry(sqlite_connection
     assert ready["challenge_nonce"] is None
     assert ready["challenge_expires_at"] is None
     assert ready["identity_xonly_pubkey"] == "4" * 64
+    assert ready["identity_descriptor"] == TESTNET_IDENTITY_DESCRIPTOR
     assert ready["backup_acknowledged_at"] is not None
     assert ready["ready_at"] is not None
 
@@ -570,6 +672,7 @@ async def test_complete_arkade_binding_real_sql_cas_and_expiry(sqlite_connection
         expires_at=now - timedelta(seconds=1),
         server_utc_now=now,
         identity_xonly_pubkey="5" * 64,
+        identity_descriptor=TESTNET_IDENTITY_DESCRIPTOR,
         acknowledged_at=now,
         conn=sqlite_connection,
     )
@@ -593,6 +696,7 @@ async def test_exact_ready_replay_skips_verification_and_mutation(monkeypatch):
         state="ready",
         idempotency_key="aa" * 16,
         identity_xonly_pubkey=_server_key(),
+        identity_descriptor=TESTNET_IDENTITY_DESCRIPTOR,
     )
     binding.backup_acknowledged_at = binding.updated_at
     binding.ready_at = binding.updated_at
@@ -608,6 +712,7 @@ async def test_exact_ready_replay_skips_verification_and_mutation(monkeypatch):
         enrollment_id=binding.enrollment_id,
         idempotency_key="aa" * 16,
         identity_xonly_pubkey=_server_key(),
+        identity_descriptor=TESTNET_IDENTITY_DESCRIPTOR,
         signature="00" * 64,
     )
     result = await complete_enrollment(Account(id=binding.account_id), data)
