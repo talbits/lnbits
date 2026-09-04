@@ -123,6 +123,19 @@ window._lnbitsApi = {
       data
     })
   },
+  arkadeOutgoingIntent(intentId) {
+    return axios({
+      method: 'GET',
+      url: `/api/v1/arkade/outgoing/${intentId}`
+    })
+  },
+  arkadeOutgoingAuthorize(intentId, data) {
+    return axios({
+      method: 'POST',
+      url: `/api/v1/arkade/outgoing/${intentId}/authorize`,
+      data
+    })
+  },
   login(username, password) {
     return axios({
       method: 'POST',

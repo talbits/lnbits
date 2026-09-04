@@ -1,7 +1,7 @@
 {
   "name": "lnbits",
   "scripts": {
-    "build:arkade-enrollment": "esbuild lnbits/static/js/pages/arkade-enrollment.ts --bundle --minify --legal-comments=none --format=iife --target=es2020 --outfile=lnbits/static/js/pages/arkade-enrollment.js",
+    "build:arkade-enrollment": "esbuild lnbits/static/js/pages/arkade-enrollment.ts --bundle --minify --legal-comments=none --format=iife --target=es2020 --define:ARKADE_ENROLLMENT_TEST=false --outfile=lnbits/static/js/pages/arkade-enrollment.js",
     "sass": "./node_modules/.bin/sass ./lnbits/static/scss/base.scss > ./lnbits/static/css/base.css",
     "vendor_copy": "node -e \"require('./package.json').vendor.forEach((file) => require('fs').copyFileSync(file, './lnbits/static/vendor/'+file.split('/').pop()))\"",
     "vendor_json": "node -e \"require('fs').writeFileSync('./lnbits/static/vendor.json', JSON.stringify(require('./package.json').bundle))\"",

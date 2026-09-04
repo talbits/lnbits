@@ -1,10 +1,13 @@
 import {
+  ArkAddress,
   DefaultVtxo,
   IndexedDBContractRepository,
   IndexedDBWalletRepository,
   MnemonicIdentity,
   Wallet,
-  deriveDescriptorLeafPubKey
+  buildOffchainTx,
+  deriveDescriptorLeafPubKey,
+  selectVirtualCoins
 } from '@arkade-os/sdk'
 import {generateMnemonic, validateMnemonic} from '@scure/bip39'
 import {wordlist} from '@scure/bip39/wordlists/english.js'
@@ -14,6 +17,7 @@ const STORE_NAME = 'vaults'
 const VAULT_VERSION = 1
 const PBKDF2_ITERATIONS = 600_000
 const IDLE_TIMEOUT_MS = 15 * 60 * 1000
+declare const ARKADE_ENROLLMENT_TEST: boolean
 const HEX32 = /^[0-9a-f]{32}$/
 const HEX64 = /^[0-9a-f]{64}$/
 const NETWORK = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/
@@ -55,6 +59,7 @@ let activeBinding: any = null
 let idleTimer: number | undefined
 let allocationWallet: Awaited<ReturnType<typeof Wallet.create>> | null = null
 let allocationWalletKey = ''
+let unlockGeneration = 0
 
 type ReceiveMapping = Readonly<{
   action: 'lnbits-arkade-receive-v1'
@@ -76,8 +81,74 @@ type ReceiveMapping = Readonly<{
   exitControlBlock: string
 }>
 
+type OutgoingChange = Readonly<{
+  index: number
+  address: string
+  script: string
+  child_xonly_pubkey: string
+  amount_sat: number
+  exit_tapleaf: string
+  exit_control_block: string
+}>
+
+type OutgoingPrepared = Readonly<{
+  intentId: string
+  accountId: string
+  walletId: string
+  amountSat: number
+  destination: string
+  destinationScript: string
+  inputs: ReadonlyArray<{
+    txid: string
+    vout: number
+    amount_sat: number
+    script: string
+  }>
+  change: OutgoingChange | null
+  previewCommitment: string
+}>
+
+type ArkadeWallet = Awaited<ReturnType<typeof Wallet.create>>
+type SpendableVtxo = Awaited<
+  ReturnType<ArkadeWallet['getSpendableVtxos']>
+>[number]
+
+type OutgoingPlan = {
+  publicPlan: OutgoingPrepared
+  wallet: ArkadeWallet
+  inputs: SpendableVtxo[]
+  outputs: {script: Uint8Array; amount: bigint}[]
+  generation: number
+  accountId: string
+  intentId: string
+  walletId: string
+  amountMsat: number
+  expiresAt: number
+  destination: string
+  destinationScript: string
+  change: OutgoingChange | null
+  previewCommitment: string
+  bindingFingerprint: string
+}
+
+const outgoingPlans = new WeakMap<object, OutgoingPlan>()
+
+class ArkadeOutgoingReconciliationError extends Error {
+  readonly reconciliationRequired = true
+  readonly status: 'authorization_unknown' | 'submitted'
+
+  constructor(intentId: string, status: 'authorization_unknown' | 'submitted') {
+    super(`Arkade outgoing ${intentId} requires reconciliation`)
+    this.name = 'ArkadeOutgoingReconciliationError'
+    this.status = status
+  }
+}
+
 const bytesToHex = (bytes: Uint8Array) =>
   Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('')
+
+const fromHex = (value: string) =>
+  Uint8Array.from(value.match(/../g) || [], pair => parseInt(pair, 16))
 
 const randomHex = (bytes: number) =>
   bytesToHex(crypto.getRandomValues(new Uint8Array(bytes)))
@@ -438,6 +509,13 @@ const getAllocationWallet = async (accountId: string, binding: any) => {
   return allocationWallet
 }
 
+const outgoingWallet = async (accountId: string, binding: any) => {
+  const testWallet = ARKADE_ENROLLMENT_TEST
+    ? (window as any).__ARKADE_ENROLLMENT_TEST__?.wallet
+    : undefined
+  return testWallet || getAllocationWallet(accountId, binding)
+}
+
 const requestMatchesMapping = (request: any, mapping: ReceiveMapping) =>
   !!request &&
   request.account_id === mapping.accountId &&
@@ -605,6 +683,369 @@ const allocateReceive = async (
   return acknowledgeReceive(accountId, mapping)
 }
 
+const outgoingIntentSnapshot = (
+  intent: any,
+  intentId: string,
+  walletId: string,
+  accountId: string,
+  binding: any
+) => {
+  if (
+    !intent ||
+    intent.intent_id !== intentId ||
+    intent.account_id !== accountId ||
+    intent.wallet_id !== walletId ||
+    intent.network !== binding.network ||
+    intent.server_url !== binding.server_url ||
+    intent.server_pubkey !== binding.server_pubkey ||
+    !Number.isSafeInteger(intent.amount_msat) ||
+    intent.amount_msat <= 0 ||
+    intent.amount_msat % 1000 !== 0 ||
+    intent.max_fee_msat !== 0 ||
+    typeof intent.destination !== 'string' ||
+    !intent.destination
+  )
+    throw new Error('Arkade outgoing intent changed')
+  const expiresAt = expirySeconds(intent.expires_at)
+  const status = intent.status
+  if (status !== 'reserved' && status !== 'submitted')
+    throw new Error('Arkade outgoing intent is not submit-ready')
+  if (status === 'reserved' && expiresAt <= Math.floor(Date.now() / 1000))
+    throw new Error('Arkade outgoing intent expired')
+  let decoded: ArkAddress
+  try {
+    decoded = ArkAddress.decode(intent.destination)
+  } catch {
+    throw new Error('Arkade outgoing destination is invalid')
+  }
+  if (
+    decoded.hrp !== (binding.network === 'bitcoin' ? 'ark' : 'tark') ||
+    bytesToHex(decoded.serverPubKey) !== binding.server_pubkey.toLowerCase()
+  )
+    throw new Error('Arkade outgoing destination is not on the bound server')
+  const destinationScript = bytesToHex(decoded.pkScript)
+  if (
+    intent.destination_script &&
+    intent.destination_script.toLowerCase() !== destinationScript
+  )
+    throw new Error('Arkade outgoing destination changed')
+  return {
+    intent,
+    expiresAt,
+    amountSat: intent.amount_msat / 1000,
+    destinationScript,
+    status
+  }
+}
+
+const outgoingBindingFingerprint = (binding: any) =>
+  JSON.stringify([
+    binding?.account_id,
+    binding?.network,
+    binding?.server_url,
+    binding?.server_pubkey,
+    binding?.identity_xonly_pubkey,
+    binding?.identity_descriptor
+  ])
+
+const outgoingInputSummary = (input: SpendableVtxo) => ({
+  txid: input.txid,
+  vout: input.vout,
+  amount_sat: input.value,
+  script: input.script
+})
+
+const outgoingChangeCommitment = (
+  wallet: ArkadeWallet,
+  address: {address: string; signingDescriptor: string; contract: any}
+): OutgoingChange => {
+  if (
+    address.contract?.type !== 'default' ||
+    address.contract.address !== address.address ||
+    address.contract.metadata?.signingDescriptor !== address.signingDescriptor
+  )
+    throw new Error('SDK allocator returned mismatched change contract')
+  const indexMatch = address.signingDescriptor.match(/\/0\/(\d+)\)?$/)
+  if (!indexMatch) throw new Error('unparseable change signing descriptor')
+  const index = Number(indexMatch[1])
+  if (!Number.isSafeInteger(index)) throw new Error('invalid change index')
+  const childPubkey = deriveDescriptorLeafPubKey(address.signingDescriptor)
+  const script = address.contract.script
+  if (!script) throw new Error('SDK allocator returned no change script')
+  const tapscript = new DefaultVtxo.Script({
+    ...wallet.offchainTapscript.options,
+    pubKey: childPubkey
+  })
+  if (bytesToHex(tapscript.pkScript) !== script.toLowerCase())
+    throw new Error('SDK allocator returned unsupported change contract')
+  const [controlBlock, exitTapleaf] = tapscript.exit()
+  if (controlBlock.merklePath.length !== 1)
+    throw new Error('SDK allocator returned unsupported change exit path')
+  return {
+    index,
+    address: address.address,
+    script: script.toLowerCase(),
+    child_xonly_pubkey: bytesToHex(childPubkey),
+    amount_sat: 0,
+    exit_tapleaf: bytesToHex(exitTapleaf),
+    exit_control_block: bytesToHex(
+      new Uint8Array([
+        controlBlock.version,
+        ...controlBlock.internalKey,
+        ...controlBlock.merklePath[0]
+      ])
+    )
+  }
+}
+
+const outgoingPreview = (plan: OutgoingPlan) => {
+  const inputs = plan.inputs.map(input => ({
+    ...input,
+    tapLeafScript: input.forfeitTapLeafScript
+  }))
+  return buildOffchainTx(inputs, plan.outputs, plan.wallet.serverUnrollScript)
+}
+
+const outgoingCommitment = (plan: OutgoingPlan) => {
+  const preview = outgoingPreview(plan)
+  return JSON.stringify({
+    arkTx: bytesToHex(preview.arkTx.toBytes()),
+    checkpoints: preview.checkpoints.map(tx => bytesToHex(tx.toBytes()))
+  })
+}
+
+const prepareOutgoing = async (
+  intentId: string,
+  walletId: string
+): Promise<OutgoingPrepared> => {
+  const accountId = window.g.user.id
+  if (!identity || !activeBinding || activeBinding.state !== 'ready')
+    throw new Error('wallet is locked')
+  const intent = (await LNbits.api.arkadeOutgoingIntent(intentId)).data
+  const snapshot = outgoingIntentSnapshot(
+    intent,
+    intentId,
+    walletId,
+    accountId,
+    activeBinding
+  )
+  if (snapshot.status !== 'reserved')
+    throw new Error('Arkade outgoing intent is already submitted')
+  const wallet = await outgoingWallet(accountId, activeBinding)
+  const spendable = await wallet.getSpendableVtxos()
+  const candidates = spendable.filter(input => input.value > 0)
+  if (candidates.some(input => !Number.isSafeInteger(input.value)))
+    throw new Error('Arkade outgoing balance is invalid')
+  const candidateTotal = candidates.reduce(
+    (total, input) => total + input.value,
+    0
+  )
+  if (!Number.isSafeInteger(candidateTotal))
+    throw new Error('Arkade outgoing balance is too large')
+  const selected = selectVirtualCoins(candidates, snapshot.amountSat)
+  const inputs = [...selected.inputs]
+  if (!inputs.length || inputs.length > 100)
+    throw new Error('Arkade outgoing input count is invalid')
+  const changeAmount = Number(selected.changeAmount)
+  if (!Number.isSafeInteger(changeAmount) || changeAmount < 0)
+    throw new Error('Arkade outgoing change is invalid')
+  const info = await wallet.arkProvider.getInfo()
+  const dust = BigInt(info.dust)
+  if (changeAmount > 0 && BigInt(changeAmount) < dust)
+    throw new Error('Arkade outgoing change is below dust')
+  let change: OutgoingChange | null = null
+  if (changeAmount > 0) {
+    const [newAddress] = await wallet.getNewAddresses({forceNew: true})
+    if (!newAddress) throw new Error('SDK allocator returned no change address')
+    change = outgoingChangeCommitment(wallet, newAddress)
+    change = Object.freeze({...change, amount_sat: changeAmount})
+  }
+  const outputs = [
+    {
+      script: fromHex(snapshot.destinationScript),
+      amount: BigInt(snapshot.amountSat)
+    },
+    ...(change
+      ? [{script: fromHex(change.script), amount: BigInt(change.amount_sat)}]
+      : [])
+  ]
+  const sum = inputs.reduce((total, input) => total + BigInt(input.value), 0n)
+  if (sum !== BigInt(snapshot.amountSat) + BigInt(changeAmount))
+    throw new Error('Arkade outgoing amount changed')
+  const plan: OutgoingPlan = {
+    publicPlan: null as unknown as OutgoingPrepared,
+    wallet,
+    inputs,
+    outputs,
+    generation: unlockGeneration,
+    accountId,
+    intentId,
+    walletId,
+    amountMsat: intent.amount_msat,
+    expiresAt: snapshot.expiresAt,
+    destination: intent.destination,
+    destinationScript: snapshot.destinationScript,
+    change,
+    previewCommitment: '',
+    bindingFingerprint: outgoingBindingFingerprint(activeBinding)
+  }
+  const publicInputs = Object.freeze(
+    inputs.map(input => Object.freeze(outgoingInputSummary(input)))
+  )
+  const publicChange = change ? Object.freeze({...change}) : null
+  plan.previewCommitment = outgoingCommitment(plan)
+  const publicPlan: OutgoingPrepared = Object.freeze({
+    intentId,
+    accountId,
+    walletId,
+    amountSat: snapshot.amountSat,
+    destination: intent.destination,
+    destinationScript: snapshot.destinationScript,
+    inputs: publicInputs,
+    change: publicChange,
+    previewCommitment: plan.previewCommitment
+  })
+  plan.publicPlan = publicPlan
+  outgoingPlans.set(publicPlan, plan)
+  return publicPlan
+}
+
+const sameOutgoingInputs = (expected: OutgoingPlan['inputs'], actual: any[]) =>
+  expected.length === actual.length &&
+  expected.every(input =>
+    actual.some(
+      item =>
+        item.txid === input.txid &&
+        item.vout === input.vout &&
+        item.amount_sat === input.value
+    )
+  )
+
+const sameOutgoingPlan = (plan: OutgoingPlan, response: any) =>
+  response?.intent_id === plan.intentId &&
+  response.account_id === plan.accountId &&
+  response.wallet_id === plan.walletId &&
+  response.amount_msat === plan.amountMsat &&
+  response.max_fee_msat === 0 &&
+  response.destination === plan.destination &&
+  response.destination_kind === 'arkade_address' &&
+  response.network === activeBinding.network &&
+  response.server_url === activeBinding.server_url &&
+  response.server_pubkey === activeBinding.server_pubkey &&
+  response.destination_script === plan.destinationScript &&
+  expirySeconds(response.expires_at) === plan.expiresAt &&
+  response.change_index === (plan.change?.index ?? null) &&
+  response.change_script === (plan.change?.script ?? null) &&
+  response.change_amount_sat === (plan.change?.amount_sat ?? null) &&
+  sameOutgoingInputs(plan.inputs, response.inputs || [])
+
+const submitOutgoing = async (
+  prepared: OutgoingPrepared,
+  approval: {approved: true}
+) => {
+  if (!approval || approval.approved !== true)
+    throw new Error('Arkade outgoing approval required')
+  const plan = outgoingPlans.get(prepared)
+  if (!plan) throw new Error('Arkade outgoing preparation is invalid')
+  if (
+    !identity ||
+    plan.generation !== unlockGeneration ||
+    plan.accountId !== window.g.user.id ||
+    !activeBinding ||
+    activeBinding.state !== 'ready' ||
+    plan.bindingFingerprint !== outgoingBindingFingerprint(activeBinding)
+  )
+    throw new Error('Arkade outgoing preparation is locked')
+  const snapshot = outgoingIntentSnapshot(
+    (await LNbits.api.arkadeOutgoingIntent(plan.intentId)).data,
+    plan.intentId,
+    plan.walletId,
+    plan.accountId,
+    activeBinding
+  )
+  if (
+    snapshot.amountSat * 1000 !== plan.amountMsat ||
+    snapshot.destinationScript !== plan.destinationScript ||
+    snapshot.intent.destination !== plan.destination ||
+    snapshot.expiresAt !== plan.expiresAt ||
+    (snapshot.status === 'submitted' &&
+      !sameOutgoingPlan(plan, snapshot.intent))
+  )
+    throw new Error('Arkade outgoing intent changed')
+  if (outgoingCommitment(plan) !== plan.previewCommitment)
+    throw new Error('Arkade outgoing transaction changed')
+  const request = {
+    inputs: plan.inputs.map(input => ({
+      txid: input.txid,
+      vout: input.vout,
+      amount_sat: input.value
+    })),
+    destination_script: plan.destinationScript,
+    change: plan.change
+  }
+  let authorization: any
+  try {
+    authorization = (
+      await LNbits.api.arkadeOutgoingAuthorize(plan.intentId, request)
+    ).data
+  } catch {
+    let afterFailure: any
+    try {
+      afterFailure = (await LNbits.api.arkadeOutgoingIntent(plan.intentId)).data
+    } catch {
+      throw new ArkadeOutgoingReconciliationError(
+        plan.intentId,
+        'authorization_unknown'
+      )
+    }
+    let afterSnapshot
+    try {
+      afterSnapshot = outgoingIntentSnapshot(
+        afterFailure,
+        plan.intentId,
+        plan.walletId,
+        plan.accountId,
+        activeBinding
+      )
+    } catch {
+      throw new ArkadeOutgoingReconciliationError(
+        plan.intentId,
+        'authorization_unknown'
+      )
+    }
+    if (afterSnapshot.status !== 'submitted')
+      throw new Error('Arkade outgoing authorization failed')
+    if (!sameOutgoingPlan(plan, afterFailure))
+      throw new ArkadeOutgoingReconciliationError(
+        plan.intentId,
+        'authorization_unknown'
+      )
+    authorization = afterFailure
+  }
+  if (
+    authorization.status !== 'submitted' ||
+    !sameOutgoingPlan(plan, authorization)
+  )
+    throw new Error('Arkade outgoing authorization changed')
+  if (outgoingCommitment(plan) !== plan.previewCommitment)
+    throw new Error('Arkade outgoing transaction changed')
+  try {
+    const result = await plan.wallet.buildAndSubmitOffchainTx(
+      plan.inputs,
+      plan.outputs,
+      plan.wallet.serverUnrollScript
+    )
+    return {
+      status: 'submitted' as const,
+      reconciliationRequired: true as const,
+      intentId: plan.intentId,
+      arkTxid: result.arkTxid
+    }
+  } catch {
+    throw new ArkadeOutgoingReconciliationError(plan.intentId, 'submitted')
+  }
+}
+
 const probe = async () => {
   const accountId = window.g.user.id
   let idempotencyKey: string
@@ -702,6 +1143,7 @@ const unlock = async (password: string) => {
   )
     throw new Error('wallet mismatch')
   identity = next
+  unlockGeneration += 1
   window.g.arkadeEnrollmentState =
     activeBinding?.state === 'pending' ? 'pending_unlocked' : 'ready_unlocked'
   resetIdleTimer()
@@ -709,6 +1151,7 @@ const unlock = async (password: string) => {
 }
 
 const lock = () => {
+  unlockGeneration += 1
   identity = null
   const wallet = allocationWallet
   allocationWallet = null
@@ -776,6 +1219,7 @@ window.ArkadeEnrollment = {
         key
       )
       identity = next
+      unlockGeneration += 1
       activeBinding = challenge
       window.g.arkadeEnrollmentState = 'ready_unlocked'
       resetIdleTimer()
@@ -798,6 +1242,7 @@ window.ArkadeEnrollment = {
       key
     )
     identity = next
+    unlockGeneration += 1
     activeBinding = challenge
     await finish()
     resetIdleTimer()
@@ -811,8 +1256,26 @@ window.ArkadeEnrollment = {
   async allocateReceive(walletId: string, payment: any) {
     return allocateReceive(walletId, payment)
   },
+  async prepareOutgoing(intentId: string, walletId: string) {
+    return prepareOutgoing(intentId, walletId)
+  },
+  async submitOutgoing(prepared: OutgoingPrepared, approval: {approved: true}) {
+    return submitOutgoing(prepared, approval)
+  },
   async binding() {
     return activeBinding
+  }
+}
+
+if (ARKADE_ENROLLMENT_TEST && (window as any).__ARKADE_ENROLLMENT_TEST__) {
+  ;(window.ArkadeEnrollment as any).__setTestReady = (
+    binding: any,
+    wallet: ArkadeWallet
+  ) => {
+    activeBinding = binding
+    identity = {} as MnemonicIdentity
+    ;(window as any).__ARKADE_ENROLLMENT_TEST__.wallet = wallet
+    unlockGeneration += 1
   }
 }
 
