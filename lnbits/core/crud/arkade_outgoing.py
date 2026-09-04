@@ -63,6 +63,31 @@ async def get_arkade_outgoing_intent_inputs(
     )
 
 
+async def get_arkade_submitted_outgoing_intents(
+    limit: int = 100,
+    conn: Connection | None = None,
+    after_intent_id: str | None = None,
+) -> list[ArkadeOutgoingIntent]:
+    if not 1 <= limit <= 100:
+        raise ValueError("ARKADE_OUTGOING_BATCH_INVALID")
+    if after_intent_id is not None and not re.fullmatch(
+        r"[0-9a-f]{32}", after_intent_id
+    ):
+        raise ValueError("ARKADE_OUTGOING_CURSOR_INVALID")
+    where = "status = 'submitted'"
+    values: dict[str, str | int] = {"limit": limit}
+    if after_intent_id is not None:
+        where += " AND intent_id > :after_intent_id"
+        values["after_intent_id"] = after_intent_id
+    return await (conn or db).fetchall(
+        "SELECT * FROM arkade_outgoing_intents "  # noqa: S608
+        f"WHERE {where} ORDER BY intent_id "
+        "LIMIT :limit",
+        values,
+        ArkadeOutgoingIntent,
+    )
+
+
 def _same_immutable_fields(
     current: ArkadeOutgoingIntent, requested: ArkadeOutgoingIntent
 ) -> bool:
@@ -366,7 +391,45 @@ async def settle_arkade_outgoing_intent(
     )
 
 
-async def dispute_arkade_outgoing_intent(intent_id: str, conn: Connection) -> bool:
-    return await _transition_arkade_outgoing_intent(
-        intent_id, "submitted", "disputed", conn=conn
+async def settle_arkade_outgoing_intent_verified(
+    intent_id: str, arkade_txid: str, conn: Connection
+) -> bool:
+    database = _require_active_transaction(conn)
+    if not re.fullmatch(r"[0-9a-f]{64}", arkade_txid):
+        raise ValueError("ARKADE_TRANSACTION_ID_INVALID")
+    result = await database.execute(
+        f"""
+        UPDATE arkade_outgoing_intents
+        SET status = 'settled', arkade_txid = :arkade_txid,
+            actual_fee_msat = 0,
+            settled_at = {database.timestamp_placeholder('settled_at')},
+            updated_at = {database.timestamp_placeholder('updated_at')}
+        WHERE intent_id = :intent_id AND status = 'submitted'
+        """,  # noqa: S608
+        {
+            "intent_id": intent_id,
+            "arkade_txid": arkade_txid,
+            "settled_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(timezone.utc),
+        },
     )
+    return bool(result.rowcount)
+
+
+async def dispute_arkade_outgoing_intent(intent_id: str, conn: Connection) -> bool:
+    database = _require_active_transaction(conn)
+    result = await database.execute(
+        f"""
+        UPDATE arkade_outgoing_intents
+        SET status = 'disputed', arkade_txid = NULL, actual_fee_msat = NULL,
+            disputed_at = {database.timestamp_placeholder('disputed_at')},
+            updated_at = {database.timestamp_placeholder('updated_at')}
+        WHERE intent_id = :intent_id AND status = 'submitted'
+        """,  # noqa: S608
+        {
+            "intent_id": intent_id,
+            "disputed_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(timezone.utc),
+        },
+    )
+    return bool(result.rowcount)

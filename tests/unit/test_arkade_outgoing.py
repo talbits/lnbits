@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import cast
@@ -25,10 +26,12 @@ from lnbits.core.crud.arkade_outgoing import (
 from lnbits.core.crud.payments import get_payment_by_native_id
 from lnbits.core.models.arkade import (
     ArkadeOutgoingChangeCommitment,
+    ArkadeOutgoingEvidenceResult,
     ArkadeOutgoingIntent,
     ArkadeOutgoingIntentInput,
     ArkadeOutgoingSelectedInput,
 )
+from lnbits.core.models.payments import PaymentState
 from lnbits.core.services import arkade
 from lnbits.db import SQLITE, Connection
 from lnbits.settings import settings
@@ -657,6 +660,9 @@ async def test_dispute_and_release_are_forward_only(connection):
         with pytest.raises(ValueError, match="INVALID_TRANSITION"):
             await release_arkade_outgoing_intent(INTENT_ID, connection)
         assert await dispute_arkade_outgoing_intent(INTENT_ID, connection)
+    disputed = await get_arkade_outgoing_intent(INTENT_ID, conn=connection)
+    assert disputed and disputed.arkade_txid is None
+    assert disputed.actual_fee_msat is None
 
 
 @pytest.mark.anyio
@@ -764,6 +770,119 @@ async def test_authorize_exact_inputs_and_submitted_replay(
         change=change,
     )
     assert replay == result
+
+
+async def _submitted_intent(connection):
+    await _credit(connection, WALLET_ID, 20_000)
+    await arkade.reserve_arkade_outgoing_intent(
+        ACCOUNT_ID,
+        _intent(),
+        conn=connection,
+    )
+    claim = ArkadeOutgoingIntentInput(
+        intent_id=INTENT_ID, txid="97" * 32, vout=0, amount_sat=10
+    )
+    async with connection.transaction():
+        await authorize_arkade_outgoing_intent(
+            [claim],
+            connection,
+            destination_script=DESTINATION_SCRIPT,
+        )
+    return claim
+
+
+@pytest.mark.anyio
+async def test_reconcile_outgoing_settles_intent_and_payment(connection, monkeypatch):
+    monkeypatch.setattr(
+        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
+    )
+    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", _backing)
+    claim = await _submitted_intent(connection)
+    evidence = ArkadeOutgoingEvidenceResult(status="verified", arkade_txid="cc" * 32)
+    monkeypatch.setattr(
+        arkade, "verify_arkade_outgoing_evidence", AsyncMock(return_value=evidence)
+    )
+
+    @asynccontextmanager
+    async def use_connection():
+        yield connection
+
+    monkeypatch.setattr(arkade.db, "connect", use_connection)
+    result = await arkade.reconcile_arkade_outgoing_intent(INTENT_ID, ACCOUNT_ID)
+
+    assert result == evidence
+    settled = await get_arkade_outgoing_intent(INTENT_ID, conn=connection)
+    payment = await get_payment_by_native_id(INTENT_ID, conn=connection)
+    assert settled and settled.status == "settled"
+    assert settled.arkade_txid == "cc" * 32
+    assert settled.actual_fee_msat == 0
+    assert payment and payment.status == PaymentState.SUCCESS.value
+    assert payment.fee == 0
+    assert claim.txid == "97" * 32
+
+
+@pytest.mark.anyio
+async def test_reconcile_outgoing_rolls_back_when_payment_cas_fails(
+    connection, monkeypatch
+):
+    monkeypatch.setattr(
+        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
+    )
+    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", _backing)
+    await _submitted_intent(connection)
+    evidence = ArkadeOutgoingEvidenceResult(status="verified", arkade_txid="cc" * 32)
+    monkeypatch.setattr(
+        arkade, "verify_arkade_outgoing_evidence", AsyncMock(return_value=evidence)
+    )
+    monkeypatch.setattr(
+        arkade, "settle_arkade_outgoing_payment", AsyncMock(return_value=False)
+    )
+
+    @asynccontextmanager
+    async def use_connection():
+        yield connection
+
+    monkeypatch.setattr(arkade.db, "connect", use_connection)
+    with pytest.raises(arkade.ArkadeReceiveError, match="CORRUPT"):
+        await arkade.reconcile_arkade_outgoing_intent(INTENT_ID, ACCOUNT_ID)
+
+    intent = await get_arkade_outgoing_intent(INTENT_ID, conn=connection)
+    payment = await get_payment_by_native_id(INTENT_ID, conn=connection)
+    assert intent and intent.status == "submitted"
+    assert intent.arkade_txid is None
+    assert intent.actual_fee_msat is None
+    assert payment and payment.status == PaymentState.PENDING.value
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("status", ["pending", "contradictory"])
+async def test_reconcile_outgoing_keeps_pending_or_disputes(
+    connection, monkeypatch, status
+):
+    monkeypatch.setattr(
+        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
+    )
+    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", _backing)
+    await _submitted_intent(connection)
+    evidence = ArkadeOutgoingEvidenceResult(status=status, code="test")
+    monkeypatch.setattr(
+        arkade, "verify_arkade_outgoing_evidence", AsyncMock(return_value=evidence)
+    )
+
+    @asynccontextmanager
+    async def use_connection():
+        yield connection
+
+    monkeypatch.setattr(arkade.db, "connect", use_connection)
+    result = await arkade.reconcile_arkade_outgoing_intent(INTENT_ID, ACCOUNT_ID)
+
+    assert result == evidence
+    intent = await get_arkade_outgoing_intent(INTENT_ID, conn=connection)
+    payment = await get_payment_by_native_id(INTENT_ID, conn=connection)
+    assert intent and intent.status == (
+        "disputed" if status == "contradictory" else "submitted"
+    )
+    assert payment and payment.status == PaymentState.PENDING.value
 
 
 @pytest.mark.anyio

@@ -38,14 +38,17 @@ from lnbits.core.crud.arkade import (
 from lnbits.core.crud.arkade_outgoing import (
     authorize_arkade_outgoing_intent,
     create_arkade_outgoing_intent,
+    dispute_arkade_outgoing_intent,
     get_arkade_outgoing_intent,
     get_arkade_outgoing_intent_inputs,
     release_arkade_outgoing_intent,
+    settle_arkade_outgoing_intent_verified,
 )
 from lnbits.core.crud.payments import (
     compare_and_set_payment_success,
     create_payment,
     get_payment_by_native_id,
+    settle_arkade_outgoing_payment,
     update_payment,
 )
 from lnbits.core.crud.wallets import get_wallet
@@ -1893,6 +1896,114 @@ async def verify_arkade_outgoing_evidence(
         change_script=change_script,
         change_amount_sat=change_amount_sat,
     )
+
+
+def _same_outgoing_claims(
+    left: list[ArkadeOutgoingIntentInput], right: list[ArkadeOutgoingIntentInput]
+) -> bool:
+    return sorted((item.txid, item.vout, item.amount_sat) for item in left) == sorted(
+        (item.txid, item.vout, item.amount_sat) for item in right
+    )
+
+
+def _same_outgoing_reconciliation_fields(
+    left: ArkadeOutgoingIntent, right: ArkadeOutgoingIntent
+) -> bool:
+    return all(
+        getattr(left, field) == getattr(right, field)
+        for field in (
+            "account_id",
+            "wallet_id",
+            "amount_msat",
+            "max_fee_msat",
+            "destination",
+            "destination_kind",
+            "destination_script",
+            "change_index",
+            "change_script",
+            "change_amount_sat",
+        )
+    )
+
+
+async def reconcile_arkade_outgoing_intent(  # noqa: C901
+    intent_id: str, account_id: str
+) -> ArkadeOutgoingEvidenceResult | None:
+    """Reconcile one submitted outgoing intent from public Arkade evidence."""
+    intent = await get_arkade_outgoing_intent(intent_id)
+    if not intent or intent.account_id != account_id or intent.status != "submitted":
+        return None
+    claims = await get_arkade_outgoing_intent_inputs(intent_id)
+    if not claims or not intent.destination_script:
+        raise ArkadeReceiveError("ARKADE_OUTGOING_CORRUPT")
+    evidence = await verify_arkade_outgoing_evidence(
+        account_id,
+        claims,
+        intent.destination_script,
+        intent.amount_msat,
+        intent.change_script,
+        intent.change_amount_sat,
+    )
+    if evidence.status == "pending":
+        return evidence
+
+    async with db.connect() as database:
+        async with database.transaction():
+            await database.execute(
+                "UPDATE arkade_account_bindings SET account_id = account_id "
+                "WHERE account_id = :account_id AND state = 'ready'",
+                {"account_id": account_id},
+            )
+            current_binding = await get_arkade_binding(account_id, conn=database)
+            if not current_binding or current_binding.state != "ready":
+                raise ArkadeReceiveError("ARKADE_OUTGOING_CORRUPT")
+            current = await get_arkade_outgoing_intent(intent_id, conn=database)
+            if not current or current.account_id != account_id:
+                raise ArkadeReceiveError("ARKADE_OUTGOING_CORRUPT")
+            current_claims = await get_arkade_outgoing_intent_inputs(
+                intent_id, conn=database
+            )
+            payment = await get_payment_by_native_id(intent_id, conn=database)
+            if current.status == "settled":
+                if not payment or payment.status != PaymentState.SUCCESS.value:
+                    raise ArkadeReceiveError("ARKADE_OUTGOING_CORRUPT")
+                return evidence
+            if current.status == "disputed":
+                return evidence
+            if current.status != "submitted":
+                return None
+            if (
+                not payment
+                or not _outgoing_payment_matches(payment, current)
+                or payment.status != PaymentState.PENDING.value
+                or not _same_outgoing_reconciliation_fields(intent, current)
+                or not _same_outgoing_claims(claims, current_claims)
+            ):
+                raise ArkadeReceiveError("ARKADE_OUTGOING_CORRUPT")
+            if evidence.status == "contradictory":
+                disputed = await dispute_arkade_outgoing_intent(
+                    intent_id, conn=database
+                )
+                if not disputed:
+                    raise ArkadeReceiveError("ARKADE_OUTGOING_CORRUPT")
+                return evidence
+            if not evidence.arkade_txid:
+                raise ArkadeReceiveError("ARKADE_OUTGOING_CORRUPT")
+            settled = await settle_arkade_outgoing_intent_verified(
+                intent_id, evidence.arkade_txid, conn=database
+            )
+            if not settled:
+                raise ArkadeReceiveError("ARKADE_OUTGOING_CORRUPT")
+            paid = await settle_arkade_outgoing_payment(
+                intent_id,
+                wallet_id=current.wallet_id,
+                amount_msat=current.amount_msat,
+                arkade_address=current.destination,
+                conn=database,
+            )
+            if not paid:
+                raise ArkadeReceiveError("ARKADE_OUTGOING_CORRUPT")
+    return evidence
 
 
 async def _mark_receive_reconciliation_required(

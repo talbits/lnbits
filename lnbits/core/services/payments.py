@@ -11,6 +11,7 @@ from loguru import logger
 from lnbits.core.crud.arkade import (
     get_arkade_ready_account_ids,
 )
+from lnbits.core.crud.arkade_outgoing import get_arkade_submitted_outgoing_intents
 from lnbits.core.crud.payments import (
     compare_and_set_arkade_payment_failed,
     get_arkade_pending_payments,
@@ -60,6 +61,7 @@ from .arkade import (
     ArkadeReceiveError,
     create_arkade_receive_request_for_account,
     fetch_arkade_indexer_vtxos,
+    reconcile_arkade_outgoing_intent,
     reconcile_arkade_receive,
     require_arkade_payments_unavailable,
 )
@@ -69,6 +71,7 @@ from .notifications import send_payment_notification_in_background
 
 payment_lock = asyncio.Lock()
 wallets_payments_lock: dict[str, asyncio.Lock] = {}
+arkade_outgoing_cursor: str | None = None
 
 
 async def pay_invoice(
@@ -550,7 +553,7 @@ async def update_pending_payment(
     return payment
 
 
-async def check_pending_payments():
+async def check_pending_payments():  # noqa: C901
     """
     check_pending_payments is called during startup to check for pending payments with
     the backend and also to delete expired invoices. Incoming payments will be
@@ -563,6 +566,32 @@ async def check_pending_payments():
                 for payment in await get_arkade_pending_payments(conn=conn):
                     if payment.is_expired:
                         await compare_and_set_arkade_payment_failed(payment, conn=conn)
+        global arkade_outgoing_cursor
+        submitted_intents = await get_arkade_submitted_outgoing_intents(
+            after_intent_id=arkade_outgoing_cursor
+        )
+        if not submitted_intents and arkade_outgoing_cursor is not None:
+            arkade_outgoing_cursor = None
+            submitted_intents = await get_arkade_submitted_outgoing_intents()
+        for intent in submitted_intents:
+            try:
+                await reconcile_arkade_outgoing_intent(
+                    intent.intent_id, intent.account_id
+                )
+            except ArkadeReceiveError as exc:
+                logger.warning(
+                    f"Task: Arkade outgoing check failed for intent "
+                    f"{intent.intent_id}: {exc}"
+                )
+            except Exception:
+                logger.exception(
+                    f"Task: Arkade outgoing check failed unexpectedly for intent "
+                    f"{intent.intent_id}"
+                )
+        if submitted_intents:
+            # ponytail: process-local cursor; persist last_checked only if
+            # multi-process throughput proves this insufficient.
+            arkade_outgoing_cursor = submitted_intents[-1].intent_id
         for account_id in await get_arkade_ready_account_ids():
             try:
                 # Indexer I/O must not hold the ledger transaction open.

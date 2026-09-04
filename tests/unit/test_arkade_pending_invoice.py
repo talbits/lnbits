@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -100,6 +101,8 @@ async def connection(monkeypatch):
             },
         )
         await migrations.m054_add_payment_protocol_identity(connection)
+        await migrations.m055_create_arkade_outgoing_tables(connection)
+        await migrations.m057_add_arkade_outgoing_outputs(connection)
         yield connection
     await engine.dispose()
 
@@ -662,6 +665,71 @@ async def test_arkade_pending_check_isolates_indexer_failure(
 
     assert reconcile.await_count == 1
     funding.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_arkade_pending_check_reconciles_bounded_outgoing_batch(
+    connection, ready_mode, mocker
+):
+    @asynccontextmanager
+    async def use_connection():
+        yield connection
+
+    mocker.patch.object(payments.db, "connect", use_connection)
+    mocker.patch.object(payments, "get_arkade_ready_account_ids", return_value=[])
+    intents = [
+        SimpleNamespace(intent_id=f"{index:032x}", account_id=ACCOUNT_ID)
+        for index in (1, 2)
+    ]
+    mocker.patch.object(
+        payments, "get_arkade_submitted_outgoing_intents", return_value=intents
+    )
+    reconcile = mocker.patch.object(
+        payments,
+        "reconcile_arkade_outgoing_intent",
+        side_effect=[arkade.ArkadeReceiveError("ARKADE_INDEXER_UNAVAILABLE"), None],
+    )
+
+    await payments.check_pending_payments()
+
+    assert reconcile.await_args_list[0].args == (intents[0].intent_id, ACCOUNT_ID)
+    assert reconcile.await_args_list[1].args == (intents[1].intent_id, ACCOUNT_ID)
+
+
+@pytest.mark.anyio
+async def test_arkade_outgoing_cursor_advances_and_wraps(
+    connection, ready_mode, mocker
+):
+    @asynccontextmanager
+    async def use_connection():
+        yield connection
+
+    mocker.patch.object(payments.db, "connect", use_connection)
+    mocker.patch.object(payments, "get_arkade_ready_account_ids", return_value=[])
+    payments.arkade_outgoing_cursor = None
+    first = [
+        SimpleNamespace(intent_id=f"{index:032x}", account_id=ACCOUNT_ID)
+        for index in (1, 2)
+    ]
+    third = [SimpleNamespace(intent_id=f"{3:032x}", account_id=ACCOUNT_ID)]
+    query = mocker.patch.object(
+        payments,
+        "get_arkade_submitted_outgoing_intents",
+        side_effect=[first, third, [], first],
+    )
+    mocker.patch.object(payments, "reconcile_arkade_outgoing_intent", return_value=None)
+
+    await payments.check_pending_payments()
+    await payments.check_pending_payments()
+    await payments.check_pending_payments()
+
+    assert [call.kwargs.get("after_intent_id") for call in query.await_args_list] == [
+        None,
+        "0" * 31 + "2",
+        "0" * 31 + "3",
+        None,
+    ]
+    assert payments.arkade_outgoing_cursor == "0" * 31 + "2"
 
 
 @pytest.mark.anyio

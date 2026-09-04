@@ -383,6 +383,36 @@ async def compare_and_set_payment_success(
     return bool(result.rowcount)
 
 
+async def settle_arkade_outgoing_payment(
+    native_id: str,
+    *,
+    wallet_id: str,
+    amount_msat: int,
+    arkade_address: str,
+    conn: Connection | None = None,
+) -> bool:
+    database = conn or db
+    result = await database.execute(
+        f"""
+        UPDATE apipayments
+        SET status = 'success', fee = 0,
+            updated_at = {database.timestamp_placeholder('updated_at')}
+        WHERE protocol = 'arkade' AND native_id = :native_id
+          AND wallet_id = :wallet_id AND amount = :amount
+          AND arkade_address = :arkade_address AND fee = 0
+          AND status = 'pending'
+        """,  # noqa: S608
+        {
+            "native_id": native_id,
+            "wallet_id": wallet_id,
+            "amount": -amount_msat,
+            "arkade_address": arkade_address,
+            "updated_at": datetime.now(timezone.utc),
+        },
+    )
+    return bool(result.rowcount)
+
+
 async def compare_and_set_arkade_payment_failed(
     payment: Payment, conn: Connection | None = None
 ) -> bool:
