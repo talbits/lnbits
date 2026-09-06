@@ -234,6 +234,19 @@ async def sqlite_connection():
         await connection.execute("CREATE TABLE accounts (id TEXT PRIMARY KEY)")
         await migrations.m052_create_arkade_account_bindings_table(connection)
         await migrations.m056_add_arkade_account_descriptor(connection)
+        await connection.execute(
+            "CREATE TABLE apipayments ("
+            "wallet_id TEXT, amount INT, fee INT, status TEXT)"
+        )
+        await connection.execute(
+            "CREATE TABLE arkade_outgoing_intents (wallet_id TEXT, status TEXT)"
+        )
+        await connection.execute(
+            "CREATE TABLE arkade_receive_requests (wallet_id TEXT)"
+        )
+        await connection.execute(
+            "CREATE TABLE arkade_reconciliation_state (" "account_id TEXT, state TEXT)"
+        )
         yield connection
     await engine.dispose()
 
@@ -784,6 +797,64 @@ async def test_account_and_wallet_deletion_guards_are_before_mutation(
     await sqlite_connection.execute("DELETE FROM wallets WHERE id='w2'")
     with pytest.raises(ValueError, match="ARKADE_FINAL_WALLET_DELETION_BLOCKED"):
         await arkade.ensure_arkade_wallet_deletion_allowed("w1", conn=sqlite_connection)
+
+
+@pytest.mark.anyio
+async def test_wallet_deletion_guard_checks_all_wallet_money_state(
+    monkeypatch, sqlite_connection
+):
+    from lnbits.core.crud import arkade
+
+    monkeypatch.setattr(
+        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
+    )
+    await sqlite_connection.execute(
+        'CREATE TABLE wallets (id TEXT PRIMARY KEY, "user" TEXT, deleted BOOLEAN)'
+    )
+    await sqlite_connection.execute(
+        'INSERT INTO wallets (id, "user", deleted) VALUES '
+        "('w1', 'a', false), ('w2', 'a', false)"
+    )
+    ready = _binding_model(state="ready", identity_xonly_pubkey=_server_key())
+    ready.backup_acknowledged_at = ready.updated_at
+    ready.ready_at = ready.updated_at
+    monkeypatch.setattr(arkade, "get_arkade_binding", AsyncMock(return_value=ready))
+
+    checks = [
+        (
+            "INSERT INTO apipayments (wallet_id, amount, fee, status) "
+            "VALUES ('w1', 1000, 0, 'success')",
+            "DELETE FROM apipayments",
+        ),
+        (
+            "INSERT INTO apipayments (wallet_id, amount, fee, status) "
+            "VALUES ('w1', 1000, 0, 'pending')",
+            "DELETE FROM apipayments",
+        ),
+        (
+            "INSERT INTO arkade_outgoing_intents (wallet_id, status) "
+            "VALUES ('w1', 'disputed')",
+            "DELETE FROM arkade_outgoing_intents",
+        ),
+        (
+            "INSERT INTO arkade_receive_requests (wallet_id) VALUES ('w1')",
+            "DELETE FROM arkade_receive_requests",
+        ),
+        (
+            "INSERT INTO arkade_reconciliation_state (account_id, state) "
+            "VALUES ('a', 'reconciliation_required')",
+            "DELETE FROM arkade_reconciliation_state",
+        ),
+    ]
+    for insert, cleanup in checks:
+        await sqlite_connection.execute(insert)
+        with pytest.raises(ValueError, match="ARKADE_WALLET_DELETION_BLOCKED"):
+            await arkade.ensure_arkade_wallet_deletion_allowed(
+                "w1", conn=sqlite_connection
+            )
+        await sqlite_connection.execute(cleanup)
+
+    await arkade.ensure_arkade_wallet_deletion_allowed("w1", conn=sqlite_connection)
 
 
 @pytest.mark.anyio

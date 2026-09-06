@@ -85,6 +85,19 @@ async def get_arkade_receive_request_by_script(
     )
 
 
+async def get_arkade_receive_request_by_destination(
+    destination: str, conn: Connection | None = None
+) -> ArkadeReceiveRequest | None:
+    """Resolve one registered destination without trusting a caller account id."""
+    return await (conn or db).fetchone(
+        "SELECT * FROM arkade_receive_requests "
+        "WHERE lower(address) = lower(:destination) "
+        "OR lower(script) = lower(:destination)",
+        {"destination": destination},
+        ArkadeReceiveRequest,
+    )
+
+
 async def get_arkade_receive_requests(
     account_id: str, conn: Connection | None = None
 ) -> list[ArkadeReceiveRequest]:
@@ -521,9 +534,30 @@ async def ensure_arkade_wallet_deletion_allowed(
         raise ValueError("ARKADE_WALLET_DELETION_BLOCKED")
     if binding.state != "ready":
         raise ValueError("ARKADE_ENROLLMENT_REQUIRED")
-    # Reactivation and removal of an already inactive row cannot remove the
-    # final active logical wallet.
-    if not deleted or wallet["deleted"]:
+    if not deleted:
+        return
+    database = conn or db
+    blocked = await database.fetchone(
+        "SELECT CASE WHEN "
+        "COALESCE((SELECT SUM(amount - ABS(fee)) FROM apipayments "
+        "WHERE wallet_id = :wallet AND ((status = 'success' AND amount > 0) "
+        "OR (status IN ('success', 'pending') AND amount < 0))), 0) <> 0 "
+        "OR EXISTS (SELECT 1 FROM apipayments WHERE wallet_id = :wallet "
+        "AND status = 'pending') "
+        "OR EXISTS (SELECT 1 FROM arkade_outgoing_intents "
+        "WHERE wallet_id = :wallet AND status IN "
+        "('reserved', 'submitted', 'disputed')) "
+        "OR EXISTS (SELECT 1 FROM arkade_receive_requests "
+        "WHERE wallet_id = :wallet) "
+        "OR EXISTS (SELECT 1 FROM arkade_reconciliation_state "
+        "WHERE account_id = :account AND state = 'reconciliation_required') "
+        "THEN 1 ELSE 0 END AS blocked",
+        {"wallet": wallet_id, "account": wallet["user"]},
+    )
+    if blocked["blocked"]:
+        raise ValueError("ARKADE_WALLET_DELETION_BLOCKED")
+    # Removal of an already inactive row still needs the money-state guards.
+    if wallet["deleted"]:
         return
     row = await (conn or db).fetchone(
         "SELECT COUNT(*) AS count FROM wallets "

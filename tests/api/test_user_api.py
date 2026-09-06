@@ -52,6 +52,22 @@ async def test_user_api_toggle_admin_and_update_balance(
 
 
 @pytest.mark.anyio
+async def test_user_api_rejects_admin_balance_update_in_arkade_mode(
+    http_client: AsyncClient, superuser_token: str, monkeypatch
+):
+    monkeypatch.setattr(
+        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
+    )
+    response = await http_client.put(
+        "/users/api/v1/balance",
+        headers={"Authorization": f"Bearer {superuser_token}"},
+        json=UpdateBalance(id=uuid4().hex, amount=-1).dict(),
+    )
+    assert response.status_code == 403
+    assert response.json()["detail"] == "ARKADE_BALANCE_SET_UNSUPPORTED"
+
+
+@pytest.mark.anyio
 async def test_user_api_get_wallets_and_delete_all_wallets(
     http_client: AsyncClient, superuser_token: str
 ):

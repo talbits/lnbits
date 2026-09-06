@@ -12,8 +12,10 @@ from lnbits.core import migrations
 from lnbits.core.crud.payments import compare_and_set_arkade_payment_failed
 from lnbits.core.models import (
     ArkadeIndexerVtxo,
+    ArkadeOutgoingIntent,
     ArkadeReceiveAcknowledgement,
     CreateInvoice,
+    CreatePayment,
     PaymentState,
     Wallet,
 )
@@ -25,6 +27,8 @@ from lnbits.task_manager import task_manager
 ACCOUNT_ID = "00" * 16
 WALLET_ID = "11" * 16
 SECOND_WALLET_ID = "22" * 16
+FOREIGN_ACCOUNT_ID = "ff" * 16
+FOREIGN_WALLET_ID = "77" * 16
 
 
 @pytest.fixture
@@ -455,6 +459,480 @@ async def test_arkade_pending_invoice_rolls_back_pair(
     assert await _count(connection, "arkade_receive_requests") == 0
 
 
+async def _prepare_same_account_transfer(connection, ready_mode, monkeypatch):
+    wallets = {
+        WALLET_ID: Wallet(
+            id=WALLET_ID,
+            user=ACCOUNT_ID,
+            name="receiver",
+            adminkey="a",
+            inkey="b",
+            balance_msat=0,
+        ),
+        SECOND_WALLET_ID: Wallet(
+            id=SECOND_WALLET_ID,
+            user=ACCOUNT_ID,
+            name="sender",
+            adminkey="c",
+            inkey="d",
+            balance_msat=100_000,
+        ),
+    }
+
+    async def get_test_wallet(wallet_id, conn=None):
+        return wallets.get(wallet_id)
+
+    monkeypatch.setattr(arkade, "get_wallet", get_test_wallet)
+    monkeypatch.setattr(payments, "get_wallet", get_test_wallet)
+    payment = await payments.create_arkade_pending_invoice(
+        wallet_id=WALLET_ID,
+        amount=42,
+        memo="receiver",
+        idempotency_key="12" * 16,
+        conn=connection,
+    )
+    assert payment.native_id is not None
+    request = await arkade.get_arkade_receive_request(
+        payment.native_id, conn=connection
+    )
+    assert request is not None
+    address = "tark-internal-destination"
+    script = "5120" + "aa" * 32
+    await connection.execute(
+        'UPDATE arkade_receive_requests SET "index" = 7, address = :address, '
+        "script = :script, child_xonly_pubkey = :child, state = 'acknowledged' "
+        "WHERE native_request_id = :native_id",
+        {
+            "address": address,
+            "script": script,
+            "child": "55" * 32,
+            "native_id": payment.native_id,
+        },
+    )
+    await connection.execute(
+        "UPDATE apipayments SET arkade_address = :address "
+        "WHERE native_id = :native_id",
+        {"address": address, "native_id": payment.native_id},
+    )
+    await payments.create_payment(
+        checking_id=None,
+        data=CreatePayment(
+            wallet_id=SECOND_WALLET_ID,
+            amount_msat=100_000,
+            memo="funding",
+            protocol="arkade",
+            native_id="ee" * 16,
+        ),
+        status=PaymentState.SUCCESS,
+        conn=connection,
+    )
+    return wallets, request, address
+
+
+@pytest.mark.anyio
+async def test_same_account_transfer_is_atomic_and_replay_safe(
+    connection, ready_mode, monkeypatch, mocker
+):
+    wallets, request, address = await _prepare_same_account_transfer(
+        connection, ready_mode, monkeypatch
+    )
+    notify = mocker.patch.object(arkade, "send_payment_notification_in_background")
+    while not task_manager.internal_invoice_queue.empty():
+        task_manager.internal_invoice_queue.get_nowait()
+
+    sender, receiver = await arkade.settle_arkade_same_account_transfer(
+        ACCOUNT_ID,
+        SECOND_WALLET_ID,
+        address,
+        42_000,
+        memo="same account",
+        conn=connection,
+    )
+    replay_sender, replay_receiver = await arkade.settle_arkade_same_account_transfer(
+        ACCOUNT_ID,
+        SECOND_WALLET_ID,
+        address,
+        42_000,
+        memo="replay",
+        conn=connection,
+    )
+
+    assert sender.native_id == arkade.arkade_internal_transfer_id(
+        request.native_request_id
+    )
+    assert replay_sender == sender
+    assert replay_receiver == receiver
+    assert sender.status == receiver.status == PaymentState.SUCCESS.value
+    assert sender.amount == -42_000 and receiver.amount == 42_000
+    assert sender.fee == receiver.fee == 0
+    assert notify.call_count == 2
+    assert task_manager.internal_invoice_queue.qsize() == 1
+    stored_request = await arkade.get_arkade_receive_request(
+        request.native_request_id, conn=connection
+    )
+    assert stored_request is not None and stored_request.state == "settled"
+    assert await _count(connection, "arkade_receive_requests") == 1
+    assert await _count(connection, "apipayments") == 3
+    rows = await connection.fetchall(
+        "SELECT wallet_id, balance FROM balances ORDER BY wallet_id"
+    )
+    assert [(row["wallet_id"], row["balance"]) for row in rows] == [
+        (WALLET_ID, 42_000),
+        (SECOND_WALLET_ID, 58_000),
+    ]
+    intents = await connection.fetchone(
+        "SELECT COUNT(*) AS count FROM arkade_outgoing_intents"
+    )
+    assert intents["count"] == 0
+    assert wallets[SECOND_WALLET_ID].balance_msat == 100_000
+
+
+@pytest.mark.anyio
+async def test_same_account_transfer_rolls_back_on_sender_insert_failure(
+    connection, ready_mode, monkeypatch
+):
+    _, request, address = await _prepare_same_account_transfer(
+        connection, ready_mode, monkeypatch
+    )
+
+    async def fail_create_payment(*args, **kwargs):
+        raise RuntimeError("injected transfer failure")
+
+    monkeypatch.setattr(arkade, "create_payment", fail_create_payment)
+    with pytest.raises(RuntimeError, match="injected transfer failure"):
+        await arkade.settle_arkade_same_account_transfer(
+            ACCOUNT_ID, SECOND_WALLET_ID, address, 42_000, conn=connection
+        )
+    receiver = await payments.get_payment_by_native_id(
+        request.native_request_id, conn=connection
+    )
+    assert receiver is not None and receiver.status == PaymentState.PENDING.value
+    stored_request = await arkade.get_arkade_receive_request(
+        request.native_request_id, conn=connection
+    )
+    assert stored_request is not None and stored_request.state == "acknowledged"
+    assert await _count(connection, "apipayments") == 2
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("state", ["expired", "held", "failed"])
+async def test_same_account_transfer_rejects_nonsettleable_receiver(
+    connection, ready_mode, monkeypatch, state
+):
+    _, request, address = await _prepare_same_account_transfer(
+        connection, ready_mode, monkeypatch
+    )
+    if state == "expired":
+        await connection.execute(
+            "UPDATE arkade_receive_requests SET expires_at = :expires_at "
+            "WHERE native_request_id = :native_id",
+            {
+                "expires_at": datetime.now(timezone.utc) - timedelta(seconds=1),
+                "native_id": request.native_request_id,
+            },
+        )
+    elif state == "held":
+        await connection.execute(
+            "INSERT INTO arkade_reconciliation_state "
+            "(account_id, state, observed_at, updated_at) "
+            "VALUES (:account_id, 'reconciliation_required', :now, :now)",
+            {"account_id": ACCOUNT_ID, "now": datetime.now(timezone.utc)},
+        )
+    else:
+        await connection.execute(
+            "UPDATE apipayments SET status = 'failed' WHERE native_id = :native_id",
+            {"native_id": request.native_request_id},
+        )
+
+    with pytest.raises(arkade.ArkadeOutgoingError):
+        await arkade.settle_arkade_same_account_transfer(
+            ACCOUNT_ID, SECOND_WALLET_ID, address, 42_000, conn=connection
+        )
+    assert await _count(connection, "apipayments") == 2
+
+
+async def _prepare_cross_account_transfer(connection, ready_mode, monkeypatch):
+    wallets = {
+        SECOND_WALLET_ID: Wallet(
+            id=SECOND_WALLET_ID,
+            user=ACCOUNT_ID,
+            name="sender",
+            adminkey="c",
+            inkey="d",
+            balance_msat=100_000,
+        ),
+        FOREIGN_WALLET_ID: Wallet(
+            id=FOREIGN_WALLET_ID,
+            user=FOREIGN_ACCOUNT_ID,
+            name="receiver",
+            adminkey="e",
+            inkey="f",
+            balance_msat=0,
+        ),
+    }
+
+    async def get_test_wallet(wallet_id, conn=None):
+        return wallets.get(wallet_id)
+
+    monkeypatch.setattr(arkade, "get_wallet", get_test_wallet)
+    monkeypatch.setattr(payments, "get_wallet", get_test_wallet)
+    now = datetime.now(timezone.utc)
+    await connection.execute(
+        "INSERT INTO accounts (id) VALUES (:account_id)",
+        {"account_id": FOREIGN_ACCOUNT_ID},
+    )
+    await connection.execute(
+        'INSERT INTO wallets (id, "user", name, adminkey, inkey) '
+        "VALUES (:wallet_id, :account_id, 'foreign', 'e', 'f')",
+        {"wallet_id": FOREIGN_WALLET_ID, "account_id": FOREIGN_ACCOUNT_ID},
+    )
+    await connection.execute(
+        "INSERT INTO arkade_account_bindings "
+        "(account_id, state, enrollment_id, network, server_url, server_pubkey, "
+        "identity_xonly_pubkey, backup_acknowledged_at, ready_at) VALUES "
+        "(:account_id, 'ready', :enrollment_id, 'regtest', 'http://arkade', "
+        ":server, :identity, :ack, :ready)",
+        {
+            "account_id": FOREIGN_ACCOUNT_ID,
+            "enrollment_id": "66" * 16,
+            "server": "44" * 32,
+            "identity": "77" * 32,
+            "ack": now,
+            "ready": now,
+        },
+    )
+    payment = await payments.create_arkade_pending_invoice(
+        wallet_id=FOREIGN_WALLET_ID,
+        amount=42,
+        memo="foreign receiver",
+        idempotency_key="34" * 16,
+        conn=connection,
+    )
+    assert payment.native_id is not None
+    request = await arkade.get_arkade_receive_request(
+        payment.native_id, conn=connection
+    )
+    assert request is not None
+    address = "tark-foreign-destination"
+    script = "5120" + "bb" * 32
+    await connection.execute(
+        'UPDATE arkade_receive_requests SET "index" = 8, address = :address, '
+        "script = :script, child_xonly_pubkey = :child, state = 'acknowledged' "
+        "WHERE native_request_id = :native_id",
+        {
+            "address": address,
+            "script": script,
+            "child": "77" * 32,
+            "native_id": payment.native_id,
+        },
+    )
+    await connection.execute(
+        "UPDATE apipayments SET arkade_address = :address "
+        "WHERE native_id = :native_id",
+        {"address": address, "native_id": payment.native_id},
+    )
+    await payments.create_payment(
+        checking_id=None,
+        data=CreatePayment(
+            wallet_id=SECOND_WALLET_ID,
+            amount_msat=100_000,
+            memo="funding",
+            protocol="arkade",
+            native_id="ef" * 16,
+        ),
+        status=PaymentState.SUCCESS,
+        conn=connection,
+    )
+    return wallets, request, address, script
+
+
+@pytest.mark.anyio
+async def test_cross_account_reservation_keeps_receiver_pending_and_replays(
+    connection, ready_mode, monkeypatch
+):
+    wallets, request, address, script = await _prepare_cross_account_transfer(
+        connection, ready_mode, monkeypatch
+    )
+    monkeypatch.setattr(arkade, "decode_arkade_address_script", lambda *args: script)
+
+    async def backing(_account_id, **_kwargs):
+        return [
+            ArkadeIndexerVtxo(
+                txid="cc" * 32,
+                vout=0,
+                amount_sat=100,
+                script=script,
+            )
+        ]
+
+    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", backing)
+    intent = ArkadeOutgoingIntent(
+        intent_id=arkade.arkade_internal_transfer_id(request.native_request_id),
+        account_id=ACCOUNT_ID,
+        wallet_id=SECOND_WALLET_ID,
+        amount_msat=42_000,
+        destination=address,
+        expires_at=(datetime.now(timezone.utc) + timedelta(minutes=10)).replace(
+            microsecond=0
+        ),
+    )
+    receiver_context = {
+        "receiver_account_id": FOREIGN_ACCOUNT_ID,
+        "receiver_native_request_id": request.native_request_id,
+    }
+
+    reserved, sender_payment = await arkade.reserve_arkade_outgoing_intent(
+        ACCOUNT_ID, intent, conn=connection, **receiver_context
+    )
+    replay, replay_payment = await arkade.reserve_arkade_outgoing_intent(
+        ACCOUNT_ID, intent, conn=connection, **receiver_context
+    )
+
+    receiver_payment = await payments.get_payment_by_native_id(
+        request.native_request_id, conn=connection
+    )
+    assert reserved.intent_id == arkade.arkade_internal_transfer_id(
+        request.native_request_id
+    )
+    assert sender_payment.status == replay_payment.status == PaymentState.PENDING.value
+    assert sender_payment.amount == replay_payment.amount == -42_000
+    assert replay == reserved and replay_payment == sender_payment
+    assert receiver_payment is not None
+    assert receiver_payment.status == PaymentState.PENDING.value
+    assert receiver_payment.amount == 42_000
+    assert wallets[SECOND_WALLET_ID].balance_msat == 100_000
+    stored_request = await arkade.get_arkade_receive_request(
+        request.native_request_id, conn=connection
+    )
+    assert stored_request is not None and stored_request.state == "acknowledged"
+    intent_count = await connection.fetchone(
+        "SELECT COUNT(*) AS count FROM arkade_outgoing_intents"
+    )
+    assert intent_count["count"] == 1
+
+    with pytest.raises(arkade.ArkadeOutgoingError, match="IDEMPOTENCY_CONFLICT"):
+        await arkade.reserve_arkade_outgoing_intent(
+            ACCOUNT_ID,
+            intent.copy(update={"amount_msat": 43_000}),
+            conn=connection,
+            **receiver_context,
+        )
+    with pytest.raises(arkade.ArkadeOutgoingError, match="IDEMPOTENCY_CONFLICT"):
+        await arkade.reserve_arkade_outgoing_intent(
+            ACCOUNT_ID,
+            intent.copy(update={"wallet_id": WALLET_ID}),
+            conn=connection,
+            **receiver_context,
+        )
+
+
+@pytest.mark.anyio
+async def test_cross_account_reservation_rechecks_settled_receiver(
+    connection, ready_mode, monkeypatch
+):
+    _, request, address, script = await _prepare_cross_account_transfer(
+        connection, ready_mode, monkeypatch
+    )
+    monkeypatch.setattr(arkade, "decode_arkade_address_script", lambda *args: script)
+    evidence = ArkadeIndexerVtxo(
+        txid="ee" * 32,
+        vout=0,
+        amount_sat=42,
+        script=script,
+    )
+    settled = False
+
+    async def backing(_account_id, **_kwargs):
+        nonlocal settled
+        if not settled:
+            settled = True
+            await arkade.reconcile_arkade_receive(
+                FOREIGN_ACCOUNT_ID, [evidence], conn=connection
+            )
+        return [
+            ArkadeIndexerVtxo(
+                txid="ff" * 32,
+                vout=0,
+                amount_sat=100,
+                script=script,
+            )
+        ]
+
+    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", backing)
+    intent = ArkadeOutgoingIntent(
+        intent_id=arkade.arkade_internal_transfer_id(request.native_request_id),
+        account_id=ACCOUNT_ID,
+        wallet_id=SECOND_WALLET_ID,
+        amount_msat=42_000,
+        destination=address,
+        expires_at=(datetime.now(timezone.utc) + timedelta(minutes=10)).replace(
+            microsecond=0
+        ),
+    )
+
+    with pytest.raises(arkade.ArkadeOutgoingError, match="RECEIVER_INVALID"):
+        await arkade.reserve_arkade_outgoing_intent(
+            ACCOUNT_ID,
+            intent,
+            conn=connection,
+            receiver_account_id=FOREIGN_ACCOUNT_ID,
+            receiver_native_request_id=request.native_request_id,
+        )
+
+    assert settled
+    sender_payment = await payments.get_payment_by_native_id(
+        intent.intent_id, conn=connection
+    )
+    assert sender_payment is None
+    intent_count = await connection.fetchone(
+        "SELECT COUNT(*) AS count FROM arkade_outgoing_intents"
+    )
+    assert intent_count["count"] == 0
+    receiver_payment = await payments.get_payment_by_native_id(
+        request.native_request_id, conn=connection
+    )
+    stored_request = await arkade.get_arkade_receive_request(
+        request.native_request_id, conn=connection
+    )
+    assert receiver_payment is not None
+    assert receiver_payment.status == PaymentState.SUCCESS.value
+    assert stored_request is not None and stored_request.state == "settled"
+
+
+@pytest.mark.anyio
+async def test_cross_account_receive_evidence_credits_receiver_once(
+    connection, ready_mode, monkeypatch
+):
+    _, request, _, script = await _prepare_cross_account_transfer(
+        connection, ready_mode, monkeypatch
+    )
+    evidence = ArkadeIndexerVtxo(
+        txid="dd" * 32,
+        vout=0,
+        amount_sat=42,
+        script=script,
+    )
+
+    first = await arkade.reconcile_arkade_receive(
+        FOREIGN_ACCOUNT_ID, [evidence], conn=connection
+    )
+    replay = await arkade.reconcile_arkade_receive(
+        FOREIGN_ACCOUNT_ID, [evidence], conn=connection
+    )
+
+    receiver_payment = await payments.get_payment_by_native_id(
+        request.native_request_id, conn=connection
+    )
+    stored_request = await arkade.get_arkade_receive_request(
+        request.native_request_id, conn=connection
+    )
+    assert len(first) == 1
+    assert replay == []
+    assert receiver_payment is not None
+    assert receiver_payment.status == PaymentState.SUCCESS.value
+    assert stored_request is not None and stored_request.state == "settled"
+
+
 @pytest.mark.anyio
 async def test_nested_transaction_preserves_outer_rollback(connection):
     await connection.execute(
@@ -694,6 +1172,41 @@ async def test_arkade_pending_check_reconciles_bounded_outgoing_batch(
 
     assert reconcile.await_args_list[0].args == (intents[0].intent_id, ACCOUNT_ID)
     assert reconcile.await_args_list[1].args == (intents[1].intent_id, ACCOUNT_ID)
+
+
+@pytest.mark.anyio
+async def test_arkade_outgoing_settlement_enqueues_once(connection, ready_mode, mocker):
+    @asynccontextmanager
+    async def use_connection():
+        yield connection
+
+    while not task_manager.invoice_queue.empty():
+        task_manager.invoice_queue.get_nowait()
+    intent = SimpleNamespace(intent_id="33" * 16, account_id=ACCOUNT_ID)
+    mocker.patch.object(payments.db, "connect", use_connection)
+    mocker.patch.object(payments, "get_arkade_pending_payments", return_value=[])
+    mocker.patch.object(payments, "get_arkade_ready_account_ids", return_value=[])
+    mocker.patch.object(
+        payments,
+        "get_arkade_submitted_outgoing_intents",
+        side_effect=[[intent], [intent]],
+    )
+    mocker.patch.object(
+        payments,
+        "reconcile_arkade_outgoing_intent",
+        side_effect=[SimpleNamespace(status="verified"), None],
+    )
+    payment = SimpleNamespace(success=True)
+    get_payment = mocker.patch.object(
+        payments, "get_payment_by_native_id", return_value=payment
+    )
+
+    await payments.check_pending_payments()
+    await payments.check_pending_payments()
+
+    assert task_manager.invoice_queue.qsize() == 1
+    assert task_manager.invoice_queue.get_nowait() is payment
+    get_payment.assert_awaited_once_with(intent.intent_id)
 
 
 @pytest.mark.anyio

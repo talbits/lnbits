@@ -7,6 +7,7 @@ import {
   Wallet,
   buildOffchainTx,
   deriveDescriptorLeafPubKey,
+  isSpendable,
   selectVirtualCoins
 } from '@arkade-os/sdk'
 import {generateMnemonic, validateMnemonic} from '@scure/bip39'
@@ -26,6 +27,16 @@ const IDENTITY_DESCRIPTOR =
 const PASSWORD_MIN_LENGTH = 12
 const MAX_CIPHERTEXT_BYTES = 1024 * 1024
 const RECEIVE_JOURNAL_PREFIX = 'lnbits-arkade-receive-v1'
+const OUTGOING_JOURNAL_PREFIX = 'lnbits-arkade-outgoing-v1'
+const OUTGOING_JOURNAL_VERSION = 1
+const MAX_OUTGOING_JOURNAL_RECORDS = 32
+const MAX_OUTGOING_JOURNAL_BYTES = 128 * 1024
+const OUTGOING_PHASES = new Set([
+  'prepared',
+  'authorization_unknown',
+  'submitted',
+  'reconciliation_required'
+])
 const RECORD_FIELDS = new Set([
   'accountId',
   'version',
@@ -108,6 +119,41 @@ type OutgoingPrepared = Readonly<{
   previewCommitment: string
 }>
 
+type OutgoingJournalInput = Readonly<{
+  txid: string
+  vout: number
+  amount_sat: number
+  script: string
+}>
+
+type OutgoingJournalChange = Readonly<{
+  index: number
+  script: string
+  amount_sat: number
+}>
+
+type OutgoingJournal = Readonly<{
+  version: 1
+  intentId: string
+  accountId: string
+  walletId: string
+  amountSat: number
+  destination: string
+  destinationScript: string
+  inputs: ReadonlyArray<OutgoingJournalInput>
+  change: OutgoingJournalChange | null
+  previewCommitment: string
+  network: string
+  serverUrl: string
+  serverPubkey: string
+  expiresAt: number
+  phase:
+    | 'prepared'
+    | 'authorization_unknown'
+    | 'submitted'
+    | 'reconciliation_required'
+}>
+
 type ArkadeWallet = Awaited<ReturnType<typeof Wallet.create>>
 type SpendableVtxo = Awaited<
   ReturnType<ArkadeWallet['getSpendableVtxos']>
@@ -132,6 +178,7 @@ type OutgoingPlan = {
 }
 
 const outgoingPlans = new WeakMap<object, OutgoingPlan>()
+const outgoingRecoveries = new Map<string, Promise<any>>()
 
 class ArkadeOutgoingReconciliationError extends Error {
   readonly reconciliationRequired = true
@@ -180,6 +227,197 @@ const persistReceiveMapping = (
   mappings.push(mapping)
   localStorage.setItem(receiveJournalKey(accountId), JSON.stringify(mappings))
   return mapping
+}
+
+const outgoingJournalKey = (accountId: string) =>
+  `${OUTGOING_JOURNAL_PREFIX}:${location.origin}:${accountId}`
+
+const isHex = (value: unknown, min = 2, max = 4096): value is string =>
+  typeof value === 'string' &&
+  value.length >= min &&
+  value.length <= max &&
+  value.length % 2 === 0 &&
+  /^[0-9a-f]+$/i.test(value)
+
+const strictOutgoingJournal = (value: unknown): value is OutgoingJournal[] => {
+  if (!Array.isArray(value) || value.length > MAX_OUTGOING_JOURNAL_RECORDS)
+    return false
+  return value.every(record => {
+    if (!record || typeof record !== 'object') return false
+    const item = record as any
+    if (
+      Object.keys(item).sort().join(',') !==
+      [
+        'accountId',
+        'amountSat',
+        'change',
+        'destination',
+        'destinationScript',
+        'expiresAt',
+        'inputs',
+        'intentId',
+        'network',
+        'phase',
+        'previewCommitment',
+        'serverPubkey',
+        'serverUrl',
+        'version',
+        'walletId'
+      ]
+        .sort()
+        .join(',')
+    )
+      return false
+    if (
+      item.version !== OUTGOING_JOURNAL_VERSION ||
+      !HEX32.test(item.intentId) ||
+      typeof item.accountId !== 'string' ||
+      typeof item.walletId !== 'string' ||
+      !Number.isSafeInteger(item.amountSat) ||
+      item.amountSat <= 0 ||
+      typeof item.destination !== 'string' ||
+      !item.destination ||
+      !isHex(item.destinationScript) ||
+      !Array.isArray(item.inputs) ||
+      item.inputs.length < 1 ||
+      item.inputs.length > 100 ||
+      typeof item.previewCommitment !== 'string' ||
+      !item.previewCommitment ||
+      item.previewCommitment.length > 64 * 1024 ||
+      !NETWORK.test(item.network) ||
+      typeof item.serverUrl !== 'string' ||
+      !item.serverUrl ||
+      !HEX64.test(item.serverPubkey) ||
+      !Number.isSafeInteger(item.expiresAt) ||
+      item.expiresAt < 0 ||
+      !OUTGOING_PHASES.has(item.phase)
+    )
+      return false
+    if (
+      !item.inputs.every(
+        (input: any) =>
+          input &&
+          Object.keys(input).sort().join(',') ===
+            'amount_sat,script,txid,vout' &&
+          HEX64.test(input.txid) &&
+          Number.isSafeInteger(input.vout) &&
+          input.vout >= 0 &&
+          Number.isSafeInteger(input.amount_sat) &&
+          input.amount_sat > 0 &&
+          isHex(input.script)
+      )
+    )
+      return false
+    if (
+      new Set(item.inputs.map((input: any) => `${input.txid}:${input.vout}`))
+        .size !== item.inputs.length
+    )
+      return false
+    return (
+      item.change === null ||
+      (item.change &&
+        Object.keys(item.change).sort().join(',') ===
+          'amount_sat,index,script' &&
+        Number.isSafeInteger(item.change.index) &&
+        item.change.index >= 0 &&
+        Number.isSafeInteger(item.change.amount_sat) &&
+        item.change.amount_sat > 0 &&
+        isHex(item.change.script))
+    )
+  })
+}
+
+const readOutgoingJournal = (accountId: string): OutgoingJournal[] => {
+  const value = localStorage.getItem(outgoingJournalKey(accountId))
+  if (!value) return []
+  if (new TextEncoder().encode(value).byteLength > MAX_OUTGOING_JOURNAL_BYTES)
+    throw new Error('outgoing journal too large')
+  let journal: unknown
+  try {
+    journal = JSON.parse(value)
+  } catch {
+    throw new Error('outgoing journal corrupt')
+  }
+  if (!strictOutgoingJournal(journal))
+    throw new Error('outgoing journal corrupt')
+  return journal
+}
+
+const journalMatchesBinding = (
+  record: OutgoingJournal,
+  accountId: string,
+  binding: any
+) =>
+  record.accountId === accountId &&
+  binding?.account_id === accountId &&
+  record.network === binding?.network &&
+  record.serverUrl === binding?.server_url &&
+  record.serverPubkey === binding?.server_pubkey
+
+const persistOutgoingJournal = (record: OutgoingJournal) => {
+  const journal = readOutgoingJournal(record.accountId)
+  const existingIndex = journal.findIndex(
+    item => item.intentId === record.intentId
+  )
+  if (existingIndex >= 0) {
+    const existing = journal[existingIndex]
+    const {phase: _oldPhase, ...oldImmutable} = existing
+    const {phase: _newPhase, ...newImmutable} = record
+    if (JSON.stringify(oldImmutable) !== JSON.stringify(newImmutable))
+      throw new Error('outgoing journal conflict')
+    journal[existingIndex] = record
+  } else {
+    if (journal.length >= MAX_OUTGOING_JOURNAL_RECORDS)
+      throw new Error('outgoing journal is full')
+    journal.push(record)
+  }
+  const serialized = JSON.stringify(journal)
+  if (
+    new TextEncoder().encode(serialized).byteLength > MAX_OUTGOING_JOURNAL_BYTES
+  )
+    throw new Error('outgoing journal too large')
+  localStorage.setItem(outgoingJournalKey(record.accountId), serialized)
+  return record
+}
+
+const updateOutgoingJournalPhase = (
+  accountId: string,
+  intentId: string,
+  phase: OutgoingJournal['phase']
+) => {
+  const journal = readOutgoingJournal(accountId)
+  const index = journal.findIndex(item => item.intentId === intentId)
+  if (index < 0) throw new Error('outgoing journal entry missing')
+  persistOutgoingJournal({...journal[index], phase})
+}
+
+const removeOutgoingJournal = (accountId: string, intentId: string) => {
+  const journal = readOutgoingJournal(accountId).filter(
+    item => item.intentId !== intentId
+  )
+  localStorage.setItem(outgoingJournalKey(accountId), JSON.stringify(journal))
+}
+
+const reconcileTerminalOutgoing = async (
+  accountId: string,
+  journal: OutgoingJournal[]
+) => {
+  for (const record of journal) {
+    try {
+      const response = (await LNbits.api.arkadeOutgoingIntent(record.intentId))
+        .data
+      if (
+        (response.status === 'released' &&
+          releasedOutgoingJournalMatches(record, response, activeBinding)) ||
+        (response.status === 'settled' &&
+          outgoingJournalResponseMatches(record, response, activeBinding))
+      )
+        removeOutgoingJournal(accountId, record.intentId)
+    } catch {
+      // Keep records that cannot be independently reconciled.
+    }
+  }
+  return readOutgoingJournal(accountId)
 }
 
 const expirySeconds = (value: unknown): number => {
@@ -621,7 +859,7 @@ const allocateReceive = async (
   if (existing) return acknowledgeReceive(accountId, existing)
   if (request.state !== 'pending')
     throw new Error('Arkade payment mapping is no longer pending')
-  const wallet = await getAllocationWallet(accountId, request)
+  const wallet = await getAllocationWallet(accountId, activeBinding)
   const [newAddress] = await wallet.getNewAddresses({forceNew: true})
   if (!newAddress?.signingDescriptor || !newAddress.contract)
     throw new Error(
@@ -748,6 +986,25 @@ const outgoingBindingFingerprint = (binding: any) =>
     binding?.identity_descriptor
   ])
 
+const outgoingContextIsLive = (
+  accountId: string,
+  generation: number,
+  bindingFingerprint: string
+) =>
+  !!identity &&
+  generation === unlockGeneration &&
+  accountId === window.g.user.id &&
+  !!activeBinding &&
+  activeBinding.state === 'ready' &&
+  bindingFingerprint === outgoingBindingFingerprint(activeBinding)
+
+const outgoingPlanIsLive = (plan: OutgoingPlan) =>
+  outgoingContextIsLive(
+    plan.accountId,
+    plan.generation,
+    plan.bindingFingerprint
+  )
+
 const outgoingInputSummary = (input: SpendableVtxo) => ({
   txid: input.txid,
   vout: input.vout,
@@ -812,6 +1069,85 @@ const outgoingCommitment = (plan: OutgoingPlan) => {
     arkTx: bytesToHex(preview.arkTx.toBytes()),
     checkpoints: preview.checkpoints.map(tx => bytesToHex(tx.toBytes()))
   })
+}
+
+const outgoingJournalFromPlan = (
+  plan: OutgoingPlan,
+  phase: OutgoingJournal['phase']
+): OutgoingJournal => ({
+  version: OUTGOING_JOURNAL_VERSION,
+  intentId: plan.intentId,
+  accountId: plan.accountId,
+  walletId: plan.walletId,
+  amountSat: plan.publicPlan.amountSat,
+  destination: plan.destination,
+  destinationScript: plan.destinationScript,
+  inputs: plan.publicPlan.inputs,
+  change: plan.change
+    ? {
+        index: plan.change.index,
+        script: plan.change.script,
+        amount_sat: plan.change.amount_sat
+      }
+    : null,
+  previewCommitment: plan.previewCommitment,
+  network: activeBinding.network,
+  serverUrl: activeBinding.server_url,
+  serverPubkey: activeBinding.server_pubkey,
+  expiresAt: plan.expiresAt,
+  phase
+})
+
+const outgoingJournalResponseMatches = (
+  record: OutgoingJournal,
+  response: any,
+  binding: any
+) => {
+  try {
+    if (
+      !response ||
+      response.intent_id !== record.intentId ||
+      response.account_id !== record.accountId ||
+      response.wallet_id !== record.walletId ||
+      response.amount_msat !== record.amountSat * 1000 ||
+      response.max_fee_msat !== 0 ||
+      response.destination !== record.destination ||
+      response.destination_kind !== 'arkade_address' ||
+      response.network !== record.network ||
+      response.server_url !== record.serverUrl ||
+      response.server_pubkey !== record.serverPubkey ||
+      !journalMatchesBinding(record, record.accountId, binding) ||
+      (response.destination_script?.toLowerCase() ?? null) !==
+        record.destinationScript.toLowerCase() ||
+      expirySeconds(response.expires_at) !== record.expiresAt ||
+      response.change_index !== (record.change?.index ?? null) ||
+      (response.change_script?.toLowerCase() ?? null) !==
+        (record.change?.script.toLowerCase() ?? null) ||
+      response.change_amount_sat !== (record.change?.amount_sat ?? null)
+    )
+      return false
+    const inputs = response.inputs || []
+    return (
+      inputs.length === record.inputs.length &&
+      record.inputs.every(input =>
+        inputs.some(
+          (item: any) =>
+            item.txid === input.txid &&
+            item.vout === input.vout &&
+            item.amount_sat === input.amount_sat
+        )
+      )
+    )
+  } catch {
+    return false
+  }
+}
+
+const outgoingJournalForPlan = (plan: OutgoingPlan) => {
+  const journal = outgoingJournalFromPlan(plan, 'prepared')
+  if (!journalMatchesBinding(journal, plan.accountId, activeBinding))
+    throw new Error('Arkade outgoing binding changed')
+  persistOutgoingJournal(journal)
 }
 
 const prepareOutgoing = async (
@@ -906,6 +1242,7 @@ const prepareOutgoing = async (
     previewCommitment: plan.previewCommitment
   })
   plan.publicPlan = publicPlan
+  outgoingJournalForPlan(plan)
   outgoingPlans.set(publicPlan, plan)
   return publicPlan
 }
@@ -947,14 +1284,7 @@ const submitOutgoing = async (
     throw new Error('Arkade outgoing approval required')
   const plan = outgoingPlans.get(prepared)
   if (!plan) throw new Error('Arkade outgoing preparation is invalid')
-  if (
-    !identity ||
-    plan.generation !== unlockGeneration ||
-    plan.accountId !== window.g.user.id ||
-    !activeBinding ||
-    activeBinding.state !== 'ready' ||
-    plan.bindingFingerprint !== outgoingBindingFingerprint(activeBinding)
-  )
+  if (!outgoingPlanIsLive(plan))
     throw new Error('Arkade outgoing preparation is locked')
   const snapshot = outgoingIntentSnapshot(
     (await LNbits.api.arkadeOutgoingIntent(plan.intentId)).data,
@@ -993,6 +1323,11 @@ const submitOutgoing = async (
     try {
       afterFailure = (await LNbits.api.arkadeOutgoingIntent(plan.intentId)).data
     } catch {
+      updateOutgoingJournalPhase(
+        plan.accountId,
+        plan.intentId,
+        'authorization_unknown'
+      )
       throw new ArkadeOutgoingReconciliationError(
         plan.intentId,
         'authorization_unknown'
@@ -1008,27 +1343,51 @@ const submitOutgoing = async (
         activeBinding
       )
     } catch {
+      updateOutgoingJournalPhase(
+        plan.accountId,
+        plan.intentId,
+        'authorization_unknown'
+      )
       throw new ArkadeOutgoingReconciliationError(
         plan.intentId,
         'authorization_unknown'
       )
     }
-    if (afterSnapshot.status !== 'submitted')
+    if (afterSnapshot.status !== 'submitted') {
+      updateOutgoingJournalPhase(plan.accountId, plan.intentId, 'prepared')
       throw new Error('Arkade outgoing authorization failed')
-    if (!sameOutgoingPlan(plan, afterFailure))
+    }
+    if (!sameOutgoingPlan(plan, afterFailure)) {
+      updateOutgoingJournalPhase(
+        plan.accountId,
+        plan.intentId,
+        'authorization_unknown'
+      )
       throw new ArkadeOutgoingReconciliationError(
         plan.intentId,
         'authorization_unknown'
       )
+    }
     authorization = afterFailure
   }
   if (
     authorization.status !== 'submitted' ||
     !sameOutgoingPlan(plan, authorization)
-  )
+  ) {
+    updateOutgoingJournalPhase(
+      plan.accountId,
+      plan.intentId,
+      'authorization_unknown'
+    )
     throw new Error('Arkade outgoing authorization changed')
+  }
+  if (!outgoingPlanIsLive(plan))
+    throw new Error('Arkade outgoing preparation is locked')
+  updateOutgoingJournalPhase(plan.accountId, plan.intentId, 'submitted')
   if (outgoingCommitment(plan) !== plan.previewCommitment)
     throw new Error('Arkade outgoing transaction changed')
+  if (!outgoingPlanIsLive(plan))
+    throw new Error('Arkade outgoing preparation is locked')
   try {
     const result = await plan.wallet.buildAndSubmitOffchainTx(
       plan.inputs,
@@ -1042,8 +1401,462 @@ const submitOutgoing = async (
       arkTxid: result.arkTxid
     }
   } catch {
+    updateOutgoingJournalPhase(
+      plan.accountId,
+      plan.intentId,
+      'reconciliation_required'
+    )
     throw new ArkadeOutgoingReconciliationError(plan.intentId, 'submitted')
   }
+}
+
+const outgoingJournalResponseBindingMatches = (
+  record: OutgoingJournal,
+  response: any,
+  binding: any
+) => {
+  try {
+    return (
+      response?.intent_id === record.intentId &&
+      response.account_id === record.accountId &&
+      response.wallet_id === record.walletId &&
+      response.amount_msat === record.amountSat * 1000 &&
+      response.max_fee_msat === 0 &&
+      response.destination === record.destination &&
+      response.destination_kind === 'arkade_address' &&
+      response.network === record.network &&
+      response.server_url === record.serverUrl &&
+      response.server_pubkey === record.serverPubkey &&
+      journalMatchesBinding(record, record.accountId, binding) &&
+      expirySeconds(response.expires_at) === record.expiresAt
+    )
+  } catch {
+    return false
+  }
+}
+
+const releasedOutgoingJournalMatches = (
+  record: OutgoingJournal,
+  response: any,
+  binding: any
+) =>
+  record.phase === 'prepared' &&
+  response?.status === 'released' &&
+  outgoingJournalResponseBindingMatches(record, response, binding) &&
+  Array.isArray(response.inputs) &&
+  response.inputs.length === 0 &&
+  response.destination_script === null &&
+  response.change_index === null &&
+  response.change_script === null &&
+  response.change_amount_sat === null
+
+const exactOutgoingVtxos = (
+  vtxos: any[],
+  record: OutgoingJournal
+): SpendableVtxo[] => {
+  const result: SpendableVtxo[] = []
+  for (const input of record.inputs) {
+    const matches = vtxos.filter(
+      item =>
+        item.txid === input.txid &&
+        item.vout === input.vout &&
+        item.value === input.amount_sat &&
+        typeof item.script === 'string' &&
+        item.script.toLowerCase() === input.script.toLowerCase()
+    )
+    if (matches.length !== 1)
+      throw new Error('Arkade outgoing VTXO unavailable')
+    result.push(matches[0])
+  }
+  return result
+}
+
+const fetchExactOutgoingVtxos = async (
+  wallet: ArkadeWallet,
+  manager: Awaited<ReturnType<ArkadeWallet['getContractManager']>>,
+  inputs: ReadonlyArray<{txid: string; vout: number}>
+) => {
+  const response = await wallet.indexerProvider.getVtxos({
+    outpoints: inputs.map(({txid, vout}) => ({txid, vout}))
+  })
+  if (!response || !Array.isArray(response.vtxos))
+    throw new Error('Arkade outgoing recovery unavailable')
+  return manager.annotateVtxos(response.vtxos)
+}
+
+const outgoingRecoveryPreview = (
+  wallet: ArkadeWallet,
+  record: OutgoingJournal,
+  inputs: SpendableVtxo[]
+) => {
+  const outputs = [
+    {
+      script: fromHex(record.destinationScript),
+      amount: BigInt(record.amountSat)
+    },
+    ...(record.change
+      ? [
+          {
+            script: fromHex(record.change.script),
+            amount: BigInt(record.change.amount_sat)
+          }
+        ]
+      : [])
+  ]
+  const preview = buildOffchainTx(
+    inputs.map(input => ({
+      ...input,
+      tapLeafScript: input.forfeitTapLeafScript
+    })),
+    outputs,
+    wallet.serverUnrollScript
+  )
+  return {
+    outputs,
+    commitment: JSON.stringify({
+      arkTx: bytesToHex(preview.arkTx.toBytes()),
+      checkpoints: preview.checkpoints.map(tx => bytesToHex(tx.toBytes()))
+    })
+  }
+}
+
+const outgoingRecoveryArtifacts = (
+  wallet: ArkadeWallet,
+  record: OutgoingJournal,
+  inputs: SpendableVtxo[]
+) => {
+  if (inputs.some(input => !isSpendable(input)))
+    throw new Error('Arkade outgoing VTXO is no longer spendable')
+  const {outputs, commitment} = outgoingRecoveryPreview(wallet, record, inputs)
+  if (commitment !== record.previewCommitment)
+    throw new Error('outgoing journal commitment mismatch')
+  return {inputs, outputs}
+}
+
+const hydrateOutgoingJournal = async (
+  wallet: ArkadeWallet,
+  manager: Awaited<ReturnType<ArkadeWallet['getContractManager']>>,
+  response: any,
+  accountId: string,
+  binding: any
+) => {
+  const snapshot = outgoingIntentSnapshot(
+    response,
+    response?.intent_id,
+    response?.wallet_id,
+    accountId,
+    binding
+  )
+  if (snapshot.status !== 'submitted' || !Array.isArray(response.inputs))
+    throw new Error('Arkade outgoing intent changed')
+  const annotated = await fetchExactOutgoingVtxos(
+    wallet,
+    manager,
+    response.inputs
+  )
+  const inputs = response.inputs.map((claim: any) => {
+    const matches = annotated.filter(
+      input =>
+        input.txid === claim.txid &&
+        input.vout === claim.vout &&
+        input.value === claim.amount_sat &&
+        typeof input.script === 'string'
+    )
+    if (matches.length !== 1)
+      throw new Error('Arkade outgoing VTXO unavailable')
+    return {
+      txid: claim.txid,
+      vout: claim.vout,
+      amount_sat: claim.amount_sat,
+      script: matches[0].script
+    }
+  })
+  const base: OutgoingJournal = {
+    version: OUTGOING_JOURNAL_VERSION,
+    intentId: response.intent_id,
+    accountId,
+    walletId: response.wallet_id,
+    amountSat: snapshot.amountSat,
+    destination: response.destination,
+    destinationScript: snapshot.destinationScript,
+    inputs,
+    change:
+      response.change_index === null
+        ? null
+        : {
+            index: response.change_index,
+            script: response.change_script,
+            amount_sat: response.change_amount_sat
+          },
+    previewCommitment: '',
+    network: response.network,
+    serverUrl: response.server_url,
+    serverPubkey: response.server_pubkey,
+    expiresAt: snapshot.expiresAt,
+    phase: 'submitted'
+  }
+  const record = {
+    ...base,
+    previewCommitment: outgoingRecoveryPreview(
+      wallet,
+      base,
+      exactOutgoingVtxos(annotated, base)
+    ).commitment
+  }
+  if (!outgoingJournalResponseMatches(record, response, binding))
+    throw new Error('Arkade outgoing intent changed')
+  return persistOutgoingJournal(record)
+}
+
+const listOutgoing = async () => {
+  const accountId = window.g.user.id
+  if (!activeBinding) await probe()
+  if (!activeBinding || activeBinding.account_id !== accountId)
+    throw new Error('Arkade outgoing binding unavailable')
+  let journal = readOutgoingJournal(accountId)
+  if (
+    journal.some(
+      record => !journalMatchesBinding(record, accountId, activeBinding)
+    )
+  )
+    throw new Error('outgoing journal binding changed')
+  journal = await reconcileTerminalOutgoing(accountId, journal)
+  if (!identity) return journal
+  const wallet = await outgoingWallet(accountId, activeBinding)
+  const manager = await wallet.getContractManager()
+  const responses = (await LNbits.api.arkadeSubmittedOutgoingIntents()).data
+  if (!Array.isArray(responses))
+    throw new Error('Arkade outgoing recovery unavailable')
+  for (const response of responses) {
+    const existing = journal.find(item => item.intentId === response?.intent_id)
+    if (existing) {
+      if (!outgoingJournalResponseMatches(existing, response, activeBinding))
+        throw new Error('Arkade outgoing intent changed')
+    } else {
+      await hydrateOutgoingJournal(
+        wallet,
+        manager,
+        response,
+        accountId,
+        activeBinding
+      )
+    }
+  }
+  journal = readOutgoingJournal(accountId)
+  return journal
+}
+
+const recoverOutgoing = async (
+  intentId: string,
+  approval?: {approved: true}
+) => {
+  const accountId = window.g.user.id
+  if (!identity || !activeBinding || activeBinding.state !== 'ready')
+    throw new Error('wallet is locked')
+  const record = readOutgoingJournal(accountId).find(
+    item => item.intentId === intentId
+  )
+  if (!record || !journalMatchesBinding(record, accountId, activeBinding))
+    throw new Error('outgoing journal unavailable')
+  const recoveryGeneration = unlockGeneration
+  const recoveryBindingFingerprint = outgoingBindingFingerprint(activeBinding)
+  const wallet = await outgoingWallet(accountId, activeBinding)
+  let manager: Awaited<ReturnType<ArkadeWallet['getContractManager']>>
+  try {
+    manager = await wallet.getContractManager()
+  } catch {
+    updateOutgoingJournalPhase(accountId, intentId, 'reconciliation_required')
+    return {intentId, phase: 'reconciliation_required' as const}
+  }
+  if (
+    !manager ||
+    typeof manager.refreshVtxos !== 'function' ||
+    typeof manager.annotateVtxos !== 'function'
+  ) {
+    updateOutgoingJournalPhase(accountId, intentId, 'reconciliation_required')
+    return {intentId, phase: 'reconciliation_required' as const}
+  }
+  const scripts = [
+    ...record.inputs.map(input => input.script),
+    ...(record.change ? [record.change.script] : [])
+  ]
+  try {
+    await manager.refreshVtxos({scripts: [...new Set(scripts)]})
+  } catch {
+    updateOutgoingJournalPhase(accountId, intentId, 'reconciliation_required')
+    return {intentId, phase: 'reconciliation_required' as const}
+  }
+  let response: any
+  try {
+    response = (await LNbits.api.arkadeOutgoingIntent(intentId)).data
+  } catch {
+    updateOutgoingJournalPhase(accountId, intentId, 'reconciliation_required')
+    return {intentId, phase: 'reconciliation_required' as const}
+  }
+  if (!outgoingJournalResponseBindingMatches(record, response, activeBinding)) {
+    updateOutgoingJournalPhase(accountId, intentId, 'reconciliation_required')
+    return {intentId, phase: 'reconciliation_required' as const}
+  }
+  if (response.status === 'reserved')
+    return {intentId, status: response.status, phase: record.phase}
+  if (response.status === 'released') {
+    if (releasedOutgoingJournalMatches(record, response, activeBinding)) {
+      removeOutgoingJournal(accountId, intentId)
+      return {intentId, status: response.status, reconciliationRequired: false}
+    }
+    updateOutgoingJournalPhase(accountId, intentId, 'reconciliation_required')
+    return {intentId, phase: 'reconciliation_required' as const}
+  }
+  if (!outgoingJournalResponseMatches(record, response, activeBinding)) {
+    updateOutgoingJournalPhase(accountId, intentId, 'reconciliation_required')
+    return {intentId, phase: 'reconciliation_required' as const}
+  }
+  if (response.status === 'settled') {
+    removeOutgoingJournal(accountId, intentId)
+    return {intentId, status: response.status, reconciliationRequired: false}
+  }
+  if (response.status === 'disputed') {
+    updateOutgoingJournalPhase(accountId, intentId, 'reconciliation_required')
+    return {
+      intentId,
+      status: response.status,
+      reconciliationRequired: true
+    }
+  }
+  if (response.status !== 'submitted') {
+    updateOutgoingJournalPhase(accountId, intentId, 'reconciliation_required')
+    return {intentId, phase: 'reconciliation_required' as const}
+  }
+  let allVtxos: any[]
+  let inputs: SpendableVtxo[]
+  try {
+    allVtxos = await fetchExactOutgoingVtxos(wallet, manager, record.inputs)
+    inputs = exactOutgoingVtxos(allVtxos, record)
+    if (
+      outgoingRecoveryPreview(wallet, record, inputs).commitment !==
+      record.previewCommitment
+    )
+      throw new Error('outgoing journal commitment mismatch')
+  } catch {
+    updateOutgoingJournalPhase(accountId, intentId, 'reconciliation_required')
+    return {intentId, phase: 'reconciliation_required' as const}
+  }
+  if (!approval || approval.approved !== true)
+    throw new Error('Arkade outgoing recovery approval required')
+  if (
+    !outgoingContextIsLive(
+      accountId,
+      recoveryGeneration,
+      recoveryBindingFingerprint
+    )
+  ) {
+    updateOutgoingJournalPhase(accountId, intentId, 'reconciliation_required')
+    return {intentId, phase: 'reconciliation_required' as const}
+  }
+  let finalization: {finalized: string[]; pending: string[]}
+  let finalizationError = false
+  try {
+    finalization = await wallet.finalizePendingTxs(inputs)
+  } catch {
+    finalizationError = true
+    finalization = {finalized: [], pending: []}
+  }
+  try {
+    await manager.refreshVtxos({scripts: [...new Set(scripts)]})
+  } catch {
+    updateOutgoingJournalPhase(accountId, intentId, 'reconciliation_required')
+    return {intentId, phase: 'reconciliation_required' as const}
+  }
+  try {
+    response = (await LNbits.api.arkadeOutgoingIntent(intentId)).data
+  } catch {
+    updateOutgoingJournalPhase(accountId, intentId, 'reconciliation_required')
+    return {intentId, phase: 'reconciliation_required' as const}
+  }
+  if (!outgoingJournalResponseMatches(record, response, activeBinding)) {
+    updateOutgoingJournalPhase(accountId, intentId, 'reconciliation_required')
+    return {intentId, phase: 'reconciliation_required' as const}
+  }
+  if (response.status === 'settled') {
+    removeOutgoingJournal(accountId, intentId)
+    return {intentId, status: response.status, reconciliationRequired: false}
+  }
+  if (response.status === 'disputed') {
+    updateOutgoingJournalPhase(accountId, intentId, 'reconciliation_required')
+    return {
+      intentId,
+      status: response.status,
+      reconciliationRequired: true
+    }
+  }
+  if (
+    finalizationError ||
+    !Array.isArray(finalization?.finalized) ||
+    !Array.isArray(finalization?.pending) ||
+    finalization.finalized.length > 0 ||
+    finalization.pending.length > 0
+  ) {
+    updateOutgoingJournalPhase(accountId, intentId, 'reconciliation_required')
+    return {intentId, phase: 'reconciliation_required' as const}
+  }
+  if (response.status !== 'submitted') {
+    updateOutgoingJournalPhase(accountId, intentId, 'reconciliation_required')
+    return {intentId, phase: 'reconciliation_required' as const}
+  }
+  if (
+    !outgoingContextIsLive(
+      accountId,
+      recoveryGeneration,
+      recoveryBindingFingerprint
+    )
+  ) {
+    updateOutgoingJournalPhase(accountId, intentId, 'reconciliation_required')
+    return {intentId, phase: 'reconciliation_required' as const}
+  }
+  try {
+    const refreshed = exactOutgoingVtxos(
+      await fetchExactOutgoingVtxos(wallet, manager, record.inputs),
+      record
+    )
+    const {outputs} = outgoingRecoveryArtifacts(wallet, record, refreshed)
+    if (
+      !outgoingContextIsLive(
+        accountId,
+        recoveryGeneration,
+        recoveryBindingFingerprint
+      )
+    )
+      throw new Error('Arkade outgoing recovery is locked')
+    const result = await wallet.buildAndSubmitOffchainTx(
+      refreshed,
+      outputs,
+      wallet.serverUnrollScript
+    )
+    updateOutgoingJournalPhase(accountId, intentId, 'submitted')
+    return {
+      status: 'submitted' as const,
+      reconciliationRequired: true as const,
+      intentId,
+      arkTxid: result.arkTxid
+    }
+  } catch {
+    updateOutgoingJournalPhase(accountId, intentId, 'reconciliation_required')
+    return {intentId, phase: 'reconciliation_required' as const}
+  }
+}
+
+const recoverOutgoingSerialized = (
+  intentId: string,
+  approval?: {approved: true}
+) => {
+  const key = `${window.g.user.id}:${intentId}`
+  const existing = outgoingRecoveries.get(key)
+  if (existing) return existing
+  const recovery = recoverOutgoing(intentId, approval).finally(() => {
+    if (outgoingRecoveries.get(key) === recovery) outgoingRecoveries.delete(key)
+  })
+  outgoingRecoveries.set(key, recovery)
+  return recovery
 }
 
 const probe = async () => {
@@ -1261,6 +2074,12 @@ window.ArkadeEnrollment = {
   },
   async submitOutgoing(prepared: OutgoingPrepared, approval: {approved: true}) {
     return submitOutgoing(prepared, approval)
+  },
+  async listOutgoing() {
+    return listOutgoing()
+  },
+  async recoverOutgoing(intentId: string, approval?: {approved: true}) {
+    return recoverOutgoingSerialized(intentId, approval)
   },
   async binding() {
     return activeBinding

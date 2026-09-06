@@ -64,11 +64,17 @@ async def test_outgoing_api_requires_auth_for_get_and_authorize():
         transport=ASGITransport(app=app), base_url="http://test"
     ) as client:
         get_response = await client.get(f"/api/v1/arkade/outgoing/{INTENT_ID}")
+        list_response = await client.get("/api/v1/arkade/outgoing")
         post_response = await client.post(
             f"/api/v1/arkade/outgoing/{INTENT_ID}/authorize", json=_authorize_body()
         )
+        release_response = await client.post(
+            f"/api/v1/arkade/outgoing/{INTENT_ID}/release"
+        )
     assert get_response.status_code == 401
+    assert list_response.status_code == 401
     assert post_response.status_code == 401
+    assert release_response.status_code == 401
 
 
 @pytest.mark.anyio
@@ -82,17 +88,33 @@ async def test_outgoing_api_isolation_and_canonical_response(monkeypatch):
         "lnbits.core.views.arkade_api.authorize_arkade_outgoing",
         AsyncMock(return_value=_response()),
     )
+    release = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "lnbits.core.views.arkade_api.release_arkade_outgoing_payment", release
+    )
+    listed = AsyncMock(return_value=[_response()])
+    monkeypatch.setattr(
+        "lnbits.core.views.arkade_api.list_arkade_submitted_outgoing_intents",
+        listed,
+    )
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"
     ) as client:
         response = await client.get(f"/api/v1/arkade/outgoing/{INTENT_ID}")
+        list_response = await client.get("/api/v1/arkade/outgoing?limit=1")
         authorized = await client.post(
             f"/api/v1/arkade/outgoing/{INTENT_ID}/authorize", json=_authorize_body()
         )
+        released = await client.post(f"/api/v1/arkade/outgoing/{INTENT_ID}/release")
     assert response.status_code == 200
+    assert list_response.status_code == 200
+    listed.assert_awaited_once_with(ACCOUNT_ID, 1)
     assert response.json()["action"] == "lnbits-arkade-outgoing-v1"
     assert response.json()["inputs"][0]["txid"] == TXID
     assert authorized.status_code == 200
+    assert released.status_code == 200
+    assert released.json()["success"] is True
+    release.assert_awaited_once_with(ACCOUNT_ID, INTENT_ID)
 
     foreign = _app(Account(id=OTHER_ACCOUNT_ID))
     not_found = AsyncMock(side_effect=ArkadeOutgoingError("ARKADE_OUTGOING_NOT_FOUND"))
@@ -147,6 +169,17 @@ async def test_outgoing_api_rejects_malformed_authorization_body(payload):
 
 
 @pytest.mark.anyio
+async def test_outgoing_api_bounds_recovery_enumeration():
+    app = _app(Account(id=ACCOUNT_ID))
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        low = await client.get("/api/v1/arkade/outgoing?limit=0")
+        high = await client.get("/api/v1/arkade/outgoing?limit=33")
+    assert low.status_code == high.status_code == 422
+
+
+@pytest.mark.anyio
 async def test_outgoing_api_sanitizes_internal_service_errors(monkeypatch):
     app = _app(Account(id=ACCOUNT_ID))
     error = AsyncMock(side_effect=ArkadeOutgoingError("upstream secret"))
@@ -157,6 +190,10 @@ async def test_outgoing_api_sanitizes_internal_service_errors(monkeypatch):
         "lnbits.core.views.arkade_api.authorize_arkade_outgoing",
         AsyncMock(side_effect=ArkadeOutgoingError("upstream secret")),
     )
+    monkeypatch.setattr(
+        "lnbits.core.views.arkade_api.release_arkade_outgoing_payment",
+        AsyncMock(side_effect=ArkadeOutgoingError("upstream secret")),
+    )
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"
     ) as client:
@@ -164,12 +201,17 @@ async def test_outgoing_api_sanitizes_internal_service_errors(monkeypatch):
         post_response = await client.post(
             f"/api/v1/arkade/outgoing/{INTENT_ID}/authorize", json=_authorize_body()
         )
+        release_response = await client.post(
+            f"/api/v1/arkade/outgoing/{INTENT_ID}/release"
+        )
     assert get_response.status_code == post_response.status_code == 400
+    assert release_response.status_code == 400
     assert (
         get_response.json()["detail"]
         == post_response.json()["detail"]
         == "ARKADE_OUTGOING_ERROR"
     )
+    assert release_response.json()["detail"] == "ARKADE_OUTGOING_ERROR"
 
 
 @pytest.mark.anyio

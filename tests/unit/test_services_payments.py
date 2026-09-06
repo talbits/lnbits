@@ -379,6 +379,24 @@ async def test_update_wallet_balance_validates_credit_and_debit(
 
 
 @pytest.mark.anyio
+async def test_update_wallet_balance_rejects_arkade_admin_debit(
+    settings: Settings, monkeypatch
+):
+    wallet = Wallet(
+        id=uuid4().hex,
+        user=uuid4().hex,
+        name="test",
+        adminkey="admin",
+        inkey="invoice",
+    )
+    monkeypatch.setattr(
+        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
+    )
+    with pytest.raises(ValueError, match="ARKADE_BALANCE_SET_UNSUPPORTED"):
+        await update_wallet_balance(wallet, -1)
+
+
+@pytest.mark.anyio
 async def test_check_wallet_limits_and_time_limit(
     settings: Settings, mocker: MockerFixture
 ):

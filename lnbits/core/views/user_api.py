@@ -405,6 +405,8 @@ async def api_users_delete_user_wallet(
     dependencies=[Depends(check_super_user)],
 )
 async def api_update_balance(data: UpdateBalance) -> SimpleStatus:
+    if settings.lnbits_effective_installation_mode == "arkade_noncustodial":
+        raise HTTPException(HTTPStatus.FORBIDDEN, "ARKADE_BALANCE_SET_UNSUPPORTED")
     wallet = await get_wallet(data.id)
     if not wallet:
         raise HTTPException(HTTPStatus.NOT_FOUND, "Wallet not found.")

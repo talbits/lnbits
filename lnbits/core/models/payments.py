@@ -322,6 +322,7 @@ class CreateInvoice(BaseModel):
     extension: str | None = None
     webhook: str | None = None
     bolt11: str | None = None
+    arkade_address: str | None = Query(default=None, min_length=1, max_length=1023)
     lnurl_withdraw: LnurlWithdrawResponse | None = None
     fiat_provider: str | None = None
     labels: list[str] = []

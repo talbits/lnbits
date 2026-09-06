@@ -205,6 +205,33 @@
           </div>
         </q-card-section>
       </q-card>
+      <q-card v-if="arkadeRecovery.length" class="wallet-card">
+        <q-card-section>
+          <div class="text-subtitle1">Arkade outgoing recovery</div>
+          <div class="text-caption q-mb-sm">
+            An outgoing payment needs wallet recovery before it can finish.
+          </div>
+          <div
+            v-for="record in arkadeRecovery"
+            :key="record.intentId"
+            class="row items-center q-gutter-sm q-mb-sm"
+          >
+            <div class="col">
+              <div
+                v-text="`${record.amountSat} sat to ${record.destination}`"
+              ></div>
+              <div class="text-caption" v-text="record.intentId"></div>
+            </div>
+            <q-btn
+              color="primary"
+              outline
+              label="Recover"
+              :disable="arkadeRecoveryBusy"
+              @click="recoverArkadeOutgoing(record)"
+            ></q-btn>
+          </div>
+        </q-card-section>
+      </q-card>
       <q-card class="wallet-card">
         <q-card-section>
           <lnbits-payment-list
@@ -689,7 +716,45 @@
 
   <q-dialog v-model="parse.show" @hide="closeParseDialog" position="top">
     <q-card class="q-pa-lg q-pt-xl lnbits__dialog-card">
-      <div v-if="parse.invoice">
+      <div v-if="parse.arkade">
+        <h6 class="q-mt-none">Arkade payment</h6>
+        <q-input
+          filled
+          dense
+          readonly
+          autogrow
+          v-model="parse.arkade.address"
+          label="Arkade address"
+        ></q-input>
+        <q-input
+          filled
+          dense
+          class="q-mt-md"
+          v-model.number="parse.arkade.amount"
+          type="number"
+          min="1"
+          step="1"
+          suffix="sat"
+          label="Amount"
+        ></q-input>
+        <div class="row q-mt-lg">
+          <q-btn
+            unelevated
+            color="primary"
+            @click="payArkade"
+            :disable="!canPay || parse.sending"
+            :label="parse.sending ? $t('sending') + '...' : $t('pay')"
+          ></q-btn>
+          <q-btn
+            v-close-popup
+            flat
+            color="grey"
+            class="q-ml-auto"
+            :label="$t('cancel')"
+          ></q-btn>
+        </div>
+      </div>
+      <div v-else-if="parse.invoice">
         <div class="column content-center text-center q-mb-md">
           <div v-if="!g.isFiatPriority">
             <h4 class="q-my-none text-bold">

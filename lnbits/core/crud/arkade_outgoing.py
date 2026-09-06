@@ -6,7 +6,7 @@ from lnbits.core.models.arkade import (
     ArkadeOutgoingIntent,
     ArkadeOutgoingIntentInput,
 )
-from lnbits.db import Connection
+from lnbits.db import SQLITE, Connection
 
 _TRANSITIONS = {
     ("reserved", "submitted"),
@@ -67,6 +67,7 @@ async def get_arkade_submitted_outgoing_intents(
     limit: int = 100,
     conn: Connection | None = None,
     after_intent_id: str | None = None,
+    account_id: str | None = None,
 ) -> list[ArkadeOutgoingIntent]:
     if not 1 <= limit <= 100:
         raise ValueError("ARKADE_OUTGOING_BATCH_INVALID")
@@ -76,6 +77,9 @@ async def get_arkade_submitted_outgoing_intents(
         raise ValueError("ARKADE_OUTGOING_CURSOR_INVALID")
     where = "status = 'submitted'"
     values: dict[str, str | int] = {"limit": limit}
+    if account_id is not None:
+        where += " AND account_id = :account_id"
+        values["account_id"] = account_id
     if after_intent_id is not None:
         where += " AND intent_id > :after_intent_id"
         values["after_intent_id"] = after_intent_id
@@ -101,6 +105,10 @@ async def create_arkade_outgoing_intent(
     intent: ArkadeOutgoingIntent, conn: Connection
 ) -> ArkadeOutgoingIntent:
     connection = _require_active_transaction(conn)
+    if connection.type == SQLITE:
+        intent = intent.copy(
+            update={"expires_at": intent.expires_at.replace(microsecond=0)}
+        )
     if intent.status != "reserved" or any(
         getattr(intent, field) is not None
         for field in (

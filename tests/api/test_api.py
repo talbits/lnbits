@@ -2,6 +2,8 @@ import asyncio
 import hashlib
 import ipaddress
 import json
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
@@ -10,8 +12,9 @@ import shortuuid
 from pytest_mock.plugin import MockerFixture
 
 from lnbits import bolt11
-from lnbits.core.models import CreateInvoice, Payment
+from lnbits.core.models import ArkadeOutgoingIntent, CreateInvoice, Payment
 from lnbits.core.models.users import Account, UserExtra, UserLabel
+from lnbits.core.services.arkade import ArkadeOutgoingError, arkade_internal_transfer_id
 from lnbits.core.services.users import create_user_account
 from lnbits.core.views.payment_api import api_payment
 from lnbits.fiat.base import FiatInvoiceResponse
@@ -225,6 +228,468 @@ async def test_create_custodial_invoice_keeps_created_response(
     assert body["payment_hash"] == "11" * 32
     assert body["bolt11"] == "bolt11"
     assert "browser_required" not in body
+
+
+@pytest.mark.anyio
+async def test_create_arkade_outgoing_is_retry_safe_and_requires_whole_sats(
+    client,
+    adminkey_headers_to,
+    inkey_headers_to,
+    to_wallet,
+    settings: Settings,
+    mocker: MockerFixture,
+):
+    settings.lnbits_effective_installation_mode = "arkade_noncustodial"
+    mocker.patch("lnbits.decorators.require_arkade_ready", mocker.AsyncMock())
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=10)
+    stored = ArkadeOutgoingIntent(
+        intent_id="00" * 16,
+        account_id=to_wallet.user,
+        wallet_id=to_wallet.id,
+        amount_msat=42_000,
+        destination="tark1destination",
+        expires_at=expires_at,
+    )
+    existing = mocker.patch(
+        "lnbits.core.views.payment_api.get_arkade_outgoing_intent",
+        mocker.AsyncMock(side_effect=[None, stored]),
+    )
+
+    async def reserve(account_id, intent):
+        payment = Payment(
+            checking_id=None,
+            payment_hash=None,
+            wallet_id=to_wallet.id,
+            amount=-42_000,
+            fee=0,
+            bolt11=None,
+            protocol="arkade",
+            native_id=intent.intent_id,
+            arkade_address=intent.destination,
+        )
+        return intent, payment
+
+    reservation = mocker.patch(
+        "lnbits.core.views.payment_api.reserve_arkade_outgoing_intent",
+        side_effect=reserve,
+    )
+    headers = {**adminkey_headers_to, "Idempotency-Key": "ab" * 16}
+    body = {
+        "out": True,
+        "unit": "sat",
+        "amount": 42,
+        "arkade_address": "tark1destination",
+    }
+    first = await client.post("/api/v1/payments", json=body, headers=headers)
+    second = await client.post("/api/v1/payments", json=body, headers=headers)
+    fractional = await client.post(
+        "/api/v1/payments", json={**body, "amount": 1.5}, headers=headers
+    )
+    invoice_key = await client.post(
+        "/api/v1/payments",
+        json=body,
+        headers={**inkey_headers_to, "Idempotency-Key": "ab" * 16},
+    )
+
+    assert first.status_code == second.status_code == 202
+    assert first.json()["intent_id"] == second.json()["intent_id"]
+    assert first.json()["native_id"] == first.json()["intent_id"]
+    assert first.json()["browser_required"] is True
+    assert reservation.await_args_list[1].args[1].expires_at == expires_at
+    assert fractional.status_code == 400
+    assert fractional.json()["detail"] == "ARKADE_OUTGOING_AMOUNT_INVALID"
+    assert invoice_key.status_code == 403
+    assert existing.await_count == reservation.await_count == 2
+
+    race_calls = 0
+
+    async def race_reserve(account_id, intent):
+        nonlocal race_calls
+        race_calls += 1
+        if race_calls == 1:
+            raise ArkadeOutgoingError("ARKADE_OUTGOING_IDEMPOTENCY_CONFLICT")
+        return await reserve(account_id, intent)
+
+    existing.side_effect = [None, stored]
+    reservation.side_effect = race_reserve
+    raced = await client.post(
+        "/api/v1/payments",
+        json=body,
+        headers={**adminkey_headers_to, "Idempotency-Key": "ef" * 16},
+    )
+    assert raced.status_code == 202
+    assert reservation.await_args_list[-1].args[1].expires_at == expires_at
+
+    existing.side_effect = [None]
+    reservation.side_effect = ArkadeOutgoingError("ARKADE_PRIVATE_DETAIL")
+    sanitized = await client.post(
+        "/api/v1/payments",
+        json=body,
+        headers={**adminkey_headers_to, "Idempotency-Key": "cd" * 16},
+    )
+    assert sanitized.status_code == 400
+    assert sanitized.json()["detail"] == "ARKADE_OUTGOING_ERROR"
+
+
+@pytest.mark.anyio
+async def test_create_arkade_same_account_transfer_uses_terminal_pair(
+    client,
+    adminkey_headers_to,
+    to_wallet,
+    settings: Settings,
+    mocker: MockerFixture,
+):
+    settings.lnbits_effective_installation_mode = "arkade_noncustodial"
+    mocker.patch("lnbits.decorators.require_arkade_ready", mocker.AsyncMock())
+    destination = "tark1registered"
+    sender = Payment(
+        checking_id=None,
+        payment_hash=None,
+        wallet_id=to_wallet.id,
+        amount=-42_000,
+        fee=0,
+        bolt11=None,
+        protocol="arkade",
+        native_id="aa" * 16,
+        arkade_address=destination,
+        status="success",
+    )
+    receiver = sender.copy(
+        update={
+            "wallet_id": to_wallet.id,
+            "amount": 42_000,
+            "native_id": "bb" * 16,
+        }
+    )
+    mapping = mocker.patch(
+        "lnbits.core.views.payment_api.get_arkade_receive_request_by_destination",
+        AsyncMock(return_value=SimpleNamespace(account_id=to_wallet.user)),
+    )
+    transfer = mocker.patch(
+        "lnbits.core.views.payment_api.settle_arkade_same_account_transfer",
+        AsyncMock(return_value=(sender, receiver)),
+    )
+    reserve = mocker.patch(
+        "lnbits.core.views.payment_api.reserve_arkade_outgoing_intent"
+    )
+
+    first = await client.post(
+        "/api/v1/payments",
+        json={"out": True, "unit": "sat", "amount": 42, "arkade_address": destination},
+        headers={**adminkey_headers_to, "Idempotency-Key": "11" * 16},
+    )
+    second = await client.post(
+        "/api/v1/payments",
+        json={"out": True, "unit": "sat", "amount": 42, "arkade_address": destination},
+        headers={**adminkey_headers_to, "Idempotency-Key": "22" * 16},
+    )
+
+    assert first.status_code == second.status_code == 201
+    assert first.json()["status"] == second.json()["status"] == "success"
+    assert first.json()["transfer_id"] == second.json()["transfer_id"] == "aa" * 16
+    assert first.json()["receiver_native_id"] == "bb" * 16
+    assert mapping.await_count == 2
+    assert transfer.await_count == 2
+    assert reserve.await_count == 0
+
+
+@pytest.mark.anyio
+async def test_registered_foreign_arkade_transfer_uses_receiver_identity(
+    client,
+    adminkey_headers_to,
+    to_wallet,
+    settings: Settings,
+    mocker: MockerFixture,
+):
+    settings.lnbits_effective_installation_mode = "arkade_noncustodial"
+    mocker.patch("lnbits.decorators.require_arkade_ready", mocker.AsyncMock())
+    destination = "tark1foreign"
+    receive_request = SimpleNamespace(
+        account_id="ff" * 16,
+        native_request_id="33" * 16,
+        amount_sat=42,
+        address=destination,
+        wallet_id="ee" * 16,
+        state="acknowledged",
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+    )
+    mocker.patch(
+        "lnbits.core.views.payment_api.get_arkade_receive_request_by_destination",
+        AsyncMock(return_value=receive_request),
+    )
+    mocker.patch(
+        "lnbits.core.views.payment_api.get_payment_by_native_id",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                protocol="arkade",
+                native_id=receive_request.native_request_id,
+                wallet_id=receive_request.wallet_id,
+                amount=42_000,
+                fee=0,
+                arkade_address=destination,
+                status="pending",
+            )
+        ),
+    )
+    same_account = mocker.patch(
+        "lnbits.core.views.payment_api.settle_arkade_same_account_transfer"
+    )
+    intent_ids = []
+
+    async def reserve(account_id, intent, **kwargs):
+        assert kwargs == {
+            "receiver_account_id": receive_request.account_id,
+            "receiver_native_request_id": receive_request.native_request_id,
+        }
+        intent_ids.append(intent.intent_id)
+        return intent, Payment(
+            checking_id=None,
+            payment_hash=None,
+            wallet_id=to_wallet.id,
+            amount=-42_000,
+            fee=0,
+            bolt11=None,
+            protocol="arkade",
+            native_id=intent.intent_id,
+            arkade_address=intent.destination,
+        )
+
+    reservation = mocker.patch(
+        "lnbits.core.views.payment_api.reserve_arkade_outgoing_intent",
+        side_effect=reserve,
+    )
+    body = {
+        "out": True,
+        "unit": "sat",
+        "amount": 42,
+        "arkade_address": destination,
+    }
+    first = await client.post(
+        "/api/v1/payments",
+        json=body,
+        headers={**adminkey_headers_to, "Idempotency-Key": "11" * 16},
+    )
+    second = await client.post(
+        "/api/v1/payments",
+        json=body,
+        headers={**adminkey_headers_to, "Idempotency-Key": "22" * 16},
+    )
+
+    expected_id = arkade_internal_transfer_id(receive_request.native_request_id)
+    assert first.status_code == second.status_code == 202
+    assert intent_ids == [expected_id, expected_id]
+    assert first.json()["intent_id"] == second.json()["intent_id"] == expected_id
+    assert reservation.await_count == 2
+    same_account.assert_not_awaited()
+    assert receive_request.state == "acknowledged"
+
+
+@pytest.mark.anyio
+async def test_released_foreign_transfer_requires_fresh_receiver_request(
+    client,
+    adminkey_headers_to,
+    to_wallet,
+    settings: Settings,
+    mocker: MockerFixture,
+):
+    settings.lnbits_effective_installation_mode = "arkade_noncustodial"
+    mocker.patch("lnbits.decorators.require_arkade_ready", mocker.AsyncMock())
+    destination = "tark1foreign"
+    receive_request = SimpleNamespace(
+        account_id="ff" * 16,
+        native_request_id="33" * 16,
+        amount_sat=42,
+        address=destination,
+        wallet_id="ee" * 16,
+        state="acknowledged",
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+    )
+    mocker.patch(
+        "lnbits.core.views.payment_api.get_arkade_receive_request_by_destination",
+        AsyncMock(return_value=receive_request),
+    )
+    mocker.patch(
+        "lnbits.core.views.payment_api.get_payment_by_native_id",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                protocol="arkade",
+                native_id=receive_request.native_request_id,
+                wallet_id=receive_request.wallet_id,
+                amount=42_000,
+                fee=0,
+                arkade_address=destination,
+                status="pending",
+            )
+        ),
+    )
+    intent = ArkadeOutgoingIntent(
+        intent_id=arkade_internal_transfer_id(receive_request.native_request_id),
+        account_id=to_wallet.user,
+        wallet_id=to_wallet.id,
+        amount_msat=42_000,
+        destination=destination,
+        expires_at=receive_request.expires_at,
+    )
+    payment = Payment(
+        checking_id=None,
+        payment_hash=None,
+        wallet_id=to_wallet.id,
+        amount=-42_000,
+        fee=0,
+        bolt11=None,
+        protocol="arkade",
+        native_id=intent.intent_id,
+        arkade_address=destination,
+    )
+    existing = mocker.patch(
+        "lnbits.core.views.payment_api.get_arkade_outgoing_intent",
+        AsyncMock(side_effect=[None, SimpleNamespace(status="released")]),
+    )
+    reservation = mocker.patch(
+        "lnbits.core.views.payment_api.reserve_arkade_outgoing_intent",
+        AsyncMock(return_value=(intent, payment)),
+    )
+    body = {
+        "out": True,
+        "unit": "sat",
+        "amount": 42,
+        "arkade_address": destination,
+    }
+
+    first = await client.post(
+        "/api/v1/payments",
+        json=body,
+        headers={**adminkey_headers_to, "Idempotency-Key": "11" * 16},
+    )
+    retry = await client.post(
+        "/api/v1/payments",
+        json=body,
+        headers={**adminkey_headers_to, "Idempotency-Key": "22" * 16},
+    )
+
+    assert first.status_code == 202
+    assert retry.status_code == 400
+    assert retry.json()["detail"] == "ARKADE_TRANSFER_REQUEST_CONSUMED"
+    assert reservation.await_count == 1
+    assert existing.await_count == 2
+    assert receive_request.state == "acknowledged"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("state", "amount_sat", "expired", "detail"),
+    [
+        ("pending", 42, False, "ARKADE_TRANSFER_MAPPING_NOT_READY"),
+        ("acknowledged", 41, False, "ARKADE_TRANSFER_AMOUNT_CONFLICT"),
+        ("acknowledged", 42, True, "ARKADE_TRANSFER_EXPIRED"),
+    ],
+)
+async def test_registered_foreign_arkade_transfer_rejects_invalid_mapping(
+    client,
+    adminkey_headers_to,
+    settings: Settings,
+    mocker: MockerFixture,
+    state,
+    amount_sat,
+    expired,
+    detail,
+):
+    settings.lnbits_effective_installation_mode = "arkade_noncustodial"
+    mocker.patch("lnbits.decorators.require_arkade_ready", mocker.AsyncMock())
+    mocker.patch(
+        "lnbits.core.views.payment_api.get_arkade_receive_request_by_destination",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                account_id="ff" * 16,
+                native_request_id="44" * 16,
+                amount_sat=amount_sat,
+                address="tark1foreign",
+                state=state,
+                expires_at=(
+                    datetime.now(timezone.utc) - timedelta(minutes=1)
+                    if expired
+                    else datetime.now(timezone.utc) + timedelta(minutes=10)
+                ),
+            )
+        ),
+    )
+    reservation = mocker.patch(
+        "lnbits.core.views.payment_api.reserve_arkade_outgoing_intent"
+    )
+
+    response = await client.post(
+        "/api/v1/payments",
+        json={
+            "out": True,
+            "unit": "sat",
+            "amount": 42,
+            "arkade_address": "tark1foreign",
+        },
+        headers={**adminkey_headers_to, "Idempotency-Key": "55" * 16},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == detail
+    reservation.assert_not_awaited()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("status", ["success", "failed"])
+async def test_registered_foreign_arkade_transfer_requires_pending_receiver(
+    client,
+    adminkey_headers_to,
+    settings: Settings,
+    mocker: MockerFixture,
+    status,
+):
+    settings.lnbits_effective_installation_mode = "arkade_noncustodial"
+    mocker.patch("lnbits.decorators.require_arkade_ready", mocker.AsyncMock())
+    destination = "tark1foreign"
+    request = SimpleNamespace(
+        account_id="ff" * 16,
+        native_request_id="66" * 16,
+        wallet_id="ee" * 16,
+        amount_sat=42,
+        address=destination,
+        state="acknowledged",
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+    )
+    mocker.patch(
+        "lnbits.core.views.payment_api.get_arkade_receive_request_by_destination",
+        AsyncMock(return_value=request),
+    )
+    mocker.patch(
+        "lnbits.core.views.payment_api.get_payment_by_native_id",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                protocol="arkade",
+                native_id=request.native_request_id,
+                wallet_id=request.wallet_id,
+                amount=42_000,
+                fee=0,
+                arkade_address=destination,
+                status=status,
+            )
+        ),
+    )
+    reservation = mocker.patch(
+        "lnbits.core.views.payment_api.reserve_arkade_outgoing_intent"
+    )
+
+    response = await client.post(
+        "/api/v1/payments",
+        json={
+            "out": True,
+            "unit": "sat",
+            "amount": 42,
+            "arkade_address": destination,
+        },
+        headers={**adminkey_headers_to, "Idempotency-Key": "77" * 16},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "ARKADE_TRANSFER_RECEIVER_INVALID"
+    reservation.assert_not_awaited()
 
 
 @pytest.mark.anyio

@@ -575,9 +575,13 @@ async def check_pending_payments():  # noqa: C901
             submitted_intents = await get_arkade_submitted_outgoing_intents()
         for intent in submitted_intents:
             try:
-                await reconcile_arkade_outgoing_intent(
+                result = await reconcile_arkade_outgoing_intent(
                     intent.intent_id, intent.account_id
                 )
+                if result and result.status == "verified":
+                    payment = await get_payment_by_native_id(intent.intent_id)
+                    if payment and payment.success:
+                        task_manager.invoice_queue.put_nowait(payment)
             except ArkadeReceiveError as exc:
                 logger.warning(
                     f"Task: Arkade outgoing check failed for intent "
@@ -691,6 +695,8 @@ async def update_wallet_balance(
     memo: str | None = None,
     conn: Connection | None = None,
 ):
+    if settings.lnbits_effective_installation_mode == "arkade_noncustodial":
+        raise ValueError("ARKADE_BALANCE_SET_UNSUPPORTED")
     if amount == 0:
         raise ValueError("Amount cannot be 0.")
 

@@ -10,7 +10,11 @@ from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 
 import lnbits.db as db_module
 from lnbits.core import migrations
-from lnbits.core.crud.wallets import delete_unused_wallets, remove_deleted_wallets
+from lnbits.core.crud import wallets
+from lnbits.core.crud.wallets import (
+    delete_unused_wallets,
+    remove_deleted_wallets,
+)
 from lnbits.core.models import (
     ArkadeIndexerVtxo,
     ArkadeReceiveAcknowledgement,
@@ -46,10 +50,13 @@ async def connection(monkeypatch):
             {"id": WALLET_ID, "user": ACCOUNT_ID},
         )
         await connection.execute(
-            "CREATE TABLE apipayments (wallet_id TEXT, native_id TEXT)"
+            "CREATE TABLE apipayments ("
+            "wallet_id TEXT, native_id TEXT, amount INT, fee INT, status TEXT)"
         )
         await migrations.m052_create_arkade_account_bindings_table(connection)
         await migrations.m053_create_arkade_receive_tables(connection)
+        await migrations.m055_create_arkade_outgoing_tables(connection)
+        await migrations.m057_add_arkade_outgoing_outputs(connection)
         now = datetime.now(timezone.utc)
         await connection.execute(
             "INSERT INTO arkade_account_bindings "
@@ -164,6 +171,42 @@ async def _create(
     )
 
 
+async def _settled_outgoing_with_change(
+    connection, *, input_txid: str, input_amount_sat: int, change_amount_sat: int
+):
+    intent_id = "da" * 16
+    arkade_txid = "db" * 32
+    now = datetime.now(timezone.utc)
+    await connection.execute(
+        "INSERT INTO arkade_outgoing_intents ("
+        "intent_id, account_id, wallet_id, amount_msat, max_fee_msat, "
+        "destination, destination_kind, status, arkade_txid, actual_fee_msat, "
+        "expires_at, reserved_at, destination_script, change_index, "
+        "change_script, change_amount_sat) VALUES ("
+        ":intent, :account, :wallet, :amount, 0, 'destination', "
+        "'arkade_address', 'settled', :arkade_txid, 0, :expires_at, :reserved_at, "
+        ":destination_script, 9, :change_script, :change_amount_sat)",
+        {
+            "intent": intent_id,
+            "account": ACCOUNT_ID,
+            "wallet": WALLET_ID,
+            "amount": (input_amount_sat - change_amount_sat) * 1000,
+            "arkade_txid": arkade_txid,
+            "expires_at": now + timedelta(hours=1),
+            "reserved_at": now,
+            "destination_script": "5120" + "dc" * 32,
+            "change_script": "5120" + "dd" * 32,
+            "change_amount_sat": change_amount_sat,
+        },
+    )
+    await connection.execute(
+        "INSERT INTO arkade_outgoing_intent_inputs "
+        "(intent_id, txid, vout, amount_sat) VALUES (:intent, :txid, 0, :amount)",
+        {"intent": intent_id, "txid": input_txid, "amount": input_amount_sat},
+    )
+    return arkade_txid, "5120" + "dd" * 32
+
+
 @pytest.mark.anyio
 async def test_receive_ack_and_duplicate_reconciliation(connection, ready_mode):
     request = await _create(connection)
@@ -240,6 +283,121 @@ async def test_mapped_wallet_survives_bulk_cleanup(connection, ready_mode):
         "SELECT id FROM wallets WHERE id = :wallet", {"wallet": WALLET_ID}
     )
     assert row and request.wallet_id == WALLET_ID
+
+
+@pytest.mark.anyio
+async def test_bulk_cleanup_reuses_arkade_deletion_guard(connection, ready_mode):
+    wallet_id = "22" * 16
+    await connection.execute(
+        'INSERT INTO wallets (id, "user", name, adminkey, inkey, deleted, '
+        "created_at, updated_at) VALUES (:wallet, :account, 'old', 'a', 'b', "
+        "true, 0, 0)",
+        {"wallet": wallet_id, "account": ACCOUNT_ID},
+    )
+    await connection.execute(
+        "INSERT INTO apipayments (wallet_id, amount, fee, status) "
+        "VALUES (:wallet, 1000, 0, 'success')",
+        {"wallet": wallet_id},
+    )
+    await remove_deleted_wallets(connection)
+    assert await connection.fetchone(
+        "SELECT id FROM wallets WHERE id = :wallet", {"wallet": wallet_id}
+    )
+
+    await connection.execute(
+        "DELETE FROM apipayments WHERE wallet_id = :wallet", {"wallet": wallet_id}
+    )
+    await connection.execute(
+        "INSERT INTO arkade_outgoing_intents ("
+        "intent_id, account_id, wallet_id, amount_msat, max_fee_msat, "
+        "destination, destination_kind, status, expires_at) VALUES ("
+        ":intent, :account, :wallet, 1000, 0, 'destination', 'arkade_address', "
+        "'submitted', :expires_at)",
+        {
+            "intent": "44" * 16,
+            "account": ACCOUNT_ID,
+            "wallet": wallet_id,
+            "expires_at": datetime.now(timezone.utc) + timedelta(days=1),
+        },
+    )
+    await remove_deleted_wallets(connection)
+    assert await connection.fetchone(
+        "SELECT id FROM wallets WHERE id = :wallet", {"wallet": wallet_id}
+    )
+
+    await connection.execute(
+        "DELETE FROM arkade_outgoing_intents WHERE wallet_id = :wallet",
+        {"wallet": wallet_id},
+    )
+    await remove_deleted_wallets(connection)
+    assert not await connection.fetchone(
+        "SELECT id FROM wallets WHERE id = :wallet", {"wallet": wallet_id}
+    )
+
+    unused_wallet_id = "33" * 16
+    await connection.execute(
+        'INSERT INTO wallets (id, "user", name, adminkey, inkey, deleted, '
+        "created_at, updated_at) VALUES (:wallet, :account, 'old', 'a', 'b', "
+        "true, 0, 0)",
+        {"wallet": unused_wallet_id, "account": ACCOUNT_ID},
+    )
+    await connection.execute(
+        "INSERT INTO arkade_outgoing_intents ("
+        "intent_id, account_id, wallet_id, amount_msat, max_fee_msat, "
+        "destination, destination_kind, status, expires_at) VALUES ("
+        ":intent, :account, :wallet, 1000, 0, 'destination', 'arkade_address', "
+        "'submitted', :expires_at)",
+        {
+            "intent": "55" * 16,
+            "account": ACCOUNT_ID,
+            "wallet": unused_wallet_id,
+            "expires_at": datetime.now(timezone.utc) + timedelta(days=1),
+        },
+    )
+    await delete_unused_wallets(0, connection)
+    assert await connection.fetchone(
+        "SELECT id FROM wallets WHERE id = :wallet", {"wallet": unused_wallet_id}
+    )
+    await connection.execute(
+        "DELETE FROM arkade_outgoing_intents WHERE wallet_id = :wallet",
+        {"wallet": unused_wallet_id},
+    )
+    await delete_unused_wallets(0, connection)
+    assert not await connection.fetchone(
+        "SELECT id FROM wallets WHERE id = :wallet", {"wallet": unused_wallet_id}
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("cleanup", [remove_deleted_wallets, delete_unused_wallets])
+async def test_cleanup_rechecks_reactivated_wallet_before_delete(
+    monkeypatch, connection, ready_mode, cleanup
+):
+    await connection.execute(
+        "UPDATE wallets SET deleted = true, updated_at = 0 WHERE id = :wallet",
+        {"wallet": WALLET_ID},
+    )
+    guard = wallets.ensure_arkade_wallet_deletion_allowed
+
+    async def interleave(wallet_id, deleted=True, conn=None):
+        await guard(wallet_id, deleted=deleted, conn=conn)
+        if deleted:
+            await connection.execute(
+                "UPDATE wallets SET deleted = false WHERE id = :wallet",
+                {"wallet": WALLET_ID},
+            )
+            await _create(connection, idempotency_key="56" * 16)
+
+    monkeypatch.setattr(wallets, "ensure_arkade_wallet_deletion_allowed", interleave)
+    if cleanup is delete_unused_wallets:
+        await cleanup(0, connection)
+    else:
+        await cleanup(connection)
+
+    row = await connection.fetchone(
+        "SELECT deleted FROM wallets WHERE id = :wallet", {"wallet": WALLET_ID}
+    )
+    assert row and not row["deleted"]
 
 
 @pytest.mark.anyio
@@ -365,6 +523,123 @@ async def test_partial_receive_remains_acknowledged(connection, ready_mode):
         request.native_request_id, connection
     )
     assert stored_request and stored_request.state == "acknowledged"
+
+
+@pytest.mark.anyio
+async def test_verified_outgoing_change_is_backing_without_income(
+    connection, ready_mode
+):
+    request = await _ack(connection, await _create(connection))
+    assert request.script
+    received = ArkadeIndexerVtxo(
+        txid="a1" * 32, vout=0, amount_sat=100, script=request.script
+    )
+    await arkade.reconcile_arkade_receive(ACCOUNT_ID, [received], conn=connection)
+    arkade_txid, change_script = await _settled_outgoing_with_change(
+        connection, input_txid=received.txid, input_amount_sat=100, change_amount_sat=60
+    )
+    spent = received.copy(
+        update={
+            "is_spent": True,
+            "spent_by": "a2" * 32,
+            "arkade_txid": arkade_txid,
+        }
+    )
+    change = ArkadeIndexerVtxo(
+        txid=arkade_txid,
+        vout=1,
+        amount_sat=60,
+        script=change_script,
+        is_preconfirmed=True,
+    )
+
+    await arkade.reconcile_arkade_receive(ACCOUNT_ID, [spent, change], conn=connection)
+
+    state = await arkade.get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
+    assert state and state.state == "ok"
+    outpoints = await connection.fetchone(
+        "SELECT COUNT(*) AS count, COALESCE(SUM(amount_sat), 0) AS total "
+        "FROM arkade_receive_outpoints WHERE account_id = :account_id",
+        {"account_id": ACCOUNT_ID},
+    )
+    assert outpoints["count"] == 1
+    assert outpoints["total"] == 100
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "divergence",
+    ["external_spend", "expiry", "height_expiry", "renewal", "missing"],
+)
+async def test_backing_divergence_holds_account(connection, ready_mode, divergence):
+    request = await _ack(connection, await _create(connection))
+    assert request.script
+    received = ArkadeIndexerVtxo(
+        txid="b1" * 32, vout=0, amount_sat=100, script=request.script
+    )
+    await arkade.reconcile_arkade_receive(ACCOUNT_ID, [received], conn=connection)
+    if divergence == "external_spend":
+        evidence = [
+            received.copy(
+                update={
+                    "is_spent": True,
+                    "spent_by": "b2" * 32,
+                    "arkade_txid": "b3" * 32,
+                }
+            )
+        ]
+    elif divergence == "expiry":
+        evidence = [
+            received.copy(
+                update={"expires_at": datetime.now(timezone.utc) - timedelta(seconds=1)}
+            )
+        ]
+    elif divergence == "height_expiry":
+        evidence = [received.copy(update={"expires_at_height": 144})]
+    elif divergence == "missing":
+        evidence = []
+    else:
+        evidence = [
+            received.copy(update={"is_swept": True}),
+            received.copy(update={"txid": "b4" * 32}),
+        ]
+
+    await arkade.reconcile_arkade_receive(ACCOUNT_ID, evidence, conn=connection)
+
+    state = await arkade.get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
+    assert state and state.state == "reconciliation_required"
+
+
+@pytest.mark.anyio
+async def test_fresh_backing_fetch_includes_settled_change_script(
+    connection, ready_mode, monkeypatch
+):
+    _, change_script = await _settled_outgoing_with_change(
+        connection, input_txid="c1" * 32, input_amount_sat=100, change_amount_sat=60
+    )
+    requested_scripts = []
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"vtxos": [], "page": {"current": 1, "next": 0, "total": 0}}
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, _url, *, params):
+            requested_scripts.extend(value for key, value in params if key == "scripts")
+            return Response()
+
+    monkeypatch.setattr(arkade.httpx, "AsyncClient", lambda **_kwargs: Client())
+    assert await arkade.fetch_arkade_indexer_vtxos(ACCOUNT_ID, connection) == []
+    assert change_script in requested_scripts
 
 
 @pytest.mark.anyio
@@ -676,6 +951,32 @@ async def test_indexer_chunks_32_scripts(connection, ready_mode, monkeypatch):
 
 
 def test_indexer_parser_rejects_unpinned_shapes():
+    assert (
+        arkade.parse_indexer_vtxos(
+            {"vtxos": [], "page": {"current": 1, "next": 0, "total": 0}}
+        )
+        == []
+    )
+    with pytest.raises(arkade.ArkadeReceiveError, match="INVALID_RESPONSE"):
+        arkade.parse_indexer_vtxos(
+            {
+                "vtxos": [
+                    {
+                        "outpoint": {"txid": "aa" * 32, "vout": 0},
+                        "amount": "1",
+                        "script": "51",
+                        "isPreconfirmed": False,
+                        "isSpent": False,
+                        "isSwept": False,
+                        "isUnrolled": False,
+                        "createdAt": "1735689600",
+                        "expiresAt": None,
+                        "commitmentTxids": [],
+                    }
+                ],
+                "page": {"current": 1, "next": 0, "total": 0},
+            }
+        )
     with pytest.raises(arkade.ArkadeReceiveError, match="INVALID_RESPONSE"):
         arkade._validate_indexer_page({"current": 1, "next": 2})
     with pytest.raises(arkade.ArkadeReceiveError, match="INVALID_RESPONSE"):

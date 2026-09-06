@@ -20,6 +20,7 @@ from lnbits.core.crud.arkade import (
     get_arkade_binding,
     get_arkade_receive_outpoint,
     get_arkade_receive_request,
+    get_arkade_receive_request_by_destination,
     get_arkade_receive_request_by_idempotency,
     get_arkade_receive_request_by_script,
     get_arkade_receive_request_total,
@@ -41,6 +42,7 @@ from lnbits.core.crud.arkade_outgoing import (
     dispute_arkade_outgoing_intent,
     get_arkade_outgoing_intent,
     get_arkade_outgoing_intent_inputs,
+    get_arkade_submitted_outgoing_intents,
     release_arkade_outgoing_intent,
     settle_arkade_outgoing_intent_verified,
 )
@@ -73,8 +75,11 @@ from lnbits.core.models import (
 )
 from lnbits.core.models.payments import CreatePayment
 from lnbits.core.models.users import Account
-from lnbits.db import Connection
+from lnbits.db import SQLITE, Connection
 from lnbits.settings import settings
+from lnbits.task_manager import task_manager
+
+from .notifications import send_payment_notification_in_background
 
 ENROLLMENT_ACTION = "lnbits-arkade-enrollment-v1"
 IDENTITY_KIND = "mnemonic_hd"
@@ -117,6 +122,203 @@ class ArkadeOutgoingError(ValueError):
     pass
 
 
+def arkade_internal_transfer_id(native_request_id: str) -> str:
+    return hashlib.sha256(
+        f"lnbits-arkade-transfer-v1:{native_request_id}".encode()
+    ).hexdigest()[:32]
+
+
+async def settle_arkade_same_account_transfer(  # noqa: C901
+    account_id: str,
+    wallet_id: str,
+    destination: str,
+    amount_msat: int,
+    *,
+    memo: str | None = None,
+    extra: dict | None = None,
+    labels: list[str] | None = None,
+    external_id: str | None = None,
+    conn: Connection | None = None,
+) -> tuple[Payment, Payment]:
+    """Atomically reallocate a registered Arkade receive request locally."""
+    if settings.lnbits_effective_installation_mode != "arkade_noncustodial":
+        raise ArkadeOutgoingError("ARKADE_OUTGOING_UNAVAILABLE")
+    if amount_msat <= 0 or amount_msat % 1000:
+        raise ArkadeOutgoingError("ARKADE_OUTGOING_AMOUNT_INVALID")
+    request = await get_arkade_receive_request_by_destination(destination, conn=conn)
+    if not request:
+        raise ArkadeOutgoingError("ARKADE_TRANSFER_DESTINATION_NOT_FOUND")
+    if request.account_id != account_id:
+        raise ArkadeOutgoingError("ARKADE_TRANSFER_CROSS_ACCOUNT_REQUIRED")
+    transfer_id = arkade_internal_transfer_id(request.native_request_id)
+    now = datetime.now(timezone.utc)
+
+    try:
+        async with db.reuse_conn(conn) if conn else db.connect() as database:
+            async with database.transaction():
+                await database.execute(
+                    "UPDATE arkade_account_bindings SET account_id = account_id "
+                    "WHERE account_id = :account_id AND state = 'ready'",
+                    {"account_id": account_id},
+                )
+                binding = await get_arkade_binding(account_id, conn=database)
+                if not binding or binding.state != "ready":
+                    raise ArkadeOutgoingError("ARKADE_ENROLLMENT_REQUIRED")
+                reconciliation = await get_arkade_reconciliation(
+                    account_id, conn=database
+                )
+                if reconciliation and reconciliation.state == "reconciliation_required":
+                    raise ArkadeOutgoingError("ARKADE_BACKING_RECONCILIATION_REQUIRED")
+
+                sender_wallet = await get_wallet(wallet_id, conn=database)
+                receiver_wallet = await get_wallet(request.wallet_id, conn=database)
+                if (
+                    not sender_wallet
+                    or sender_wallet.id != wallet_id
+                    or sender_wallet.user != account_id
+                    or sender_wallet.deleted
+                    or not sender_wallet.can_send_payments
+                ):
+                    raise ArkadeOutgoingError("ARKADE_OUTGOING_NOT_ALLOWED")
+                if (
+                    not receiver_wallet
+                    or receiver_wallet.id != request.wallet_id
+                    or receiver_wallet.user != account_id
+                    or receiver_wallet.deleted
+                    or not receiver_wallet.can_receive_payments
+                ):
+                    raise ArkadeOutgoingError("ARKADE_TRANSFER_RECEIVER_NOT_ALLOWED")
+                if sender_wallet.id == receiver_wallet.id:
+                    raise ArkadeOutgoingError("ARKADE_TRANSFER_SAME_WALLET")
+
+                receiver_payment = await get_payment_by_native_id(
+                    request.native_request_id, conn=database
+                )
+                sender_payment = await get_payment_by_native_id(
+                    transfer_id, conn=database
+                )
+                expected_amount = request.amount_sat * 1000
+                if amount_msat != expected_amount:
+                    raise ArkadeOutgoingError("ARKADE_TRANSFER_AMOUNT_CONFLICT")
+
+                if sender_payment:
+                    if (
+                        request.state != "settled"
+                        or not receiver_payment
+                        or sender_payment.protocol != "arkade"
+                        or sender_payment.native_id != transfer_id
+                        or sender_payment.wallet_id != sender_wallet.id
+                        or sender_payment.amount != -expected_amount
+                        or sender_payment.fee != 0
+                        or sender_payment.arkade_address != request.address
+                        or sender_payment.status != PaymentState.SUCCESS.value
+                        or receiver_payment.protocol != "arkade"
+                        or receiver_payment.wallet_id != receiver_wallet.id
+                        or receiver_payment.amount != expected_amount
+                        or receiver_payment.arkade_address != request.address
+                        or receiver_payment.status != PaymentState.SUCCESS.value
+                    ):
+                        raise ArkadeOutgoingError("ARKADE_TRANSFER_CORRUPT")
+                    return sender_payment, receiver_payment
+
+                if request.state != "acknowledged":
+                    raise ArkadeOutgoingError("ARKADE_TRANSFER_MAPPING_NOT_READY")
+                if request.expires_at <= now:
+                    raise ArkadeOutgoingError("ARKADE_TRANSFER_EXPIRED")
+                if (
+                    not request.address
+                    or not request.script
+                    or not receiver_payment
+                    or receiver_payment.protocol != "arkade"
+                    or receiver_payment.native_id != request.native_request_id
+                    or receiver_payment.wallet_id != receiver_wallet.id
+                    or receiver_payment.amount != expected_amount
+                    or receiver_payment.arkade_address != request.address
+                    or receiver_payment.fee != 0
+                    or receiver_payment.status != PaymentState.PENDING.value
+                ):
+                    raise ArkadeOutgoingError("ARKADE_TRANSFER_RECEIVER_INVALID")
+                if sender_wallet.balance_msat < expected_amount:
+                    raise ArkadeOutgoingError("ARKADE_INSUFFICIENT_FUNDS")
+
+                sender_payment = await create_payment(
+                    checking_id=None,
+                    data=CreatePayment(
+                        wallet_id=sender_wallet.id,
+                        amount_msat=-expected_amount,
+                        memo=memo or "Arkade internal transfer",
+                        extra=extra,
+                        labels=labels,
+                        external_id=external_id,
+                        protocol="arkade",
+                        native_id=transfer_id,
+                        arkade_address=request.address,
+                    ),
+                    status=PaymentState.SUCCESS,
+                    conn=database,
+                )
+                receiver_update = await database.execute(
+                    f"""
+                    UPDATE apipayments
+                    SET status = 'success',
+                        updated_at = {database.timestamp_placeholder('updated_at')}
+                    WHERE protocol = 'arkade' AND native_id = :native_id
+                      AND wallet_id = :wallet_id AND amount = :amount
+                      AND fee = 0 AND arkade_address = :address
+                      AND status = 'pending'
+                    """,  # noqa: S608
+                    {
+                        "native_id": request.native_request_id,
+                        "wallet_id": receiver_wallet.id,
+                        "amount": expected_amount,
+                        "address": request.address,
+                        "updated_at": now,
+                    },
+                )
+                mapping_update = await database.execute(
+                    f"""
+                    UPDATE arkade_receive_requests
+                    SET state = 'settled',
+                        settled_at = {database.timestamp_placeholder('settled_at')},
+                        updated_at = {database.timestamp_placeholder('updated_at')}
+                    WHERE native_request_id = :native_id
+                      AND account_id = :account_id
+                      AND wallet_id = :wallet_id
+                      AND amount_sat = :amount_sat
+                      AND address = :address AND script = :script
+                      AND state = 'acknowledged'
+                      AND expires_at > {database.timestamp_placeholder('now')}
+                    """,  # noqa: S608
+                    {
+                        "native_id": request.native_request_id,
+                        "account_id": account_id,
+                        "wallet_id": receiver_wallet.id,
+                        "amount_sat": request.amount_sat,
+                        "address": request.address,
+                        "script": request.script,
+                        "settled_at": now,
+                        "updated_at": now,
+                        "now": now,
+                    },
+                )
+                if receiver_update.rowcount != 1 or mapping_update.rowcount != 1:
+                    raise ArkadeOutgoingError("ARKADE_TRANSFER_CORRUPT")
+                receiver_payment = await get_payment_by_native_id(
+                    request.native_request_id, conn=database
+                )
+                if not receiver_payment:
+                    raise ArkadeOutgoingError("ARKADE_TRANSFER_CORRUPT")
+    except OperationalError as exc:
+        if _is_database_busy(exc):
+            raise ArkadeOutgoingError("ARKADE_OUTGOING_BUSY") from None
+        raise
+
+    send_payment_notification_in_background(sender_wallet, sender_payment)
+    send_payment_notification_in_background(receiver_wallet, receiver_payment)
+    task_manager.internal_invoice_queue.put_nowait(receiver_payment)
+    return sender_payment, receiver_payment
+
+
 def _is_database_busy(exc: OperationalError) -> bool:
     original = getattr(exc, "orig", None)
     states = {
@@ -132,6 +334,9 @@ async def reserve_arkade_outgoing_intent(  # noqa: C901
     account_id: str,
     intent: ArkadeOutgoingIntent,
     conn: Connection | None = None,
+    *,
+    receiver_account_id: str | None = None,
+    receiver_native_request_id: str | None = None,
 ) -> tuple[ArkadeOutgoingIntent, Payment]:
     """Reserve one logical-wallet Arkade outgoing payment atomically."""
     if settings.lnbits_effective_installation_mode != "arkade_noncustodial":
@@ -140,6 +345,25 @@ async def reserve_arkade_outgoing_intent(  # noqa: C901
         raise ArkadeOutgoingError("ARKADE_OUTGOING_ACCOUNT_MISMATCH")
     if intent.status != "reserved" or intent.max_fee_msat != 0:
         raise ArkadeOutgoingError("ARKADE_OUTGOING_INVALID_REQUEST")
+    if (conn or db).type == SQLITE:
+        intent = intent.copy(
+            update={"expires_at": intent.expires_at.replace(microsecond=0)}
+        )
+    if (receiver_account_id is None) != (receiver_native_request_id is None):
+        raise ArkadeOutgoingError("ARKADE_TRANSFER_RECEIVER_INVALID")
+    if receiver_account_id == account_id:
+        raise ArkadeOutgoingError("ARKADE_TRANSFER_RECEIVER_INVALID")
+    binding = await get_arkade_binding(account_id, conn=conn)
+    if not binding or binding.state != "ready":
+        raise ArkadeOutgoingError("ARKADE_ENROLLMENT_REQUIRED")
+    try:
+        decode_arkade_address_script(
+            intent.destination,
+            binding.server_pubkey,
+            ARKADE_HRPS[binding.network],
+        )
+    except (ArkadeReceiveError, KeyError):
+        raise ArkadeOutgoingError("ARKADE_OUTGOING_OUTPUT_INVALID") from None
 
     try:
         existing_intent = await get_arkade_outgoing_intent(intent.intent_id, conn=conn)
@@ -169,7 +393,12 @@ async def reserve_arkade_outgoing_intent(  # noqa: C901
         async with db.reuse_conn(conn) if conn else db.connect() as database:
             async with database.transaction():
                 return await _reserve_arkade_outgoing_intent(
-                    account_id, intent, backing_msat, database
+                    account_id,
+                    intent,
+                    backing_msat,
+                    database,
+                    receiver_account_id=receiver_account_id,
+                    receiver_native_request_id=receiver_native_request_id,
                 )
     except OperationalError as exc:
         if _is_database_busy(exc):
@@ -177,20 +406,54 @@ async def reserve_arkade_outgoing_intent(  # noqa: C901
         raise
 
 
-async def _reserve_arkade_outgoing_intent(
+async def _reserve_arkade_outgoing_intent(  # noqa: C901
     account_id: str,
     intent: ArkadeOutgoingIntent,
     backing_msat: int,
     conn: Connection,
+    *,
+    receiver_account_id: str | None = None,
+    receiver_native_request_id: str | None = None,
 ) -> tuple[ArkadeOutgoingIntent, Payment]:
-    await conn.execute(
-        "UPDATE arkade_account_bindings SET account_id = account_id "
-        "WHERE account_id = :account_id AND state = 'ready'",
-        {"account_id": account_id},
-    )
+    binding_accounts = {account_id}
+    if receiver_account_id:
+        binding_accounts.add(receiver_account_id)
+    for binding_account_id in sorted(binding_accounts):
+        await conn.execute(
+            "UPDATE arkade_account_bindings SET account_id = account_id "
+            "WHERE account_id = :account_id",
+            {"account_id": binding_account_id},
+        )
     binding = await get_arkade_binding(account_id, conn=conn)
     if not binding or binding.state != "ready":
         raise ArkadeOutgoingError("ARKADE_ENROLLMENT_REQUIRED")
+    receiver_request = None
+    if receiver_account_id and receiver_native_request_id:
+        receiver_binding = await get_arkade_binding(receiver_account_id, conn=conn)
+        if not receiver_binding or receiver_binding.state != "ready":
+            raise ArkadeOutgoingError("ARKADE_TRANSFER_RECEIVER_INVALID")
+        await conn.execute(
+            "UPDATE arkade_receive_requests "
+            "SET native_request_id = native_request_id "
+            "WHERE native_request_id = :native_request_id "
+            "AND account_id = :account_id",
+            {
+                "native_request_id": receiver_native_request_id,
+                "account_id": receiver_account_id,
+            },
+        )
+        receiver_request = await get_arkade_receive_request(
+            receiver_native_request_id, conn=conn
+        )
+        if (
+            not receiver_request
+            or receiver_request.account_id != receiver_account_id
+            or receiver_request.native_request_id != receiver_native_request_id
+        ):
+            raise ArkadeOutgoingError("ARKADE_TRANSFER_RECEIVER_INVALID")
+    reconciliation = await get_arkade_reconciliation(account_id, conn=conn)
+    if reconciliation and reconciliation.state == "reconciliation_required":
+        raise ArkadeOutgoingError("ARKADE_BACKING_RECONCILIATION_REQUIRED")
 
     wallet = await get_wallet(intent.wallet_id, conn=conn)
     if not wallet or wallet.id != intent.wallet_id or wallet.user != account_id:
@@ -204,6 +467,28 @@ async def _reserve_arkade_outgoing_intent(
         return _existing_outgoing_pair(intent, existing_intent, existing_payment)
     if existing_payment:
         raise ArkadeOutgoingError("ARKADE_OUTGOING_CORRUPT")
+
+    if receiver_request:
+        receiver_payment = await get_payment_by_native_id(
+            receiver_request.native_request_id, conn=conn
+        )
+        expected_amount = receiver_request.amount_sat * 1000
+        if (
+            receiver_request.state != "acknowledged"
+            or receiver_request.expires_at <= datetime.now(timezone.utc)
+            or not receiver_request.address
+            or receiver_request.address != intent.destination
+            or intent.amount_msat != expected_amount
+            or not receiver_payment
+            or receiver_payment.protocol != "arkade"
+            or receiver_payment.native_id != receiver_request.native_request_id
+            or receiver_payment.wallet_id != receiver_request.wallet_id
+            or receiver_payment.amount != expected_amount
+            or receiver_payment.fee != 0
+            or receiver_payment.arkade_address != receiver_request.address
+            or receiver_payment.status != PaymentState.PENDING.value
+        ):
+            raise ArkadeOutgoingError("ARKADE_TRANSFER_RECEIVER_INVALID")
 
     if wallet.balance_msat < intent.amount_msat:
         raise ArkadeOutgoingError("ARKADE_INSUFFICIENT_FUNDS")
@@ -372,6 +657,27 @@ async def get_arkade_outgoing_intent_for_account(
         raise ArkadeOutgoingError("ARKADE_ENROLLMENT_REQUIRED")
     inputs = await get_arkade_outgoing_intent_inputs(intent_id, conn=conn)
     return _outgoing_response(intent, binding, inputs)
+
+
+async def list_arkade_submitted_outgoing_intents(
+    account_id: str, limit: int = 32
+) -> list[ArkadeOutgoingIntentResponse]:
+    if settings.lnbits_effective_installation_mode != "arkade_noncustodial":
+        raise ArkadeOutgoingError("ARKADE_OUTGOING_UNAVAILABLE")
+    binding = await get_arkade_binding(account_id)
+    if not binding or binding.state != "ready":
+        raise ArkadeOutgoingError("ARKADE_ENROLLMENT_REQUIRED")
+    intents = await get_arkade_submitted_outgoing_intents(
+        limit=limit, account_id=account_id
+    )
+    return [
+        _outgoing_response(
+            intent,
+            binding,
+            await get_arkade_outgoing_intent_inputs(intent.intent_id),
+        )
+        for intent in intents
+    ]
 
 
 def _outgoing_input_key(item: ArkadeOutgoingSelectedInput) -> tuple[str, int]:
@@ -1132,12 +1438,11 @@ def verify_receive_exit_membership(  # noqa: C901
         raise ArkadeReceiveError("ARKADE_RECEIVE_INVALID_MAPPING")
 
 
-def validate_arkade_address_script(
+def decode_arkade_address_script(
     address: str,
-    script: str,
     server_pubkey: str,
     expected_hrp: str,
-) -> None:
+) -> str:
     """Validate only the generic ArkAddress envelope and v1 pkScript.
 
     The pinned SDK's ArkAddress format is bech32m(version || server key ||
@@ -1166,7 +1471,16 @@ def validate_arkade_address_script(
         raise ArkadeReceiveError("ARKADE_RECEIVE_INVALID_MAPPING")
     if bytes(payload[1:33]).hex() != server_pubkey:
         raise ArkadeReceiveError("ARKADE_RECEIVE_INVALID_MAPPING")
-    expected_script = "5120" + bytes(payload[33:]).hex()
+    return "5120" + bytes(payload[33:]).hex()
+
+
+def validate_arkade_address_script(
+    address: str,
+    script: str,
+    server_pubkey: str,
+    expected_hrp: str,
+) -> None:
+    expected_script = decode_arkade_address_script(address, server_pubkey, expected_hrp)
     if script != expected_script:
         raise ArkadeReceiveError("ARKADE_RECEIVE_INVALID_MAPPING")
 
@@ -1390,7 +1704,7 @@ def _positive_decimal(value: object) -> int | None:
 def parse_indexer_vtxos(body: object) -> list[ArkadeIndexerVtxo]:  # noqa: C901
     if not isinstance(body, dict) or not isinstance(body.get("vtxos"), list):
         raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
-    _validate_indexer_page(body.get("page"))
+    _validate_indexer_page(body.get("page"), allow_empty_first_page=not body["vtxos"])
     parsed: list[ArkadeIndexerVtxo] = []
     for raw in body["vtxos"]:
         if not isinstance(raw, dict) or not isinstance(raw.get("outpoint"), dict):
@@ -1486,7 +1800,9 @@ def parse_indexer_vtxos(body: object) -> list[ArkadeIndexerVtxo]:  # noqa: C901
     return parsed
 
 
-def _validate_indexer_page(page: object) -> None:
+def _validate_indexer_page(
+    page: object, *, allow_empty_first_page: bool = False
+) -> None:
     if page is None:
         return
     if not isinstance(page, dict):
@@ -1505,7 +1821,11 @@ def _validate_indexer_page(page: object) -> None:
         or isinstance(total, bool)
     ):
         raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
-    if current < 0 or next_page < 0 or total < 0 or current > total:
+    if current < 0 or next_page < 0 or total < 0:
+        raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
+    if current > total and not (
+        allow_empty_first_page and current == 1 and next_page == 0 and total == 0
+    ):
         raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
     if next_page <= current and current < total:
         raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
@@ -1523,6 +1843,13 @@ async def fetch_arkade_indexer_vtxos(  # noqa: C901
         raise ArkadeReceiveError("ARKADE_ENROLLMENT_REQUIRED")
     requests = await get_arkade_receive_requests(account_id, conn=conn)
     scripts = sorted({request.script for request in requests if request.script})
+    changes = await (conn or db).fetchall(
+        "SELECT change_script FROM arkade_outgoing_intents "
+        "WHERE account_id = :account_id AND status = 'settled' "
+        "AND change_script IS NOT NULL",
+        {"account_id": account_id},
+    )
+    scripts = sorted(set(scripts) | {row["change_script"] for row in changes})
     if not scripts:
         return []
     result: list[ArkadeIndexerVtxo] = []
@@ -1555,7 +1882,9 @@ async def fetch_arkade_indexer_vtxos(  # noqa: C901
                     page = body.get("page") if isinstance(body, dict) else None
                     if page is None:
                         raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
-                    _validate_indexer_page(page)
+                    _validate_indexer_page(
+                        page, allow_empty_first_page=not body["vtxos"]
+                    )
                     if page["current"] >= page["total"]:
                         break
                     page_index = page["next"]
@@ -1614,7 +1943,7 @@ async def fetch_arkade_indexer_vtxos_for_outpoints(  # noqa: C901
                 page = body.get("page") if isinstance(body, dict) else None
                 if page is None:
                     raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
-                _validate_indexer_page(page)
+                _validate_indexer_page(page, allow_empty_first_page=not body["vtxos"])
                 if page["current"] >= page["total"]:
                     return result
                 page_index = page["next"]
@@ -1967,7 +2296,7 @@ async def reconcile_arkade_outgoing_intent(  # noqa: C901
             if current.status == "settled":
                 if not payment or payment.status != PaymentState.SUCCESS.value:
                     raise ArkadeReceiveError("ARKADE_OUTGOING_CORRUPT")
-                return evidence
+                return None
             if current.status == "disputed":
                 return evidence
             if current.status != "submitted":
@@ -2022,6 +2351,29 @@ async def _mark_receive_reconciliation_required(
     )
 
 
+def _arkade_backing_diverged(vtxo: ArkadeIndexerVtxo, claim: dict | None) -> bool:
+    if (
+        vtxo.is_swept
+        or vtxo.is_unrolled
+        or vtxo.settled_by
+        or vtxo.expires_at_height is not None
+        or (
+            vtxo.expires_at is not None
+            and vtxo.expires_at <= datetime.now(timezone.utc)
+        )
+    ):
+        return True
+    if not vtxo.is_spent:
+        return False
+    if not claim or int(claim["amount_sat"]) != vtxo.amount_sat:
+        return True
+    if claim["status"] == "disputed":
+        return True
+    return bool(
+        claim["status"] == "settled" and claim["arkade_txid"] != vtxo.arkade_txid
+    )
+
+
 async def reconcile_arkade_receive(  # noqa: C901
     account_id: str,
     evidence: list[ArkadeIndexerVtxo],
@@ -2040,8 +2392,58 @@ async def reconcile_arkade_receive(  # noqa: C901
         if required and previous_state and previous_state.last_error
         else None
     )
+    observed: dict[tuple[str, int], ArkadeIndexerVtxo] = {}
+    for vtxo in evidence:
+        key = (vtxo.txid, vtxo.vout)
+        if key in observed and observed[key] != vtxo:
+            required = True
+            last_error = "ARKADE_RECONCILIATION_REQUIRED"
+        observed[key] = vtxo
+    database = conn or db
+    claims = await database.fetchall(
+        "SELECT i.txid, i.vout, i.amount_sat, o.status, o.arkade_txid "
+        "FROM arkade_outgoing_intent_inputs i "
+        "JOIN arkade_outgoing_intents o ON o.intent_id = i.intent_id "
+        "WHERE o.account_id = :account_id "
+        "AND o.status IN ('submitted', 'settled', 'disputed')",
+        {"account_id": account_id},
+    )
+    claims_by_outpoint = {(row["txid"], int(row["vout"])): row for row in claims}
+    known_outpoints = await database.fetchall(
+        "SELECT txid, vout FROM arkade_receive_outpoints "
+        "WHERE account_id = :account_id",
+        {"account_id": account_id},
+    )
+    for row in known_outpoints:
+        key = (row["txid"], int(row["vout"]))
+        vtxo = observed.get(key)
+        if not vtxo or _arkade_backing_diverged(vtxo, claims_by_outpoint.get(key)):
+            required = True
+            last_error = "ARKADE_RECONCILIATION_REQUIRED"
+    changes = await database.fetchall(
+        "SELECT arkade_txid, change_script, change_amount_sat "
+        "FROM arkade_outgoing_intents "
+        "WHERE account_id = :account_id AND status = 'settled' "
+        "AND change_script IS NOT NULL AND change_amount_sat IS NOT NULL",
+        {"account_id": account_id},
+    )
+    change_outpoints: set[tuple[str, int]] = set()
+    for row in changes:
+        key = (row["arkade_txid"], 1)
+        change_outpoints.add(key)
+        vtxo = observed.get(key)
+        if (
+            not vtxo
+            or vtxo.script != row["change_script"]
+            or vtxo.amount_sat != int(row["change_amount_sat"])
+            or _arkade_backing_diverged(vtxo, claims_by_outpoint.get(key))
+        ):
+            required = True
+            last_error = "ARKADE_RECONCILIATION_REQUIRED"
     settled_payments: list[Payment] = []
     for vtxo in evidence:
+        if (vtxo.txid, vtxo.vout) in change_outpoints:
+            continue
         request = await get_arkade_receive_request_by_script(
             account_id, vtxo.script, conn=conn
         )

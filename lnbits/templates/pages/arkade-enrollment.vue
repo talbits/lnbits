@@ -94,13 +94,12 @@
         </div>
       </q-card-section>
       <q-card-section v-else>
-        <div class="text-h6">
-          {{
-            mode === 'create'
-              ? 'Back up your recovery phrase'
-              : 'Restore your wallet'
-          }}
-        </div>
+        <div
+          v-if="mode === 'create'"
+          class="text-h6"
+          v-text="'Back up your recovery phrase'"
+        ></div>
+        <div v-else class="text-h6" v-text="'Restore your wallet'"></div>
         <p v-if="mode === 'create'">
           Write these words down and keep them offline. Anyone with them can
           recover your funds.

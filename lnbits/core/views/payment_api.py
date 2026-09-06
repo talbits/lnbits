@@ -1,3 +1,5 @@
+import re
+from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from http import HTTPStatus
 from secrets import token_hex
@@ -14,7 +16,10 @@ from fastapi.responses import JSONResponse
 from lnurl import url_decode
 
 from lnbits import bolt11
+from lnbits.core.crud.arkade import get_arkade_receive_request_by_destination
+from lnbits.core.crud.arkade_outgoing import get_arkade_outgoing_intent
 from lnbits.core.crud.payments import (
+    get_payment_by_native_id,
     get_payment_count_stats,
     get_wallet_payment_total_breakdown,
     get_wallets_stats,
@@ -58,6 +63,7 @@ from lnbits.helpers import (
     generate_filter_params_openapi,
     is_valid_label,
 )
+from lnbits.settings import settings
 from lnbits.wallets.base import InvoiceResponse
 
 from ..crud import (
@@ -68,6 +74,7 @@ from ..crud import (
     get_standalone_payment,
     get_wallet_for_key,
 )
+from ..models import ArkadeOutgoingIntent
 from ..services import (
     cancel_hold_invoice,
     create_payment_request,
@@ -78,8 +85,146 @@ from ..services import (
     settle_hold_invoice,
     update_pending_payment,
 )
+from ..services.arkade import (
+    ArkadeOutgoingError,
+    arkade_internal_transfer_id,
+    reserve_arkade_outgoing_intent,
+    settle_arkade_same_account_transfer,
+)
+from .arkade_api import _public_outgoing_error
 
 payment_router = APIRouter(prefix="/api/v1/payments", tags=["Payments"])
+
+
+async def _create_arkade_outgoing_payment(  # noqa: C901
+    invoice_data: CreateInvoice,
+    key_info: BaseWalletTypeInfo,
+    idempotency_key: str | None,
+) -> JSONResponse:
+    if key_info.key_type != KeyType.admin:
+        raise HTTPException(
+            status_code=HTTPStatus.FORBIDDEN,
+            detail="Invoice (or Admin) key required.",
+        )
+    if not idempotency_key or not re.fullmatch(r"[0-9a-f]{32}", idempotency_key):
+        raise HTTPException(HTTPStatus.BAD_REQUEST, "ARKADE_IDEMPOTENCY_REQUIRED")
+    if (
+        invoice_data.unit != "sat"
+        or invoice_data.amount is None
+        or invoice_data.amount <= 0
+        or invoice_data.amount != int(invoice_data.amount)
+        or invoice_data.amount > 2_100_000_000_000_000
+    ):
+        raise HTTPException(HTTPStatus.BAD_REQUEST, "ARKADE_OUTGOING_AMOUNT_INVALID")
+    destination = invoice_data.arkade_address or ""
+    receive_request = await get_arkade_receive_request_by_destination(destination)
+    if receive_request and receive_request.account_id == key_info.wallet.user:
+        try:
+            payment, receiver_payment = await settle_arkade_same_account_transfer(
+                account_id=key_info.wallet.user,
+                wallet_id=key_info.wallet.id,
+                destination=destination,
+                amount_msat=int(invoice_data.amount) * 1000,
+                memo=invoice_data.memo,
+                extra=invoice_data.extra,
+                labels=invoice_data.labels,
+                external_id=invoice_data.external_id,
+            )
+        except ArkadeOutgoingError as exc:
+            raise _public_outgoing_error(exc) from exc
+        response = jsonable_encoder(payment)
+        response.update(
+            browser_required=False,
+            transfer_id=payment.native_id,
+            receiver_native_id=receiver_payment.native_id,
+        )
+        return JSONResponse(status_code=HTTPStatus.CREATED, content=response)
+    if receive_request:
+        if receive_request.state != "acknowledged":
+            raise _public_outgoing_error(
+                ArkadeOutgoingError("ARKADE_TRANSFER_MAPPING_NOT_READY")
+            )
+        if int(invoice_data.amount) * 1000 != receive_request.amount_sat * 1000:
+            raise _public_outgoing_error(
+                ArkadeOutgoingError("ARKADE_TRANSFER_AMOUNT_CONFLICT")
+            )
+        if receive_request.expires_at <= datetime.now(timezone.utc):
+            raise _public_outgoing_error(ArkadeOutgoingError("ARKADE_TRANSFER_EXPIRED"))
+        destination = receive_request.address or destination
+        receiver_payment = await get_payment_by_native_id(
+            receive_request.native_request_id
+        )
+        if (
+            not receiver_payment
+            or receiver_payment.protocol != "arkade"
+            or receiver_payment.native_id != receive_request.native_request_id
+            or receiver_payment.wallet_id != receive_request.wallet_id
+            or receiver_payment.amount != receive_request.amount_sat * 1000
+            or receiver_payment.fee != 0
+            or receiver_payment.arkade_address != destination
+            or receiver_payment.status != "pending"
+        ):
+            raise _public_outgoing_error(
+                ArkadeOutgoingError("ARKADE_TRANSFER_RECEIVER_INVALID")
+            )
+        intent_id = arkade_internal_transfer_id(receive_request.native_request_id)
+    else:
+        intent_id = sha256(
+            f"lnbits-arkade-outgoing-v1:{key_info.wallet.user}:{idempotency_key}".encode()
+        ).hexdigest()[:32]
+    existing = await get_arkade_outgoing_intent(intent_id)
+    if receive_request and existing and existing.status == "released":
+        raise _public_outgoing_error(
+            ArkadeOutgoingError("ARKADE_TRANSFER_REQUEST_CONSUMED")
+        )
+    request_intent = ArkadeOutgoingIntent(
+        intent_id=intent_id,
+        account_id=key_info.wallet.user,
+        wallet_id=key_info.wallet.id,
+        amount_msat=int(invoice_data.amount) * 1000,
+        destination=destination,
+        expires_at=(
+            existing.expires_at
+            if existing
+            else datetime.now(timezone.utc) + timedelta(minutes=10)
+        ),
+    )
+    try:
+        if receive_request:
+            intent, payment = await reserve_arkade_outgoing_intent(
+                key_info.wallet.user,
+                request_intent,
+                receiver_account_id=receive_request.account_id,
+                receiver_native_request_id=receive_request.native_request_id,
+            )
+        else:
+            intent, payment = await reserve_arkade_outgoing_intent(
+                key_info.wallet.user, request_intent
+            )
+    except ArkadeOutgoingError as exc:
+        if str(exc) != "ARKADE_OUTGOING_IDEMPOTENCY_CONFLICT" or existing:
+            raise _public_outgoing_error(exc) from exc
+        existing = await get_arkade_outgoing_intent(intent_id)
+        if not existing:
+            raise _public_outgoing_error(exc) from exc
+        request_intent.expires_at = existing.expires_at
+        try:
+            if receive_request:
+                intent, payment = await reserve_arkade_outgoing_intent(
+                    key_info.wallet.user,
+                    request_intent,
+                    receiver_account_id=receive_request.account_id,
+                    receiver_native_request_id=receive_request.native_request_id,
+                )
+            else:
+                intent, payment = await reserve_arkade_outgoing_intent(
+                    key_info.wallet.user, request_intent
+                )
+        except ArkadeOutgoingError as retry_exc:
+            raise _public_outgoing_error(retry_exc) from retry_exc
+    response = jsonable_encoder(payment)
+    response.update(browser_required=True, intent_id=intent.intent_id)
+    return JSONResponse(status_code=HTTPStatus.ACCEPTED, content=response)
 
 
 @payment_router.get(
@@ -269,8 +414,17 @@ async def api_all_payments_paginated(
 async def api_payments_create(
     invoice_data: CreateInvoice,
     key_info: BaseWalletTypeInfo = Depends(require_base_invoice_key),
+    idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
 ) -> Payment | JSONResponse:
     wallet_id = key_info.wallet.id
+    if (
+        settings.lnbits_effective_installation_mode == "arkade_noncustodial"
+        and invoice_data.out
+        and invoice_data.arkade_address is not None
+    ):
+        return await _create_arkade_outgoing_payment(
+            invoice_data, key_info, idempotency_key
+        )
     if invoice_data.out is True and key_info.key_type == KeyType.admin:
         if not invoice_data.bolt11:
             raise HTTPException(

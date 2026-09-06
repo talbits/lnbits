@@ -5,6 +5,7 @@ window.PageWallet = {
       parse: {
         show: false,
         invoice: null,
+        arkade: null,
         lnurlpay: null,
         lnurlauth: null,
         sending: false,
@@ -50,6 +51,8 @@ window.PageWallet = {
       },
       hasNfc: false,
       nfcReaderAbortController: null,
+      arkadeRecovery: [],
+      arkadeRecoveryBusy: false,
       formattedFiatAmount: 0,
       totalBreakdown: {
         show: false,
@@ -78,6 +81,13 @@ window.PageWallet = {
       return this.isFiatWallet && this.receive.fiatProvider === 'cash'
     },
     canPay() {
+      if (this.parse.arkade) {
+        return (
+          Number.isSafeInteger(Number(this.parse.arkade.amount)) &&
+          Number(this.parse.arkade.amount) > 0 &&
+          Number(this.parse.arkade.amount) <= this.g.wallet.sat
+        )
+      }
       if (!this.parse.invoice) return false
       if (this.parse.invoice.expired) {
         Quasar.Notify.create({
@@ -249,6 +259,84 @@ window.PageWallet = {
       this.parse.show = true
       this.lnurlScan()
     },
+    async refreshArkadeRecovery() {
+      if (
+        this.g.user?.installationMode !== 'arkade_noncustodial' ||
+        !window.ArkadeEnrollment?.listOutgoing
+      )
+        return
+      try {
+        const records = await window.ArkadeEnrollment.listOutgoing()
+        this.arkadeRecovery = records.filter(record =>
+          [
+            'prepared',
+            'authorization_unknown',
+            'submitted',
+            'reconciliation_required'
+          ].includes(record.phase)
+        )
+      } catch {
+        this.arkadeRecovery = []
+      }
+    },
+    async recoverArkadeOutgoing(record) {
+      if (this.arkadeRecoveryBusy) return
+      const approved = await new Promise(resolve => {
+        this.$q
+          .dialog({
+            title: 'Recover Arkade payment',
+            message:
+              `Recover ${record.amountSat} sat to ${record.destination}? ` +
+              'Refresh the wallet and continue this outgoing payment?',
+            cancel: true,
+            persistent: true
+          })
+          .onOk(() => resolve(true))
+          .onCancel(() => resolve(false))
+      })
+      if (!approved) return
+      this.arkadeRecoveryBusy = true
+      try {
+        const result = await window.ArkadeEnrollment.recoverOutgoing(
+          record.intentId,
+          {
+            approved: true
+          }
+        )
+        await this.refreshArkadeRecovery()
+        this.g.updatePayments = !this.g.updatePayments
+        if (result?.phase === 'reconciliation_required') {
+          this.$q.notify({
+            type: 'warning',
+            message: 'Arkade payment still requires reconciliation.'
+          })
+        } else if (result?.status === 'submitted') {
+          this.$q.notify({
+            type: 'info',
+            message: 'Arkade payment submitted.'
+          })
+        } else if (result?.reconciliationRequired) {
+          this.$q.notify({
+            type: 'warning',
+            message: 'Arkade payment still requires reconciliation.'
+          })
+        } else if (result?.status === 'settled') {
+          this.$q.notify({
+            type: 'positive',
+            message: 'Arkade payment recovery complete.'
+          })
+        } else {
+          this.$q.notify({
+            type: 'warning',
+            message: 'Arkade payment status needs review.'
+          })
+        }
+      } catch (error) {
+        LNbits.utils.notifyApiError(error)
+      } finally {
+        this.arkadeRecoveryBusy = false
+      }
+    },
     msatoshiFormat(value) {
       return LNbits.utils.formatSat(value / 1000)
     },
@@ -290,6 +378,7 @@ window.PageWallet = {
     showParseDialog() {
       this.parse.show = true
       this.parse.invoice = null
+      this.parse.arkade = null
       this.parse.lnurlpay = null
       this.parse.lnurlauth = null
       this.parse.copy.show =
@@ -500,6 +589,16 @@ window.PageWallet = {
         return
       }
 
+      if (/^(t?ark)1[023456789ac-hj-np-z]+$/i.test(this.parse.data.request)) {
+        this.parse.invoice = null
+        this.parse.arkade = {
+          address: this.parse.data.request,
+          amount: null,
+          idempotencyKey: this.newArkadeIdempotencyKey()
+        }
+        return
+      }
+
       // BIP-21 support
       if (this.parse.data.request.toLowerCase().includes('lightning')) {
         this.parse.data.request = this.parse.data.request.split('lightning=')[1]
@@ -572,6 +671,78 @@ window.PageWallet = {
       }
 
       this.parse.invoice = Object.freeze(cleanInvoice)
+    },
+    newArkadeIdempotencyKey() {
+      return Array.from(crypto.getRandomValues(new Uint8Array(16)), byte =>
+        byte.toString(16).padStart(2, '0')
+      ).join('')
+    },
+    async payArkade() {
+      if (this.parse.sending || !this.canPay) return
+      this.parse.sending = true
+      try {
+        if (this.g.user?.installationMode === 'arkade_noncustodial')
+          await this.refreshArkadeRecovery()
+        const response = await LNbits.api.payArkade(
+          this.g.wallet,
+          this.parse.arkade.address,
+          Number(this.parse.arkade.amount),
+          this.parse.arkade.idempotencyKey
+        )
+        if (response.data.browser_required === false) {
+          this.g.updatePayments = !this.g.updatePayments
+          this.parse.show = false
+          this.$q.notify({
+            type: 'positive',
+            message: this.$t('payment_successful')
+          })
+          return
+        }
+        if (!response.data.intent_id)
+          throw new Error('Arkade browser approval is unavailable')
+        let prepared
+        try {
+          prepared = await window.ArkadeEnrollment.prepareOutgoing(
+            response.data.intent_id,
+            this.g.wallet.id
+          )
+        } catch (error) {
+          await LNbits.api.arkadeOutgoingRelease(response.data.intent_id)
+          void window.ArkadeEnrollment?.listOutgoing?.()?.catch(() => {})
+          this.parse.arkade.idempotencyKey = this.newArkadeIdempotencyKey()
+          throw error
+        }
+        try {
+          await new Promise((resolve, reject) => {
+            this.$q
+              .dialog({
+                title: 'Approve Arkade payment',
+                message:
+                  `Send ${prepared.amountSat} sat to ${prepared.destination}? ` +
+                  `Fee: 0 sat. Inputs: ${prepared.inputs.length} ` +
+                  `(${prepared.inputs.reduce((sum, input) => sum + input.amount_sat, 0)} sat). ` +
+                  `Change: ${prepared.change?.amount_sat || 0} sat.`,
+                cancel: true,
+                persistent: true
+              })
+              .onOk(resolve)
+              .onCancel(reject)
+          })
+        } catch {
+          await LNbits.api.arkadeOutgoingRelease(response.data.intent_id)
+          void window.ArkadeEnrollment?.listOutgoing?.()?.catch(() => {})
+          this.parse.arkade.idempotencyKey = this.newArkadeIdempotencyKey()
+          return
+        }
+        await window.ArkadeEnrollment.submitOutgoing(prepared, {approved: true})
+        this.g.updatePayments = !this.g.updatePayments
+        this.parse.show = false
+        this.$q.notify({type: 'info', message: this.$t('payment_pending')})
+      } catch (error) {
+        if (error !== undefined) LNbits.utils.notifyApiError(error)
+      } finally {
+        this.parse.sending = false
+      }
     },
     payInvoice() {
       if (this.parse.sending) return
@@ -862,6 +1033,8 @@ window.PageWallet = {
       this.g.wallet = wallet
       this.g.lastActiveWallet = wallet.id
       this.$q.localStorage.setItem('lnbits.lastActiveWallet', wallet.id)
+      if (this.g.user.installationMode === 'arkade_noncustodial')
+        void this.refreshArkadeRecovery()
       // the dialog needs the wallet, and a dialog opened while this navigation
       // is still in flight gets torn down by it, so handle the payment request
       // only once the url rewrite has settled

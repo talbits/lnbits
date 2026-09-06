@@ -46,7 +46,7 @@ const hex = bytes => Buffer.from(bytes).toString('hex')
 const future = () =>
   new Date(Math.ceil(Date.now() / 1000) * 1000 + 600_000).toISOString()
 
-const makeFixture = ({amountSat, inputValue, dust = 100} = {}) => {
+const makeFixture = ({amountSat, inputValue, dust = 100, store} = {}) => {
   const amount = amountSat ?? 700
   const value = inputValue ?? 1_000
   const inputDescriptor = identity.descriptor.replace('/0/*)', '/0/1)')
@@ -89,6 +89,7 @@ const makeFixture = ({amountSat, inputValue, dust = 100} = {}) => {
       pubkeys: [serverBytes]
     }),
     arkProvider: {getInfo: async () => ({dust: BigInt(dust)})},
+    indexerProvider: {},
     getSpendableVtxos: async () => [input],
     getNewAddresses: async () => [
       {
@@ -138,11 +139,14 @@ const makeFixture = ({amountSat, inputValue, dust = 100} = {}) => {
     authError: null,
     commitAuthError: false,
     mismatch: false,
+    mismatchOnGet: 0,
+    tamperedReleased: false,
     mutateDuringAuthorize: false,
+    lockDuringAuthorize: false,
     broadcastError: false
   }
   const requests = []
-  const window = makeWindow()
+  const window = makeWindow(store)
   window.__ARKADE_ENROLLMENT_TEST__ = {}
   vm.runInNewContext(bundle, window)
   const realmBytes = value =>
@@ -175,40 +179,77 @@ const makeFixture = ({amountSat, inputValue, dust = 100} = {}) => {
     script: realmBytes(wallet.serverUnrollScript.script)
   }
   wallet.getSpendableVtxos = async () => [realmInput]
+  wallet.indexerProvider.getVtxos = async options => {
+    wallet.indexerArgs.push(options)
+    return {vtxos: [realmInput]}
+  }
+  wallet.indexerArgs = []
+  wallet.refreshArgs = []
+  wallet.finalizeArgs = null
+  wallet.finalizeCount = 0
+  wallet.finalizeResult = {finalized: [], pending: []}
+  wallet.lockOnRefresh = false
+  const manager = {
+    annotateVtxos: async inputs => inputs,
+    refreshVtxos: async options => {
+      wallet.refreshArgs.push(options)
+      if (wallet.lockOnRefresh) {
+        wallet.lockOnRefresh = false
+        window.ArkadeEnrollment.lock()
+      }
+    }
+  }
+  wallet.getContractManager = async () => manager
+  wallet.finalizePendingTxs = async inputs => {
+    wallet.finalizeCount += 1
+    wallet.finalizeArgs = inputs
+    if (wallet.clearSpentOnFinalize) realmInput.isSpent = false
+    return wallet.finalizeResult
+  }
   window.g = {user: {id: accountId}}
   window.ArkadeEnrollment.__setTestReady(binding, wallet)
   window.LNbits = {
     api: {
-      arkadeOutgoingIntent: async () => {
+      arkadeOutgoingIntent: async requestedIntentId => {
         requests.push({method: 'GET'})
-        const submitted = state.status === 'submitted'
+        const getCount = requests.filter(item => item.method === 'GET').length
+        const committed =
+          state.status !== 'reserved' &&
+          (state.status !== 'released' || state.tamperedReleased)
         return {
           data: {
             ...base,
+            intent_id: requestedIntentId || intentId,
             status: state.status,
-            destination_script: submitted
-              ? state.mismatch
+            destination_script: committed
+              ? state.mismatch || state.mismatchOnGet === getCount
                 ? '00'
                 : hex(destinationScript.pkScript)
               : null,
-            inputs: submitted
+            inputs: committed
               ? [
                   {
-                    intent_id: intentId,
+                    intent_id: requestedIntentId || intentId,
                     txid: input.txid,
                     vout: input.vout,
                     amount_sat: input.value
                   }
                 ]
               : [],
-            change_index: submitted && value > amount ? 0 : null,
+            change_index: committed && value > amount ? 0 : null,
             change_script:
-              submitted && value > amount ? hex(changeScript.pkScript) : null,
+              committed && value > amount ? hex(changeScript.pkScript) : null,
             change_amount_sat:
-              submitted && value > amount ? value - amount : null
+              committed && value > amount ? value - amount : null
           }
         }
       },
+      arkadeSubmittedOutgoingIntents: async () => ({
+        data:
+          state.status === 'submitted'
+            ? [(await window.LNbits.api.arkadeOutgoingIntent(intentId)).data]
+            : []
+      }),
       arkadeOutgoingAuthorize: async (_id, data) => {
         requests.push({method: 'POST', data})
         if (state.mutateDuringAuthorize)
@@ -216,13 +257,17 @@ const makeFixture = ({amountSat, inputValue, dust = 100} = {}) => {
         if (state.commitAuthError) state.status = 'submitted'
         if (state.authError) throw new Error('transport lost')
         state.status = 'submitted'
+        if (state.lockDuringAuthorize) window.ArkadeEnrollment.lock()
         const change = data.change
         return {
           data: {
             ...base,
             status: 'submitted',
             destination_script: data.destination_script,
-            inputs: data.inputs.map(item => ({intent_id: intentId, ...item})),
+            inputs: data.inputs.map(item => ({
+              intent_id: _id,
+              ...item
+            })),
             change_index: change?.index ?? null,
             change_script: change?.script ?? null,
             change_amount_sat: change?.amount_sat ?? null
@@ -243,8 +288,7 @@ const makeFixture = ({amountSat, inputValue, dust = 100} = {}) => {
   }
 }
 
-const makeWindow = () => {
-  const store = new Map()
+const makeWindow = (store = new Map()) => {
   const window = {
     window: null,
     globalThis: null,
@@ -505,6 +549,303 @@ async function main() {
       error.status === 'submitted' && error.reconciliationRequired === true
   )
   assert.equal(broadcast.wallet.submitCount, 1)
+
+  const recovery = makeFixture({amountSat: 1_000, inputValue: 1_000})
+  const recoveryPlan = await recovery.window.ArkadeEnrollment.prepareOutgoing(
+    intentId,
+    walletId
+  )
+  recovery.state.status = 'submitted'
+  await assert.rejects(
+    recovery.window.ArkadeEnrollment.recoverOutgoing(intentId),
+    /approval required/
+  )
+  assert.equal(recovery.wallet.finalizeArgs, null)
+  recovery.wallet.refreshArgs = []
+  const recovered = await recovery.window.ArkadeEnrollment.recoverOutgoing(
+    intentId,
+    {approved: true}
+  )
+  assert.equal(recovered.reconciliationRequired, true)
+  assert.strictEqual(recovery.wallet.finalizeArgs[0], recovery.input)
+  assert.equal(recovery.wallet.refreshArgs.length, 2)
+  assert.equal(recovery.wallet.submitCount, 1)
+  assert.equal(recoveryPlan.previewCommitment.length > 0, true)
+
+  const concurrent = makeFixture({amountSat: 1_000, inputValue: 1_000})
+  await concurrent.window.ArkadeEnrollment.prepareOutgoing(intentId, walletId)
+  concurrent.state.status = 'submitted'
+  const [concurrentA, concurrentB] = await Promise.all([
+    concurrent.window.ArkadeEnrollment.recoverOutgoing(intentId, {
+      approved: true
+    }),
+    concurrent.window.ArkadeEnrollment.recoverOutgoing(intentId, {
+      approved: true
+    })
+  ])
+  assert.strictEqual(concurrentA, concurrentB)
+  assert.equal(concurrent.wallet.finalizeCount, 1)
+  assert.equal(concurrent.wallet.submitCount, 1)
+
+  for (const result of [
+    {finalized: ['ff'.repeat(32)], pending: []},
+    {finalized: [], pending: ['ff'.repeat(32)]}
+  ]) {
+    const pendingFinalization = makeFixture({
+      amountSat: 1_000,
+      inputValue: 1_000
+    })
+    await pendingFinalization.window.ArkadeEnrollment.prepareOutgoing(
+      intentId,
+      walletId
+    )
+    pendingFinalization.state.status = 'submitted'
+    pendingFinalization.wallet.finalizeResult = result
+    const pendingResult =
+      await pendingFinalization.window.ArkadeEnrollment.recoverOutgoing(
+        intentId,
+        {approved: true}
+      )
+    assert.equal(pendingResult.phase, 'reconciliation_required')
+    assert.equal(pendingFinalization.wallet.refreshArgs.length, 2)
+    assert.equal(
+      pendingFinalization.requests.filter(item => item.method === 'GET').length,
+      3
+    )
+    assert.equal(pendingFinalization.wallet.submitCount, 0)
+  }
+
+  const recoveryRace = makeFixture({amountSat: 1_000, inputValue: 1_000})
+  await recoveryRace.window.ArkadeEnrollment.prepareOutgoing(intentId, walletId)
+  recoveryRace.state.status = 'submitted'
+  recoveryRace.wallet.lockOnRefresh = true
+  const recoveryRaceResult =
+    await recoveryRace.window.ArkadeEnrollment.recoverOutgoing(intentId, {
+      approved: true
+    })
+  assert.equal(recoveryRaceResult.phase, 'reconciliation_required')
+  assert.equal(recoveryRace.wallet.finalizeArgs, null)
+  assert.equal(recoveryRace.wallet.submitCount, 0)
+
+  const submitRace = makeFixture({amountSat: 1_000, inputValue: 1_000})
+  const submitRacePlan =
+    await submitRace.window.ArkadeEnrollment.prepareOutgoing(intentId, walletId)
+  submitRace.state.lockDuringAuthorize = true
+  await assert.rejects(
+    submitRace.window.ArkadeEnrollment.submitOutgoing(submitRacePlan, {
+      approved: true
+    }),
+    /locked/
+  )
+  assert.equal(submitRace.wallet.submitCount, 0)
+
+  const reloadStore = new Map()
+  const firstLoad = makeFixture({
+    amountSat: 1_000,
+    inputValue: 1_000,
+    store: reloadStore
+  })
+  await firstLoad.window.ArkadeEnrollment.prepareOutgoing(intentId, walletId)
+  const reloaded = makeFixture({
+    amountSat: 1_000,
+    inputValue: 1_000,
+    store: reloadStore
+  })
+  assert.equal(
+    (await reloaded.window.ArkadeEnrollment.listOutgoing()).length,
+    1
+  )
+
+  const browserLoss = makeFixture({amountSat: 1_000, inputValue: 1_000})
+  browserLoss.state.status = 'submitted'
+  const hydrated = await browserLoss.window.ArkadeEnrollment.listOutgoing()
+  assert.equal(hydrated.length, 1)
+  assert.equal(hydrated[0].intentId, intentId)
+  assert.equal(hydrated[0].phase, 'submitted')
+  assert.equal(
+    JSON.stringify(browserLoss.wallet.indexerArgs[0].outpoints),
+    JSON.stringify([
+      {txid: browserLoss.input.txid, vout: browserLoss.input.vout}
+    ])
+  )
+
+  const spentRecovery = makeFixture({amountSat: 1_000, inputValue: 1_000})
+  await spentRecovery.window.ArkadeEnrollment.prepareOutgoing(
+    intentId,
+    walletId
+  )
+  spentRecovery.state.status = 'submitted'
+  spentRecovery.input.isSpent = true
+  spentRecovery.wallet.clearSpentOnFinalize = true
+  const spentResult =
+    await spentRecovery.window.ArkadeEnrollment.recoverOutgoing(intentId, {
+      approved: true
+    })
+  assert.equal(spentResult.status, 'submitted')
+  assert.equal(spentRecovery.wallet.submitCount, 1)
+  assert.strictEqual(spentRecovery.wallet.finalizeArgs[0], spentRecovery.input)
+
+  const secondGetMismatch = makeFixture({amountSat: 1_000, inputValue: 1_000})
+  await secondGetMismatch.window.ArkadeEnrollment.prepareOutgoing(
+    intentId,
+    walletId
+  )
+  secondGetMismatch.state.status = 'submitted'
+  secondGetMismatch.state.mismatchOnGet = 3
+  const mismatchResult =
+    await secondGetMismatch.window.ArkadeEnrollment.recoverOutgoing(intentId, {
+      approved: true
+    })
+  assert.equal(mismatchResult.phase, 'reconciliation_required')
+  assert.equal(secondGetMismatch.wallet.submitCount, 0)
+
+  const tampered = makeFixture({amountSat: 1_000, inputValue: 1_000})
+  await tampered.window.ArkadeEnrollment.prepareOutgoing(intentId, walletId)
+  const journalKey = `lnbits-arkade-outgoing-v1:http://lnbits.test:${accountId}`
+  const journal = JSON.parse(tampered.window.localStorage.getItem(journalKey))
+  journal[0].previewCommitment = '00'
+  tampered.window.localStorage.setItem(journalKey, JSON.stringify(journal))
+  tampered.state.status = 'submitted'
+  const tamperedResult = await tampered.window.ArkadeEnrollment.recoverOutgoing(
+    intentId,
+    {approved: true}
+  )
+  assert.equal(tamperedResult.phase, 'reconciliation_required')
+  assert.equal(tampered.wallet.finalizeArgs, null)
+
+  const lockedRecovery = makeFixture({amountSat: 1_000, inputValue: 1_000})
+  await lockedRecovery.window.ArkadeEnrollment.prepareOutgoing(
+    intentId,
+    walletId
+  )
+  lockedRecovery.window.ArkadeEnrollment.lock()
+  await assert.rejects(
+    lockedRecovery.window.ArkadeEnrollment.recoverOutgoing(intentId, {
+      approved: true
+    }),
+    /wallet is locked/
+  )
+
+  const terminal = makeFixture({amountSat: 1_000, inputValue: 1_000})
+  await terminal.window.ArkadeEnrollment.prepareOutgoing(intentId, walletId)
+  terminal.state.status = 'settled'
+  const terminalResult = await terminal.window.ArkadeEnrollment.recoverOutgoing(
+    intentId,
+    {approved: true}
+  )
+  assert.equal(terminalResult.status, 'settled')
+  assert.equal(terminal.wallet.submitCount, 0)
+  assert.equal(terminal.wallet.finalizeArgs, null)
+
+  const released = makeFixture({amountSat: 1_000, inputValue: 1_000})
+  await released.window.ArkadeEnrollment.prepareOutgoing(intentId, walletId)
+  released.state.status = 'released'
+  const releasedResult = await released.window.ArkadeEnrollment.recoverOutgoing(
+    intentId,
+    {approved: true}
+  )
+  assert.equal(releasedResult.status, 'released')
+  assert.equal(
+    (await released.window.ArkadeEnrollment.listOutgoing()).length,
+    0
+  )
+  assert.equal(released.wallet.finalizeCount, 0)
+
+  const tamperedReleased = makeFixture({amountSat: 1_000, inputValue: 1_000})
+  await tamperedReleased.window.ArkadeEnrollment.prepareOutgoing(
+    intentId,
+    walletId
+  )
+  tamperedReleased.state.status = 'released'
+  tamperedReleased.state.tamperedReleased = true
+  const tamperedReleasedResult =
+    await tamperedReleased.window.ArkadeEnrollment.recoverOutgoing(intentId, {
+      approved: true
+    })
+  assert.equal(tamperedReleasedResult.phase, 'reconciliation_required')
+  assert.equal(
+    (await tamperedReleased.window.ArkadeEnrollment.listOutgoing()).length,
+    1
+  )
+  assert.equal(tamperedReleased.wallet.finalizeCount, 0)
+
+  const submittedReleased = makeFixture({amountSat: 1_000, inputValue: 1_000})
+  await submittedReleased.window.ArkadeEnrollment.prepareOutgoing(
+    intentId,
+    walletId
+  )
+  const submittedReleasedKey = `lnbits-arkade-outgoing-v1:http://lnbits.test:${accountId}`
+  const submittedReleasedJournal = JSON.parse(
+    submittedReleased.window.localStorage.getItem(submittedReleasedKey)
+  )
+  submittedReleasedJournal[0].phase = 'submitted'
+  submittedReleased.window.localStorage.setItem(
+    submittedReleasedKey,
+    JSON.stringify(submittedReleasedJournal)
+  )
+  submittedReleased.state.status = 'released'
+  const submittedReleasedResult =
+    await submittedReleased.window.ArkadeEnrollment.recoverOutgoing(intentId, {
+      approved: true
+    })
+  assert.equal(submittedReleasedResult.phase, 'reconciliation_required')
+  assert.equal(
+    (await submittedReleased.window.ArkadeEnrollment.listOutgoing()).length,
+    1
+  )
+  assert.equal(submittedReleased.wallet.finalizeCount, 0)
+
+  const disputed = makeFixture({amountSat: 1_000, inputValue: 1_000})
+  await disputed.window.ArkadeEnrollment.prepareOutgoing(intentId, walletId)
+  disputed.state.status = 'disputed'
+  const disputedResult = await disputed.window.ArkadeEnrollment.recoverOutgoing(
+    intentId,
+    {approved: true}
+  )
+  assert.equal(disputedResult.status, 'disputed')
+  assert.equal(disputedResult.reconciliationRequired, true)
+  assert.equal(
+    (await disputed.window.ArkadeEnrollment.listOutgoing()).length,
+    1
+  )
+
+  const fullJournal = makeFixture({amountSat: 1_000, inputValue: 1_000})
+  const journalIds = Array.from({length: 32}, (_, index) =>
+    index.toString(16).padStart(32, '0')
+  )
+  for (const journalId of journalIds)
+    await fullJournal.window.ArkadeEnrollment.prepareOutgoing(
+      journalId,
+      walletId
+    )
+  const fullJournalKey = `lnbits-arkade-outgoing-v1:http://lnbits.test:${accountId}`
+  const beforeFull = fullJournal.window.localStorage.getItem(fullJournalKey)
+  await assert.rejects(
+    fullJournal.window.ArkadeEnrollment.prepareOutgoing(
+      'ff'.repeat(16),
+      walletId
+    ),
+    /journal is full/
+  )
+  assert.equal(
+    fullJournal.window.localStorage.getItem(fullJournalKey),
+    beforeFull
+  )
+
+  const terminalJournal = makeFixture({amountSat: 1_000, inputValue: 1_000})
+  for (let index = 0; index < 40; index++) {
+    terminalJournal.state.status = 'reserved'
+    const terminalId = index.toString(16).padStart(32, '0')
+    await terminalJournal.window.ArkadeEnrollment.prepareOutgoing(
+      terminalId,
+      walletId
+    )
+    terminalJournal.state.status = index % 2 ? 'released' : 'settled'
+    assert.equal(
+      (await terminalJournal.window.ArkadeEnrollment.listOutgoing()).length,
+      0
+    )
+  }
   console.log('arkade outgoing browser helper checks passed')
 }
 

@@ -121,11 +121,18 @@ async def remove_deleted_wallets(conn: Connection | None = None) -> None:
     if settings.lnbits_effective_installation_mode != "arkade_noncustodial":
         await (conn or db).execute("DELETE FROM wallets WHERE deleted = true")
         return
-    await (conn or db).execute(
-        "DELETE FROM wallets WHERE deleted = true AND NOT EXISTS ("
-        "SELECT 1 FROM arkade_receive_requests "
-        "WHERE wallet_id = wallets.id)"
-    )
+    wallets = await (conn or db).fetchall("SELECT id FROM wallets WHERE deleted = true")
+    for wallet in wallets:
+        try:
+            await ensure_arkade_wallet_deletion_allowed(wallet["id"], conn=conn)
+        except ValueError:
+            continue
+        await (conn or db).execute(
+            "DELETE FROM wallets WHERE id = :wallet AND deleted = true "
+            "AND NOT EXISTS (SELECT 1 FROM arkade_receive_requests "
+            "WHERE wallet_id = wallets.id)",
+            {"wallet": wallet["id"]},
+        )
 
 
 async def delete_unused_wallets(
@@ -134,15 +141,28 @@ async def delete_unused_wallets(
 ) -> None:
     delta = int(time()) - time_delta
     if settings.lnbits_effective_installation_mode == "arkade_noncustodial":
-        await (conn or db).execute(
-            "DELETE FROM wallets WHERE deleted = true AND ("
+        wallets = await (conn or db).fetchall(
+            "SELECT id FROM wallets WHERE deleted = true AND ("
             "SELECT COUNT(*) FROM apipayments WHERE wallet_id = wallets.id"
             ") = 0 AND (updated_at < :delta OR (updated_at IS NULL "
-            "AND created_at < :delta)) AND NOT EXISTS ("
-            "SELECT 1 FROM arkade_receive_requests "
-            "WHERE wallet_id = wallets.id)",
+            "AND created_at < :delta))",
             {"delta": delta},
         )
+        for wallet in wallets:
+            try:
+                await ensure_arkade_wallet_deletion_allowed(wallet["id"], conn=conn)
+            except ValueError:
+                continue
+            await (conn or db).execute(
+                "DELETE FROM wallets WHERE id = :wallet AND deleted = true "
+                "AND (SELECT COUNT(*) FROM apipayments "
+                "WHERE wallet_id = wallets.id) = 0 "
+                "AND (updated_at < :delta OR (updated_at IS NULL "
+                "AND created_at < :delta)) "
+                "AND NOT EXISTS (SELECT 1 FROM arkade_receive_requests "
+                "WHERE wallet_id = wallets.id)",
+                {"wallet": wallet["id"], "delta": delta},
+            )
         return
     await (conn or db).execute(
         """

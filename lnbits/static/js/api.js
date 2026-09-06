@@ -51,6 +51,20 @@ window._lnbitsApi = {
     }
     return this.request('post', '/api/v1/payments', wallet.adminkey, data)
   },
+  payArkade(wallet, address, amount, idempotencyKey) {
+    return this.request(
+      'post',
+      '/api/v1/payments',
+      wallet.adminkey,
+      {out: true, unit: 'sat', amount, arkade_address: address},
+      {
+        headers: {
+          'X-Api-Key': wallet.adminkey,
+          'Idempotency-Key': idempotencyKey
+        }
+      }
+    )
+  },
   cancelInvoice(wallet, paymentHash) {
     return this.request('post', '/api/v1/payments/cancel', wallet.adminkey, {
       payment_hash: paymentHash
@@ -129,11 +143,23 @@ window._lnbitsApi = {
       url: `/api/v1/arkade/outgoing/${intentId}`
     })
   },
+  arkadeSubmittedOutgoingIntents(limit = 32) {
+    return axios({
+      method: 'GET',
+      url: `/api/v1/arkade/outgoing?limit=${limit}`
+    })
+  },
   arkadeOutgoingAuthorize(intentId, data) {
     return axios({
       method: 'POST',
       url: `/api/v1/arkade/outgoing/${intentId}/authorize`,
       data
+    })
+  },
+  arkadeOutgoingRelease(intentId) {
+    return axios({
+      method: 'POST',
+      url: `/api/v1/arkade/outgoing/${intentId}/release`
     })
   },
   login(username, password) {

@@ -1,6 +1,6 @@
 from http import HTTPStatus
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 
 from lnbits.core.models import (
     Account,
@@ -11,6 +11,7 @@ from lnbits.core.models import (
     ArkadeOutgoingIntentResponse,
     ArkadeReceiveAcknowledgement,
     ArkadeReceiveRequest,
+    SimpleStatus,
 )
 from lnbits.core.services.arkade import (
     ArkadeEnrollmentError,
@@ -22,6 +23,8 @@ from lnbits.core.services.arkade import (
     create_enrollment_challenge,
     get_arkade_outgoing_intent_for_account,
     get_arkade_receive_request_for_account,
+    list_arkade_submitted_outgoing_intents,
+    release_arkade_outgoing_payment,
 )
 from lnbits.decorators import check_authenticated_account
 
@@ -69,9 +72,23 @@ def _public_outgoing_error(exc: ArkadeOutgoingError) -> HTTPException:
         "ARKADE_OUTGOING_NOT_FOUND",
         "ARKADE_OUTGOING_OUTPUT_CONFLICT",
         "ARKADE_OUTGOING_OUTPUT_INVALID",
+        "ARKADE_OUTGOING_INVALID_REQUEST",
         "ARKADE_OUTGOING_UNAVAILABLE",
+        "ARKADE_BACKING_DEFICIT",
+        "ARKADE_BACKING_RECONCILIATION_REQUIRED",
         "ARKADE_DESCRIPTOR_REENROLLMENT_REQUIRED",
         "ARKADE_INSUFFICIENT_FUNDS",
+        "ARKADE_WALLET_NOT_OWNED",
+        "ARKADE_TRANSFER_DESTINATION_NOT_FOUND",
+        "ARKADE_TRANSFER_CROSS_ACCOUNT_REQUIRED",
+        "ARKADE_TRANSFER_RECEIVER_NOT_ALLOWED",
+        "ARKADE_TRANSFER_SAME_WALLET",
+        "ARKADE_TRANSFER_MAPPING_NOT_READY",
+        "ARKADE_TRANSFER_EXPIRED",
+        "ARKADE_TRANSFER_AMOUNT_CONFLICT",
+        "ARKADE_TRANSFER_RECEIVER_INVALID",
+        "ARKADE_TRANSFER_CORRUPT",
+        "ARKADE_TRANSFER_REQUEST_CONSUMED",
     }:
         code = "ARKADE_OUTGOING_ERROR"
     return HTTPException(HTTPStatus.BAD_REQUEST, code)
@@ -141,6 +158,17 @@ async def api_arkade_receive_ack(
         raise _public_receive_error(exc) from exc
 
 
+@arkade_router.get("/outgoing", response_model=list[ArkadeOutgoingIntentResponse])
+async def api_arkade_submitted_outgoing_intents(
+    limit: int = Query(32, ge=1, le=32),
+    account: Account = Depends(check_authenticated_account),
+):
+    try:
+        return await list_arkade_submitted_outgoing_intents(account.id, limit)
+    except ArkadeOutgoingError as exc:
+        raise _public_outgoing_error(exc) from exc
+
+
 @arkade_router.get("/outgoing/{intent_id}", response_model=ArkadeOutgoingIntentResponse)
 async def api_arkade_outgoing_intent(
     intent_id: str,
@@ -169,5 +197,17 @@ async def api_arkade_outgoing_authorize(
             destination_script=data.destination_script,
             change=data.change,
         )
+    except ArkadeOutgoingError as exc:
+        raise _public_outgoing_error(exc) from exc
+
+
+@arkade_router.post("/outgoing/{intent_id}/release", response_model=SimpleStatus)
+async def api_arkade_outgoing_release(
+    intent_id: str,
+    account: Account = Depends(check_authenticated_account),
+):
+    try:
+        await release_arkade_outgoing_payment(account.id, intent_id)
+        return SimpleStatus(success=True, message="Arkade reservation released.")
     except ArkadeOutgoingError as exc:
         raise _public_outgoing_error(exc) from exc
