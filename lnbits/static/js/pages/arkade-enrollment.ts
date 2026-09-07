@@ -24,7 +24,17 @@ const HEX64 = /^[0-9a-f]{64}$/
 const NETWORK = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/
 const IDENTITY_DESCRIPTOR =
   /^tr\(\[[0-9a-f]{8}\/86'\/[01]'\/0'\](?:xpub|tpub)[1-9A-HJ-NP-Za-km-z]+\/0\/\*\)$/
-const PASSWORD_MIN_LENGTH = 12
+const isValidPin = (value: string) => value === '' || /^\d{6}$/.test(value)
+const enrollmentErrorCode = (error: unknown) => {
+  const value = error as {response?: {data?: {detail?: unknown}}}
+  const detail = value?.response?.data?.detail
+  return detail === 'ARKADE_ENROLLMENT_MIGRATION_REQUIRED'
+    ? detail
+    : error instanceof Error &&
+        error.message === 'ARKADE_ENROLLMENT_MIGRATION_REQUIRED'
+      ? error.message
+      : ''
+}
 const MAX_CIPHERTEXT_BYTES = 1024 * 1024
 const RECEIVE_JOURNAL_PREFIX = 'lnbits-arkade-receive-v1'
 const OUTGOING_JOURNAL_PREFIX = 'lnbits-arkade-outgoing-v1'
@@ -1937,8 +1947,6 @@ const unlock = async (password: string) => {
   if (!activeBinding) await probe()
   const record = await readVault(accountId)
   if (!record || !strictRecord(record)) throw new Error('vault unavailable')
-  if (Array.from(password).length < PASSWORD_MIN_LENGTH)
-    throw new Error('password too short')
   const mnemonic = await decryptVault(
     accountId,
     password,
@@ -2001,10 +2009,7 @@ window.ArkadeEnrollment = {
   },
   async enroll(mnemonic: string, password: string, acknowledged: boolean) {
     const clean = mnemonic.trim().split(/\s+/).join(' ')
-    if (
-      !validateMnemonic(clean, wordlist) ||
-      Array.from(password).length < PASSWORD_MIN_LENGTH
-    )
+    if (!validateMnemonic(clean, wordlist) || !isValidPin(password))
       throw new Error('invalid wallet details')
     if (!acknowledged) throw new Error('backup acknowledgement required')
     const accountId = window.g.user.id
@@ -2107,9 +2112,25 @@ window.PageArkadeEnrollment = {
       state: 'unavailable',
       mode: '',
       mnemonic: '',
+      mnemonicWords: Array(12).fill(''),
       password: '',
       passwordRepeat: '',
-      backupAcknowledged: false
+      backupAcknowledged: false,
+      backup: {
+        step: 1,
+        visible: false,
+        challenge: [],
+        answers: {},
+        error: ''
+      }
+    }
+  },
+  computed: {
+    seedWords() {
+      return this.mnemonic
+        .split(/\s+/)
+        .filter(Boolean)
+        .map((word, index) => ({index, word}))
     }
   },
   async created() {
@@ -2118,13 +2139,42 @@ window.PageArkadeEnrollment = {
     await this.inspect()
   },
   methods: {
+    prepareChallenge() {
+      const words = this.mnemonic.split(/\s+/).filter(Boolean)
+      const count = Math.min(4, words.length)
+      const indexes = _.shuffle([...Array(words.length).keys()]).slice(0, count)
+      this.backup.challenge = indexes
+        .sort((a, b) => a - b)
+        .map(index => ({index, word: words[index]}))
+      this.backup.answers = {}
+      this.backup.error = ''
+      this.backup.step = 2
+    },
+    submitChallenge() {
+      const isValid =
+        this.backup.challenge.length > 0 &&
+        this.backup.challenge.every(({index, word}) => {
+          const answer = this.backup.answers[index] || ''
+          return answer.trim().toLowerCase() === word.toLowerCase()
+        })
+      if (!isValid) {
+        this.backup.error =
+          'One or more words are incorrect. Check your backup and try again.'
+        return
+      }
+      this.backupAcknowledged = true
+      this.backup.visible = false
+    },
     async inspect() {
       this.loading = true
       try {
         this.state = (await window.ArkadeEnrollment.inspect()).state
         this.g.arkadeEnrollmentState = this.state
-      } catch {
-        this.state = 'unavailable'
+      } catch (error) {
+        this.state =
+          enrollmentErrorCode(error) === 'ARKADE_ENROLLMENT_MIGRATION_REQUIRED'
+            ? 'migration_required'
+            : 'unavailable'
       } finally {
         this.loading = false
       }
@@ -2132,13 +2182,33 @@ window.PageArkadeEnrollment = {
     startCreate() {
       this.mode = 'create'
       this.mnemonic = generateMnemonic(wordlist, 128)
+      this.mnemonicWords = Array(12).fill('')
       this.password = ''
       this.passwordRepeat = ''
       this.backupAcknowledged = false
+      this.backup = {
+        step: 1,
+        visible: false,
+        challenge: [],
+        answers: {},
+        error: ''
+      }
+    },
+    pasteMnemonic(event: ClipboardEvent, index: number) {
+      const words =
+        event.clipboardData?.getData('text').trim().split(/\s+/) || []
+      if (words.length <= 1) return
+      event.preventDefault()
+      this.mnemonicWords.splice(
+        index,
+        words.length,
+        ...words.slice(0, 12 - index)
+      )
     },
     startRestore() {
       this.mode = 'restore'
       this.mnemonic = ''
+      this.mnemonicWords = Array(12).fill('')
       this.password = ''
       this.passwordRepeat = ''
       this.backupAcknowledged = true
@@ -2146,6 +2216,7 @@ window.PageArkadeEnrollment = {
     cancel() {
       this.mode = ''
       this.mnemonic = ''
+      this.mnemonicWords = Array(12).fill('')
       this.password = ''
       this.passwordRepeat = ''
       this.backupAcknowledged = false
@@ -2194,8 +2265,12 @@ window.PageArkadeEnrollment = {
       try {
         if (this.password !== this.passwordRepeat)
           throw new Error('password mismatch')
+        const mnemonic =
+          this.mode === 'restore'
+            ? this.mnemonicWords.join(' ').trim()
+            : this.mnemonic
         await window.ArkadeEnrollment.enroll(
-          this.mnemonic,
+          mnemonic,
           this.password,
           this.backupAcknowledged
         )

@@ -15,6 +15,81 @@ const differentMnemonic =
 const hexBytes = (value: string) =>
   Uint8Array.from(value.match(/.{2}/g) || [], pair => parseInt(pair, 16))
 
+test('restore model accepts a pasted twelve word phrase into individual inputs', async ({
+  page
+}) => {
+  const script = await readFile(modulePath, 'utf8')
+  await page.addInitScript(script)
+  await page.route('http://127.0.0.1/enrollment-restore-inputs', route =>
+    route.fulfill({contentType: 'text/html', body: '<!doctype html>'})
+  )
+  await page.goto('http://127.0.0.1/enrollment-restore-inputs')
+  const result = await page.evaluate(phrase => {
+    const model = window.PageArkadeEnrollment.data()
+    window.PageArkadeEnrollment.methods.startRestore.call(model)
+    let prevented = false
+    window.PageArkadeEnrollment.methods.pasteMnemonic.call(
+      model,
+      {
+        clipboardData: {getData: () => phrase},
+        preventDefault: () => {
+          prevented = true
+        }
+      },
+      0
+    )
+    let submitted = ''
+    window.ArkadeEnrollment.enroll = async (value: string) => {
+      submitted = value
+    }
+    model.password = '123456'
+    model.passwordRepeat = '123456'
+    model.$router = {push: async () => {}}
+    return window.PageArkadeEnrollment.methods.submit.call(model).then(() => ({
+      words: model.mnemonicWords,
+      prevented,
+      inputCount: model.mnemonicWords.length,
+      submitted
+    }))
+  }, mnemonic)
+  expect(result.inputCount).toBe(12)
+  expect(result.words.join(' ')).toBe(mnemonic)
+  expect(result.prevented).toBe(true)
+  expect(result.submitted).toBe(mnemonic)
+})
+
+test('enrollment shows migration state for the safe migration error code', async ({
+  page
+}) => {
+  const script = await readFile(modulePath, 'utf8')
+  await page.addInitScript(script)
+  await page.route('http://127.0.0.1/enrollment-migration-state', route =>
+    route.fulfill({contentType: 'text/html', body: '<!doctype html>'})
+  )
+  await page.goto('http://127.0.0.1/enrollment-migration-state')
+  const state = await page.evaluate(async () => {
+    window.ArkadeEnrollment.inspect = async () => {
+      throw new Error('ARKADE_ENROLLMENT_MIGRATION_REQUIRED')
+    }
+    const model = window.PageArkadeEnrollment.data()
+    await window.PageArkadeEnrollment.methods.inspect.call(model)
+    return model.state
+  })
+  expect(state).toBe('migration_required')
+})
+
+test('unlock template accepts legacy password length', async () => {
+  const template = await readFile(
+    resolve(__dirname, '../../lnbits/templates/pages/arkade-enrollment.vue'),
+    'utf8'
+  )
+  const locked = template.match(
+    /state === 'wallet_locked'[\s\S]*?<\/q-card-section>/
+  )?.[0]
+  expect(locked).toContain('Local unlock password or PIN')
+  expect(locked).not.toContain('maxlength="6"')
+})
+
 test('browser enrollment signs only the public proof and unlocks after reload', async ({
   page
 }) => {
@@ -83,8 +158,8 @@ test('browser enrollment signs only the public proof and unlocks after reload', 
     const model = {
       mode: 'create',
       mnemonic: phrase,
-      password: 'correct horse battery',
-      passwordRepeat: 'correct horse battery',
+      password: '123456',
+      passwordRepeat: '123456',
       backupAcknowledged: true
     }
     window.PageArkadeEnrollment.methods.cancel.call(model)
@@ -97,8 +172,15 @@ test('browser enrollment signs only the public proof and unlocks after reload', 
   expect(canceled.mode).toBe('')
   expect(await page.evaluate(() => window.__enrollmentRequests)).toHaveLength(0)
 
+  await expect(
+    page.evaluate(
+      async phrase => window.ArkadeEnrollment.enroll(phrase, 'too-short', true),
+      mnemonic
+    )
+  ).rejects.toThrow('invalid wallet details')
+
   await page.evaluate(async phrase => {
-    await window.ArkadeEnrollment.enroll(phrase, 'correct horse battery', true)
+    await window.ArkadeEnrollment.enroll(phrase, '123456', true)
   }, mnemonic)
 
   const result = await page.evaluate(async id => {
@@ -125,11 +207,69 @@ test('browser enrollment signs only the public proof and unlocks after reload', 
   expect(result.state).toBe('ready_unlocked')
   expect(result.requests).toHaveLength(1)
   expect(JSON.stringify(result.requests[0])).not.toContain(mnemonic)
-  expect(JSON.stringify(result.requests[0])).not.toContain(
-    'correct horse battery'
-  )
+  expect(JSON.stringify(result.requests[0])).not.toContain('123456')
   expect(result.record.ciphertext).toBeTruthy()
   expect(JSON.stringify(result.record)).not.toContain(mnemonic)
+
+  await page.evaluate(
+    async ({id, phrase, password}) => {
+      const open = indexedDB.open('lnbits-arkade-vault-v1', 1)
+      const record = await new Promise<any>(resolve => {
+        open.onsuccess = () => {
+          const request = open.result
+            .transaction('vaults')
+            .objectStore('vaults')
+            .get(id)
+          request.onsuccess = () => resolve(request.result)
+        }
+      })
+      const material = await crypto.subtle.importKey(
+        'raw',
+        new TextEncoder().encode(password),
+        'PBKDF2',
+        false,
+        ['deriveKey']
+      )
+      const key = await crypto.subtle.deriveKey(
+        {
+          name: 'PBKDF2',
+          salt: record.salt,
+          iterations: record.iterations,
+          hash: 'SHA-256'
+        },
+        material,
+        {name: 'AES-GCM', length: 256},
+        false,
+        ['encrypt']
+      )
+      const encrypted = await crypto.subtle.encrypt(
+        {
+          name: 'AES-GCM',
+          iv: record.iv,
+          tagLength: 128,
+          additionalData: new TextEncoder().encode(
+            [
+              'lnbits-arkade-vault-v1',
+              location.origin,
+              id,
+              record.network,
+              record.identityXonlyPubkey
+            ].join('\n')
+          )
+        },
+        key,
+        new TextEncoder().encode(phrase)
+      )
+      await new Promise<void>(resolve => {
+        const request = open.result
+          .transaction('vaults', 'readwrite')
+          .objectStore('vaults')
+          .put({...record, ciphertext: encrypted})
+        request.onsuccess = () => resolve()
+      })
+    },
+    {id: accountId, phrase: mnemonic, password: 'legacy local password'}
+  )
 
   const proof = result.requests[0] as Record<string, string | number>
   expect(proof.identity_descriptor).toMatch(
@@ -207,7 +347,7 @@ test('browser enrollment signs only the public proof and unlocks after reload', 
     page.evaluate(() => window.ArkadeEnrollment.unlock('wrong password'))
   ).rejects.toThrow()
   await page.evaluate(() =>
-    window.ArkadeEnrollment.unlock('correct horse battery')
+    window.ArkadeEnrollment.unlock('legacy local password')
   )
   expect(await page.evaluate(() => window.g.arkadeEnrollmentState)).toBe(
     'ready_unlocked'
@@ -230,7 +370,7 @@ test('browser enrollment signs only the public proof and unlocks after reload', 
     })
   }, accountId)
   await page.evaluate(async phrase => {
-    await window.ArkadeEnrollment.enroll(phrase, 'another local password', true)
+    await window.ArkadeEnrollment.enroll(phrase, '654321', true)
   }, mnemonic)
   const afterDuplicate = await page.evaluate(async id => {
     const open = indexedDB.open('lnbits-arkade-vault-v1', 1)
@@ -278,7 +418,7 @@ test('browser enrollment signs only the public proof and unlocks after reload', 
     }
   })
   expect(JSON.stringify(surfaces)).not.toContain(mnemonic)
-  expect(JSON.stringify(surfaces)).not.toContain('correct horse battery')
+  expect(JSON.stringify(surfaces)).not.toContain('123456')
   expect(logs).toEqual([])
 })
 
@@ -327,11 +467,7 @@ test('browser enrollment derives the mainnet account descriptor', async ({
           }
         }
       }
-      await window.ArkadeEnrollment.enroll(
-        phrase,
-        'correct horse battery',
-        true
-      )
+      await window.ArkadeEnrollment.enroll(phrase, '123456', true)
       return completion
     },
     {id: accountId, phrase: mnemonic}
@@ -446,11 +582,7 @@ test('generated module rejects vault tampering and restores a lost ready vault',
   await expect(
     page.evaluate(async phrase => {
       window.__enrollmentTestControl.mutateServerOnCall = 2
-      return window.ArkadeEnrollment.enroll(
-        phrase,
-        'correct horse battery',
-        true
-      )
+      return window.ArkadeEnrollment.enroll(phrase, '123456', true)
     }, mnemonic)
   ).rejects.toThrow()
   await page.evaluate(() => {
@@ -458,9 +590,7 @@ test('generated module rejects vault tampering and restores a lost ready vault',
     window.__enrollmentTestControl.failCompletion = true
     window.ArkadeEnrollment.lock()
   })
-  await page.evaluate(() =>
-    window.ArkadeEnrollment.unlock('correct horse battery')
-  )
+  await page.evaluate(() => window.ArkadeEnrollment.unlock('123456'))
   await expect(
     page.evaluate(() => window.ArkadeEnrollment.finish())
   ).rejects.toThrow()
@@ -498,7 +628,7 @@ test('generated module rejects vault tampering and restores a lost ready vault',
     })
   }, accountId)
   await page.evaluate(async phrase => {
-    await window.ArkadeEnrollment.enroll(phrase, 'another local password', true)
+    await window.ArkadeEnrollment.enroll(phrase, '654321', true)
   }, mnemonic)
   const duplicateAfter = await page.evaluate(async id => {
     const open = indexedDB.open('lnbits-arkade-vault-v1', 1)
@@ -527,8 +657,7 @@ test('generated module rejects vault tampering and restores a lost ready vault',
   })
   await expect(
     page.evaluate(
-      async phrase =>
-        window.ArkadeEnrollment.enroll(phrase, 'another local password', true),
+      async phrase => window.ArkadeEnrollment.enroll(phrase, '654321', true),
       mnemonic
     )
   ).rejects.toThrow()
@@ -553,9 +682,7 @@ test('generated module rejects vault tampering and restores a lost ready vault',
     )
     await page.evaluate(() => window.ArkadeEnrollment.lock())
     await expect(
-      page.evaluate(() =>
-        window.ArkadeEnrollment.unlock('correct horse battery')
-      )
+      page.evaluate(() => window.ArkadeEnrollment.unlock('123456'))
     ).rejects.toThrow()
     await page.evaluate(
       async ({id, envelope}) => {
@@ -622,15 +749,13 @@ test('generated module rejects vault tampering and restores a lost ready vault',
   }, accountId)
   // A missing vault is recoverable only with the same root, not a rebind.
   await page.evaluate(
-    async phrase =>
-      window.ArkadeEnrollment.enroll(phrase, 'new correct horse', true),
+    async phrase => window.ArkadeEnrollment.enroll(phrase, '135790', true),
     mnemonic
   )
   await page.evaluate(() => window.ArkadeEnrollment.lock())
   await expect(
     page.evaluate(
-      phrase =>
-        window.ArkadeEnrollment.enroll(phrase, 'new correct horse', true),
+      phrase => window.ArkadeEnrollment.enroll(phrase, '135790', true),
       differentMnemonic
     )
   ).rejects.toThrow()
@@ -659,8 +784,8 @@ test('generated module rejects vault tampering and restores a lost ready vault',
     }
   })
   expect(JSON.stringify(surfaces)).not.toContain(mnemonic)
-  expect(JSON.stringify(surfaces)).not.toContain('correct horse battery')
-  expect(JSON.stringify(surfaces)).not.toContain('new correct horse')
+  expect(JSON.stringify(surfaces)).not.toContain('123456')
+  expect(JSON.stringify(surfaces)).not.toContain('135790')
   expect(logs).toEqual([])
 })
 
@@ -752,7 +877,7 @@ test('browser receive allocation retries the journaled mapping without reallocat
   }, accountId)
 
   await page.evaluate(async phrase => {
-    await window.ArkadeEnrollment.enroll(phrase, 'correct horse battery', true)
+    await window.ArkadeEnrollment.enroll(phrase, '123456', true)
   }, mnemonic)
   await page.evaluate(() => {
     const request = window.__receiveRequest as Record<string, unknown>

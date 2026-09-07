@@ -11,7 +11,13 @@ from fastapi import HTTPException as FastAPIHTTPException
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 
+import lnbits.db as database
 from lnbits.core import migrations
+from lnbits.core.crud.arkade import (
+    ensure_arkade_binding_for_existing_account,
+    get_arkade_binding,
+    update_arkade_challenge,
+)
 from lnbits.core.helpers import get_arkade_configuration
 from lnbits.core.models import (
     Account,
@@ -21,6 +27,7 @@ from lnbits.core.models import (
 )
 from lnbits.core.services.arkade import (
     ArkadeEnrollmentError,
+    ArkadeEnrollmentMigrationRequiredError,
     canonical_enrollment_statement,
     complete_arkade_binding,
     complete_enrollment,
@@ -220,6 +227,55 @@ async def test_challenge_cas_loser_reloads_only_same_key_winner(monkeypatch):
         )
 
 
+@pytest.mark.anyio
+async def test_legacy_unused_account_gets_enrollment_placeholder(monkeypatch):
+    import lnbits.core.services.arkade as service
+
+    binding = _binding_model()
+    monkeypatch.setattr(
+        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
+    )
+    monkeypatch.setattr(
+        service,
+        "ensure_arkade_binding_for_existing_account",
+        AsyncMock(return_value=binding),
+    )
+    monkeypatch.setattr(
+        service, "get_arkade_binding", AsyncMock(side_effect=[None, binding])
+    )
+
+    async def update(current, **kwargs):
+        current.idempotency_key = kwargs["idempotency_key"]
+        current.challenge_nonce = kwargs["nonce"]
+        current.challenge_expires_at = kwargs["expires_at"]
+        return True
+
+    monkeypatch.setattr(service, "update_arkade_challenge", update)
+    result = await service.create_enrollment_challenge(
+        Account(id=binding.account_id), "aa" * 16
+    )
+    assert cast(ArkadeEnrollmentChallenge, result).account_id == binding.account_id
+
+
+@pytest.mark.anyio
+async def test_legacy_account_with_wallet_activity_requires_explicit_migration(
+    monkeypatch,
+):
+    import lnbits.core.services.arkade as service
+
+    monkeypatch.setattr(
+        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
+    )
+    monkeypatch.setattr(
+        service,
+        "ensure_arkade_binding_for_existing_account",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(service, "get_arkade_binding", AsyncMock(return_value=None))
+    with pytest.raises(ArkadeEnrollmentError, match="explicit migration"):
+        await service.create_enrollment_challenge(Account(id=uuid4().hex), "aa" * 16)
+
+
 async def _binding(binding):
     return binding
 
@@ -249,6 +305,96 @@ async def sqlite_connection():
         )
         yield connection
     await engine.dispose()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("balance", [1, -1])
+async def test_legacy_binding_rejects_nonzero_balance(
+    sqlite_connection, monkeypatch, balance
+):
+    account_id = uuid4().hex
+    await sqlite_connection.execute(
+        'CREATE TABLE wallets (id TEXT PRIMARY KEY, "user" TEXT)'
+    )
+    await sqlite_connection.execute(
+        "CREATE TABLE balances (wallet_id TEXT, balance INT)"
+    )
+    await sqlite_connection.execute(
+        "INSERT INTO accounts (id) VALUES (:id)", {"id": account_id}
+    )
+    await sqlite_connection.execute(
+        'INSERT INTO wallets (id, "user") VALUES (:id, :user)',
+        {"id": "w" * 32, "user": account_id},
+    )
+    await sqlite_connection.execute(
+        "INSERT INTO balances (wallet_id, balance) VALUES (:wallet, :balance)",
+        {"wallet": "w" * 32, "balance": balance},
+    )
+    monkeypatch.setattr(settings, "lnbits_arkade_network", "regtest")
+    monkeypatch.setattr(settings, "lnbits_arkade_server_url", "http://localhost")
+    monkeypatch.setattr(settings, "lnbits_arkade_server_pubkey", _server_key())
+    assert (
+        await ensure_arkade_binding_for_existing_account(account_id, sqlite_connection)
+        is None
+    )
+
+
+@pytest.mark.anyio
+async def test_legacy_binding_rejects_payment_history(sqlite_connection, monkeypatch):
+    account_id = uuid4().hex
+    await sqlite_connection.execute(
+        'CREATE TABLE wallets (id TEXT PRIMARY KEY, "user" TEXT)'
+    )
+    await sqlite_connection.execute(
+        "CREATE TABLE balances (wallet_id TEXT, balance INT)"
+    )
+    await sqlite_connection.execute(
+        "INSERT INTO accounts (id) VALUES (:id)", {"id": account_id}
+    )
+    await sqlite_connection.execute(
+        'INSERT INTO wallets (id, "user") VALUES (:id, :user)',
+        {"id": "p" * 32, "user": account_id},
+    )
+    await sqlite_connection.execute(
+        "INSERT INTO apipayments (wallet_id) VALUES (:wallet)", {"wallet": "p" * 32}
+    )
+    assert (
+        await ensure_arkade_binding_for_existing_account(account_id, sqlite_connection)
+        is None
+    )
+
+
+@pytest.mark.anyio
+async def test_legacy_binding_creates_for_unused_zero_balance_wallet(
+    sqlite_connection, monkeypatch
+):
+    monkeypatch.setattr(database, "DB_TYPE", SQLITE)
+    account_id = uuid4().hex
+    await sqlite_connection.execute(
+        'CREATE TABLE wallets (id TEXT PRIMARY KEY, "user" TEXT)'
+    )
+    await sqlite_connection.execute(
+        "CREATE TABLE balances (wallet_id TEXT, balance INT)"
+    )
+    await sqlite_connection.execute(
+        "INSERT INTO accounts (id) VALUES (:id)", {"id": account_id}
+    )
+    await sqlite_connection.execute(
+        'INSERT INTO wallets (id, "user") VALUES (:id, :user)',
+        {"id": "z" * 32, "user": account_id},
+    )
+    monkeypatch.setattr(settings, "lnbits_arkade_network", "regtest")
+    monkeypatch.setattr(settings, "lnbits_arkade_server_url", "http://localhost")
+    monkeypatch.setattr(settings, "lnbits_arkade_server_pubkey", _server_key())
+    binding = await ensure_arkade_binding_for_existing_account(
+        account_id, sqlite_connection
+    )
+    assert binding and binding.account_id == account_id
+    row = await sqlite_connection.fetchone(
+        "SELECT COUNT(*) AS count FROM arkade_account_bindings WHERE account_id = :id",
+        {"id": account_id},
+    )
+    assert row["count"] == 1
 
 
 def _server_key() -> str:
@@ -502,6 +648,15 @@ async def test_missing_idempotency_header_maps_to_stable_error(monkeypatch):
         await arkade_api.api_arkade_enrollment_challenge(Account(id=uuid4().hex), None)
     assert exc.value.detail == "ARKADE_ENROLLMENT_ERROR"
 
+    monkeypatch.setattr(
+        arkade_api,
+        "create_enrollment_challenge",
+        AsyncMock(side_effect=ArkadeEnrollmentMigrationRequiredError("migration")),
+    )
+    with pytest.raises(FastAPIHTTPException) as exc:
+        await arkade_api.api_arkade_enrollment_challenge(Account(id=uuid4().hex), None)
+    assert exc.value.detail == "ARKADE_ENROLLMENT_MIGRATION_REQUIRED"
+
 
 @pytest.mark.anyio
 async def test_payment_guard_preserves_pending_error_and_blocks_ready(monkeypatch):
@@ -655,7 +810,7 @@ async def test_complete_arkade_binding_real_sql_cas_and_expiry(sqlite_connection
         enrollment_id="c" * 32,
         idempotency_key="d" * 32,
         nonce="e" * 64,
-        expires_at=expiry,
+        expires_at=expiry + timedelta(hours=1),
         server_utc_now=now,
         identity_xonly_pubkey="4" * 64,
         identity_descriptor=TESTNET_IDENTITY_DESCRIPTOR,
@@ -682,7 +837,7 @@ async def test_complete_arkade_binding_real_sql_cas_and_expiry(sqlite_connection
         enrollment_id="f" * 32,
         idempotency_key="1" * 32,
         nonce="2" * 64,
-        expires_at=now - timedelta(seconds=1),
+        expires_at=now + timedelta(hours=1),
         server_utc_now=now,
         identity_xonly_pubkey="5" * 64,
         identity_descriptor=TESTNET_IDENTITY_DESCRIPTOR,
@@ -699,6 +854,73 @@ async def test_complete_arkade_binding_real_sql_cas_and_expiry(sqlite_connection
         "challenge_nonce": "2" * 64,
         "identity_xonly_pubkey": None,
     }
+
+
+@pytest.mark.anyio
+async def test_update_arkade_challenge_uses_string_cas_not_expiry(
+    monkeypatch, sqlite_connection
+):
+    monkeypatch.setattr(database, "DB_TYPE", SQLITE)
+    now = datetime.now(timezone.utc)
+    account_id = "a" * 32
+    await sqlite_connection.execute(
+        "INSERT INTO accounts (id) VALUES (:id)", {"id": account_id}
+    )
+    await sqlite_connection.execute(
+        """
+        INSERT INTO arkade_account_bindings
+        (account_id, state, enrollment_id, network, server_url, server_pubkey,
+         created_at, updated_at)
+        VALUES (:account_id, 'pending', :enrollment_id, 'regtest',
+                'http://localhost', :server_pubkey, :created_at, :updated_at)
+        """,
+        {
+            "account_id": account_id,
+            "enrollment_id": "b" * 32,
+            "server_pubkey": "c" * 64,
+            "created_at": now,
+            "updated_at": now,
+        },
+    )
+    binding = await get_arkade_binding(account_id, conn=sqlite_connection)
+    assert binding
+
+    assert await update_arkade_challenge(
+        binding,
+        enrollment_id="d" * 32,
+        idempotency_key="e" * 32,
+        nonce="f" * 64,
+        expires_at=now + timedelta(minutes=5),
+        old_idempotency_key=None,
+        old_nonce=None,
+        old_expires_at=None,
+        conn=sqlite_connection,
+    )
+    challenged = await get_arkade_binding(account_id, conn=sqlite_connection)
+    assert challenged and challenged.challenge_expires_at
+
+    assert await update_arkade_challenge(
+        challenged,
+        enrollment_id="1" * 32,
+        idempotency_key="2" * 32,
+        nonce="3" * 64,
+        expires_at=now + timedelta(minutes=10),
+        old_idempotency_key=challenged.idempotency_key,
+        old_nonce=challenged.challenge_nonce,
+        old_expires_at=challenged.challenge_expires_at + timedelta(hours=1),
+        conn=sqlite_connection,
+    )
+    assert not await update_arkade_challenge(
+        challenged,
+        enrollment_id="4" * 32,
+        idempotency_key="5" * 32,
+        nonce="6" * 64,
+        expires_at=now + timedelta(minutes=15),
+        old_idempotency_key=challenged.idempotency_key,
+        old_nonce=challenged.challenge_nonce,
+        old_expires_at=challenged.challenge_expires_at,
+        conn=sqlite_connection,
+    )
 
 
 @pytest.mark.anyio

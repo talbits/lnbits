@@ -15,6 +15,7 @@ from lnbits.core.models import (
 )
 from lnbits.core.services.arkade import (
     ArkadeEnrollmentError,
+    ArkadeEnrollmentMigrationRequiredError,
     ArkadeOutgoingError,
     ArkadeReceiveError,
     acknowledge_arkade_receive,
@@ -32,6 +33,10 @@ arkade_router = APIRouter(prefix="/api/v1/arkade", tags=["Arkade"])
 
 
 def _public_error(exc: ArkadeEnrollmentError) -> HTTPException:
+    if isinstance(exc, ArkadeEnrollmentMigrationRequiredError):
+        return HTTPException(
+            HTTPStatus.BAD_REQUEST, "ARKADE_ENROLLMENT_MIGRATION_REQUIRED"
+        )
     return HTTPException(HTTPStatus.BAD_REQUEST, "ARKADE_ENROLLMENT_ERROR")
 
 

@@ -17,6 +17,7 @@ from lnbits.core.crud.arkade import (
     complete_arkade_binding,
     create_arkade_receive_outpoint,
     create_arkade_receive_request,
+    ensure_arkade_binding_for_existing_account,
     get_arkade_binding,
     get_arkade_receive_outpoint,
     get_arkade_receive_request,
@@ -111,6 +112,10 @@ ARKADE_HRPS = {
 
 
 class ArkadeEnrollmentError(ValueError):
+    pass
+
+
+class ArkadeEnrollmentMigrationRequiredError(ArkadeEnrollmentError):
     pass
 
 
@@ -1148,7 +1153,13 @@ async def create_enrollment_challenge(  # noqa: C901
         raise ArkadeEnrollmentError("Invalid idempotency key.")
     binding = await get_arkade_binding(account.id, conn=conn)
     if not binding:
-        raise ArkadeEnrollmentError("Arkade enrollment is unavailable.")
+        binding = await ensure_arkade_binding_for_existing_account(
+            account.id, conn=conn
+        )
+    if not binding:
+        raise ArkadeEnrollmentMigrationRequiredError(
+            "Existing wallet requires explicit migration."
+        )
     if binding.state == "ready":
         return _response(binding)
 
