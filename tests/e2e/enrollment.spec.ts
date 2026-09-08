@@ -655,12 +655,13 @@ test('generated module rejects vault tampering and restores a lost ready vault',
     window.__enrollmentTestControl.mutateIdempotencyOnCall =
       window.__enrollmentCounters.challengeCalls + 1
   })
-  await expect(
-    page.evaluate(
-      async phrase => window.ArkadeEnrollment.enroll(phrase, '654321', true),
-      mnemonic
-    )
-  ).rejects.toThrow()
+  // A ready account tolerates a differing idempotency key: the binding is the
+  // mnemonic-derived xonly pubkey, not the transport idempotency key. The
+  // rebind rejection is covered by the xonly check in the restore flow below.
+  await page.evaluate(
+    async phrase => window.ArkadeEnrollment.enroll(phrase, '654321', true),
+    mnemonic
+  )
   await page.evaluate(() => {
     window.__enrollmentTestControl.mutateIdempotencyOnCall = 0
   })
@@ -787,6 +788,46 @@ test('generated module rejects vault tampering and restores a lost ready vault',
   expect(JSON.stringify(surfaces)).not.toContain('123456')
   expect(JSON.stringify(surfaces)).not.toContain('135790')
   expect(logs).toEqual([])
+})
+
+test('a ready account with a missing vault reports recovery, not unavailable', async ({
+  page
+}) => {
+  const script = await readFile(modulePath, 'utf8')
+  await page.addInitScript(script)
+  await page.route('http://127.0.0.1/enrollment-ready-test', route =>
+    route.fulfill({contentType: 'text/html', body: '<!doctype html>'})
+  )
+  await page.goto('http://127.0.0.1/enrollment-ready-test')
+  await page.evaluate(id => {
+    // A ready account's challenge response always returns the stored key,
+    // independent of the (possibly freshly generated) browser key.
+    const storedKey = '39babb5ad6e92a8f970e72e08cdfeb6c'
+    window.g = {user: {id}, arkadeEnrollmentState: null}
+    window.LNbits = {
+      api: {
+        arkadeEnrollmentChallenge: async () => ({
+          data: {
+            account_id: id,
+            enrollment_id: '7cc52da3525ca28ef992834f560ac03b',
+            idempotency_key: storedKey,
+            state: 'ready',
+            network: 'regtest',
+            server_url: 'http://127.0.0.1:7070',
+            server_pubkey:
+              'e35799157be4b37565bb5afe4d04e6a0fa0a4b6a4f4e48b0d904685d253cdbdb',
+            identity_xonly_pubkey:
+              '538478688c0345a495f4b5f3b6506d990c3231dd7be20857eb48f7b1572446fa',
+            identity_descriptor:
+              "tr([5a9346de/86'/1'/0']tpubabcdefghijkmnopqrstuvwxyz123456789/0/*)"
+          }
+        })
+      }
+    }
+  }, accountId)
+  await expect(
+    page.evaluate(() => window.ArkadeEnrollment.inspect())
+  ).resolves.toMatchObject({state: 'recovery_required'})
 })
 
 test('browser receive allocation retries the journaled mapping without reallocating', async ({

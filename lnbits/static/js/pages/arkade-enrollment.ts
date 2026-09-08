@@ -456,16 +456,16 @@ const validateBinding = (
     !NETWORK.test(value.network || '') ||
     typeof value.server_url !== 'string' ||
     !value.server_url ||
-    !HEX64.test(value.server_pubkey || '') ||
-    (expected?.idempotencyKey &&
-      value.idempotency_key !== expected.idempotencyKey)
+    !HEX64.test(value.server_pubkey || '')
   )
     throw new Error('invalid enrollment response')
   if (value.state === 'pending') {
     if (
       !HEX64.test(value.nonce || '') ||
       !Number.isSafeInteger(value.expires_at) ||
-      value.expires_at <= Math.floor(Date.now() / 1000)
+      value.expires_at <= Math.floor(Date.now() / 1000) ||
+      (expected?.idempotencyKey &&
+        value.idempotency_key !== expected.idempotencyKey)
     )
       throw new Error('invalid enrollment response')
   } else if (
