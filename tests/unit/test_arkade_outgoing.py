@@ -218,18 +218,28 @@ async def _exact_backing(_account_id, **_kwargs):
         arkade.ArkadeIndexerVtxo(
             txid="97" * 32,
             vout=0,
-            amount_sat=40,
+            amount_sat=70,
             script="aa",
         )
     ]
 
 
 async def _lightning_backing(_account_id, **_kwargs):
+    if _kwargs.get("scripts"):
+        return [
+            arkade.ArkadeIndexerVtxo(
+                txid="55" * 32,
+                vout=0,
+                amount_sat=5_001,
+                script=CHANGE_SCRIPT,
+                arkade_txid="55" * 32,
+            )
+        ]
     return [
         arkade.ArkadeIndexerVtxo(
             txid="96" * 32,
             vout=0,
-            amount_sat=10_000,
+            amount_sat=20_000,
             script="aa",
         )
     ]
@@ -295,7 +305,7 @@ def _lightning_quote(**updates):
         "bolt11": "lnbc-lightning-test",
         "payment_hash": LIGHTNING_HASH,
         "amount_msat": 5_000_000,
-        "max_fee_msat": 100_000,
+        "max_fee_msat": 15_000,
         "quote_pair": "arkade:BTC->lightning:BTC",
         "quote_from_amount_sat": 5_001,
         "quote_to_amount_sat": 5_000,
@@ -303,7 +313,7 @@ def _lightning_quote(**updates):
         "refund_locktime": int(datetime.now(timezone.utc).timestamp()) + 20_000,
         "solver_pubkey": "cd" * 32,
         "swap_rfq_id": "rfq-lightning-test",
-        "lockup_address": "tark1lightninglockup",
+        "lockup_address": CHANGE_ADDRESS,
     }
     data.update(updates)
     return ArkadeLightningQuoteInput(**data)
@@ -369,6 +379,34 @@ async def test_reservation_rejects_logical_and_backing_shortfalls(
             ACCOUNT_ID,
             _intent(amount_msat=10_000).copy(update={"intent_id": "66" * 16}),
             conn=connection,
+        )
+
+
+@pytest.mark.anyio
+async def test_lightning_reservation_includes_fee_cap_in_obligation(
+    connection, monkeypatch
+):
+    monkeypatch.setattr(
+        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
+    )
+
+    async def backing(_account_id, **kwargs):
+        assert kwargs.get("spendable_only") is True
+        return [_observed(amount_sat=10_020)]
+
+    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", backing)
+    monkeypatch.setattr(arkade.bolt11, "decode", lambda _bolt11: _LightningInvoice())
+    await _credit(connection, WALLET_ID, 5_020_000)
+    with pytest.raises(
+        arkade.ArkadeOutgoingError,
+        match="^ARKADE_BACKING_DEFICIT$",
+    ):
+        await arkade.reserve_arkade_lightning_intent(
+            ACCOUNT_ID,
+            WALLET_ID,
+            _lightning_quote(),
+            connection,
+            idempotency_key="07" * 16,
         )
 
 
@@ -1608,20 +1646,32 @@ def test_indexer_parser_rejects_oversized_decimal(field):
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
-    "invoice",
+    ("invoice", "expected"),
     [
-        _LightningInvoice(amount_msat=None),
-        _LightningInvoice(expiry_time=int(datetime.now(timezone.utc).timestamp()) - 1),
-        _LightningInvoice(amount_msat=499_000),
-        _LightningInvoice(amount_msat=50_001_000),
+        (_LightningInvoice(amount_msat=None), "ARKADE_OUTGOING_AMOUNT_INVALID"),
+        (
+            _LightningInvoice(
+                expiry_time=int(datetime.now(timezone.utc).timestamp()) - 1
+            ),
+            "ARKADE_OUTGOING_EXPIRED",
+        ),
+        (_LightningInvoice(amount_msat=499_000), "ARKADE_OUTGOING_AMOUNT_INVALID"),
+        (
+            _LightningInvoice(amount_msat=50_001_000),
+            "ARKADE_OUTGOING_AMOUNT_INVALID",
+        ),
     ],
     ids=["amountless", "expired", "below-card-bound", "above-card-bound"],
 )
 async def test_lightning_quote_rejects_invalid_invoice_facts(
-    connection, monkeypatch, invoice
+    connection, monkeypatch, invoice, expected
 ):
+    monkeypatch.setattr(
+        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
+    )
+    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", _lightning_backing)
     monkeypatch.setattr(arkade.bolt11, "decode", lambda _bolt11: invoice)
-    with pytest.raises(arkade.ArkadeOutgoingError):
+    with pytest.raises(arkade.ArkadeOutgoingError, match=f"^{expected}$"):
         await arkade.reserve_arkade_lightning_intent(
             ACCOUNT_ID,
             WALLET_ID,
@@ -1633,27 +1683,63 @@ async def test_lightning_quote_rejects_invalid_invoice_facts(
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
-    "updates",
+    ("updates", "expected"),
     [
-        {"quote_to_amount_sat": 5_001},
-        {"max_fee_msat": 1},
-        {"quote_pair": "arkade:BTC->arkade:BTC"},
-        {"quote_valid_until": datetime.now(timezone.utc) - timedelta(seconds=1)},
-        {"refund_locktime": int(datetime.now(timezone.utc).timestamp()) + 60},
+        ({"quote_to_amount_sat": 5_001}, "ARKADE_TRANSFER_AMOUNT_CONFLICT"),
+        ({"max_fee_msat": 1}, "ARKADE_OUTGOING_INVALID_REQUEST"),
+        ({"quote_pair": "arkade:BTC->arkade:BTC"}, "ARKADE_OUTGOING_OUTPUT_INVALID"),
+        (
+            {"quote_valid_until": datetime.now(timezone.utc) - timedelta(seconds=1)},
+            "ARKADE_OUTGOING_EXPIRED",
+        ),
+        (
+            {"refund_locktime": int(datetime.now(timezone.utc).timestamp()) + 60},
+            "ARKADE_OUTGOING_OUTPUT_INVALID",
+        ),
     ],
     ids=["amount-conflict", "fee-cap", "pair", "quote-expiry", "refund-headroom"],
 )
 async def test_lightning_quote_rejects_binding_and_fee_violations(
-    connection, monkeypatch, updates
+    connection, monkeypatch, updates, expected
 ):
+    monkeypatch.setattr(
+        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
+    )
+    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", _lightning_backing)
     monkeypatch.setattr(arkade.bolt11, "decode", lambda _bolt11: _LightningInvoice())
-    with pytest.raises(arkade.ArkadeOutgoingError):
+    with pytest.raises(arkade.ArkadeOutgoingError, match=f"^{expected}$"):
         await arkade.reserve_arkade_lightning_intent(
             ACCOUNT_ID,
             WALLET_ID,
             _lightning_quote(**updates),
             connection,
             idempotency_key="02" * 16,
+        )
+
+
+@pytest.mark.anyio
+async def test_lightning_quote_rejects_fee_above_backend_ceiling(
+    connection, monkeypatch
+):
+    monkeypatch.setattr(
+        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
+    )
+    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", _lightning_backing)
+    monkeypatch.setattr(arkade.bolt11, "decode", lambda _bolt11: _LightningInvoice())
+    quote = _lightning_quote(
+        quote_from_amount_sat=5_016,
+        max_fee_msat=10_000_000,
+    )
+    with pytest.raises(
+        arkade.ArkadeOutgoingError,
+        match="^ARKADE_OUTGOING_INVALID_REQUEST$",
+    ):
+        await arkade.reserve_arkade_lightning_intent(
+            ACCOUNT_ID,
+            WALLET_ID,
+            quote,
+            connection,
+            idempotency_key="05" * 16,
         )
 
 
@@ -1768,3 +1854,45 @@ async def test_lightning_submit_records_public_funding_and_is_idempotent(
         await arkade.release_arkade_outgoing_payment(
             ACCOUNT_ID, accepted.intent_id, conn=connection
         )
+
+
+@pytest.mark.anyio
+async def test_lightning_submit_requires_public_funding_observation(
+    connection, monkeypatch
+):
+    monkeypatch.setattr(
+        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
+    )
+    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", _lightning_backing)
+    monkeypatch.setattr(arkade.bolt11, "decode", lambda _bolt11: _LightningInvoice())
+    await _credit(connection, WALLET_ID, 10_000_000)
+    quote = _lightning_quote()
+    accepted, _ = await arkade.reserve_arkade_lightning_intent(
+        ACCOUNT_ID,
+        WALLET_ID,
+        quote,
+        connection,
+        idempotency_key="06" * 16,
+    )
+
+    async def no_lockup_observation(_account_id, **kwargs):
+        assert kwargs["spendable_only"] is False
+        return []
+
+    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", no_lockup_observation)
+    funding = ArkadeLightningFundingEvidence(
+        ark_txid="55" * 32,
+        lockup_address=quote.lockup_address,
+        swap_rfq_id=quote.swap_rfq_id,
+        solver_pubkey=quote.solver_pubkey,
+    )
+    with pytest.raises(
+        arkade.ArkadeOutgoingError,
+        match="^ARKADE_OUTGOING_INDEXER_UNAVAILABLE$",
+    ):
+        await arkade.submit_arkade_lightning_intent(
+            ACCOUNT_ID, accepted.intent_id, funding, conn=connection
+        )
+    current = await get_arkade_outgoing_intent(accepted.intent_id, conn=connection)
+    assert current and current.status == "quote_ready"
+    assert current.arkade_txid is None

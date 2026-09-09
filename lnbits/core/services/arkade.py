@@ -108,6 +108,7 @@ _MAX_INDEXER_PSBT_BYTES = 4 * 1024 * 1024
 _MAX_INDEXER_PSBT_BASE64_LENGTH = 4 * ((_MAX_INDEXER_PSBT_BYTES + 2) // 3)
 LIGHTNING_MIN_QUOTE_AMOUNT_SAT = 500
 LIGHTNING_MAX_QUOTE_AMOUNT_SAT = 50_000
+LIGHTNING_MAX_FEE_BPS = 30
 LIGHTNING_REFUND_HEADROOM_SECONDS = 10_800
 LIGHTNING_QUOTE_PAIR = "arkade:BTC->lightning:BTC"
 _TAPROOT_UNSPENDABLE_KEY = bytes.fromhex(
@@ -516,7 +517,8 @@ async def _reserve_arkade_outgoing_intent(  # noqa: C901
         ):
             raise ArkadeOutgoingError("ARKADE_TRANSFER_RECEIVER_INVALID")
 
-    if wallet.balance_msat < intent.amount_msat:
+    obligation_msat = intent.amount_msat + intent.max_fee_msat
+    if wallet.balance_msat < obligation_msat:
         raise ArkadeOutgoingError("ARKADE_INSUFFICIENT_FUNDS")
     balances = await conn.fetchone(
         "SELECT COALESCE(SUM(b.balance), 0) AS balance_msat "
@@ -531,8 +533,10 @@ async def _reserve_arkade_outgoing_intent(  # noqa: C901
         "AND status IN ('reserved', 'quote_ready', 'submitted')",
         {"account_id": account_id},
     )
-    gross_obligations = int(balances["balance_msat"]) + int(
-        reservations["obligations_msat"]
+    gross_obligations = (
+        int(balances["balance_msat"])
+        + int(reservations["obligations_msat"])
+        + obligation_msat
     )
     if gross_obligations > backing_msat:
         raise ArkadeOutgoingError("ARKADE_BACKING_DEFICIT")
@@ -594,9 +598,15 @@ async def reserve_arkade_lightning_intent(  # noqa: C901
         raise ArkadeOutgoingError("ARKADE_TRANSFER_AMOUNT_CONFLICT")
     if quote.quote_from_amount_sat < quote.quote_to_amount_sat:
         raise ArkadeOutgoingError("ARKADE_OUTGOING_INVALID_REQUEST")
+    quote_fee_msat = (quote.quote_from_amount_sat - quote.quote_to_amount_sat) * 1000
+    fee_ceiling_msat = (
+        (quote.quote_to_amount_sat * LIGHTNING_MAX_FEE_BPS + 9_999) // 10_000
+    ) * 1000
     if (
-        quote.quote_from_amount_sat - quote.quote_to_amount_sat
-    ) * 1000 > quote.max_fee_msat:
+        quote.max_fee_msat > fee_ceiling_msat
+        or quote_fee_msat > fee_ceiling_msat
+        or quote_fee_msat > quote.max_fee_msat
+    ):
         raise ArkadeOutgoingError("ARKADE_OUTGOING_INVALID_REQUEST")
 
     quote_valid_until = quote.quote_valid_until
@@ -690,6 +700,68 @@ async def submit_arkade_lightning_intent(  # noqa: C901
         raise ArkadeOutgoingError("ARKADE_OUTGOING_UNAVAILABLE")
 
     try:
+        intent = await get_arkade_outgoing_intent(intent_id, conn=conn)
+        if not intent or intent.account_id != account_id:
+            raise ArkadeOutgoingError("ARKADE_OUTGOING_NOT_FOUND")
+        binding = await get_arkade_binding(account_id, conn=conn)
+        if not binding or binding.state != "ready":
+            raise ArkadeOutgoingError("ARKADE_ENROLLMENT_REQUIRED")
+        if intent.destination_kind != "lightning":
+            raise ArkadeOutgoingError("ARKADE_INTENT_INVALID_TRANSITION")
+        if intent.status == "submitted":
+            if (
+                intent.arkade_txid != funding.ark_txid
+                or intent.lockup_address != funding.lockup_address
+                or intent.swap_rfq_id != funding.swap_rfq_id
+                or intent.solver_pubkey != funding.solver_pubkey
+            ):
+                raise ArkadeOutgoingError("ARKADE_OUTGOING_IDEMPOTENCY_CONFLICT")
+            return _outgoing_response(
+                intent,
+                binding,
+                await get_arkade_outgoing_intent_inputs(intent_id, conn=conn),
+            )
+        if intent.status != "quote_ready":
+            raise ArkadeOutgoingError("ARKADE_INTENT_INVALID_TRANSITION")
+        payment = await get_payment_by_native_id(intent_id, conn=conn)
+        if (
+            not payment
+            or not _outgoing_payment_matches(payment, intent)
+            or payment.status != PaymentState.PENDING.value
+        ):
+            raise ArkadeOutgoingError("ARKADE_OUTGOING_CORRUPT")
+        if (
+            intent.lockup_address != funding.lockup_address
+            or intent.swap_rfq_id != funding.swap_rfq_id
+            or intent.solver_pubkey != funding.solver_pubkey
+        ):
+            raise ArkadeOutgoingError("ARKADE_OUTGOING_OUTPUT_CONFLICT")
+        try:
+            lockup_script = decode_arkade_address_script(
+                intent.lockup_address,
+                binding.server_pubkey,
+                ARKADE_HRPS[binding.network],
+            )
+        except (ArkadeReceiveError, KeyError):
+            raise ArkadeOutgoingError("ARKADE_OUTGOING_OUTPUT_INVALID") from None
+        try:
+            lockup_evidence = await fetch_arkade_indexer_vtxos(
+                account_id,
+                conn=conn,
+                spendable_only=False,
+                scripts=[lockup_script],
+            )
+        except ArkadeReceiveError as exc:
+            raise _authorize_indexer_error(exc) from None
+        if not any(
+            vtxo.script.lower() == lockup_script
+            and vtxo.amount_sat == intent.quote_from_amount_sat
+            and vtxo.arkade_txid == funding.ark_txid
+            and (_is_spendable_vtxo(vtxo) or vtxo.settled_by is not None)
+            for vtxo in lockup_evidence
+        ):
+            raise ArkadeOutgoingError("ARKADE_OUTGOING_INDEXER_UNAVAILABLE")
+
         async with db.reuse_conn(conn) if conn else db.connect() as database:
             async with database.transaction():
                 intent = await get_arkade_outgoing_intent(intent_id, conn=database)
@@ -933,6 +1005,7 @@ async def list_arkade_submitted_outgoing_intents(
             await get_arkade_outgoing_intent_inputs(intent.intent_id),
         )
         for intent in intents
+        if intent.destination_kind != "lightning"
     ]
 
 
@@ -2099,19 +2172,24 @@ async def fetch_arkade_indexer_vtxos(  # noqa: C901
     account_id: str,
     conn: Connection | None = None,
     spendable_only: bool = False,
+    *,
+    scripts: list[str] | None = None,
 ) -> list[ArkadeIndexerVtxo]:
     binding = await get_arkade_binding(account_id, conn=conn)
     if not binding or binding.state != "ready":
         raise ArkadeReceiveError("ARKADE_ENROLLMENT_REQUIRED")
-    requests = await get_arkade_receive_requests(account_id, conn=conn)
-    scripts = sorted({request.script for request in requests if request.script})
-    changes = await (conn or db).fetchall(
-        "SELECT change_script FROM arkade_outgoing_intents "
-        "WHERE account_id = :account_id AND status = 'settled' "
-        "AND change_script IS NOT NULL",
-        {"account_id": account_id},
-    )
-    scripts = sorted(set(scripts) | {row["change_script"] for row in changes})
+    if scripts is None:
+        requests = await get_arkade_receive_requests(account_id, conn=conn)
+        scripts = sorted({request.script for request in requests if request.script})
+        changes = await (conn or db).fetchall(
+            "SELECT change_script FROM arkade_outgoing_intents "
+            "WHERE account_id = :account_id AND status = 'settled' "
+            "AND change_script IS NOT NULL",
+            {"account_id": account_id},
+        )
+        scripts = sorted(set(scripts) | {row["change_script"] for row in changes})
+    else:
+        scripts = sorted(set(scripts))
     if not scripts:
         return []
     result: list[ArkadeIndexerVtxo] = []
@@ -2522,7 +2600,12 @@ async def reconcile_arkade_outgoing_intent(  # noqa: C901
 ) -> ArkadeOutgoingEvidenceResult | None:
     """Reconcile one submitted outgoing intent from public Arkade evidence."""
     intent = await get_arkade_outgoing_intent(intent_id)
-    if not intent or intent.account_id != account_id or intent.status != "submitted":
+    if (
+        not intent
+        or intent.account_id != account_id
+        or intent.status != "submitted"
+        or intent.destination_kind == "lightning"
+    ):
         return None
     claims = await get_arkade_outgoing_intent_inputs(intent_id)
     if not claims or not intent.destination_script:

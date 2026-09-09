@@ -288,6 +288,74 @@ const makeFixture = ({amountSat, inputValue, dust = 100, store} = {}) => {
   }
 }
 
+const makeIndexedDb = store => {
+  const databases = store.get('__indexeddb__') || new Map()
+  store.set('__indexeddb__', databases)
+  return {
+    open(name) {
+      const request = {}
+      Promise.resolve().then(() => {
+        let database = databases.get(name)
+        const upgraded = !database
+        if (!database) database = {stores: new Map()}
+        const db = {
+          objectStoreNames: {
+            contains: storeName => database.stores.has(storeName)
+          },
+          createObjectStore: (storeName, options) => {
+            const objectStore = {keyPath: options.keyPath, records: new Map()}
+            database.stores.set(storeName, objectStore)
+            return objectStore
+          },
+          transaction: (storeName, mode) => {
+            const objectStore = database.stores.get(storeName)
+            const transaction = {
+              objectStore: () => ({
+                get: key => {
+                  const operation = {transaction}
+                  Promise.resolve().then(() => {
+                    operation.result = objectStore.records.get(key)
+                    operation.onsuccess?.()
+                  })
+                  return operation
+                },
+                getAll: () => {
+                  const operation = {transaction}
+                  Promise.resolve().then(() => {
+                    operation.result = [...objectStore.records.values()]
+                    operation.onsuccess?.()
+                  })
+                  return operation
+                },
+                put: value => {
+                  const operation = {transaction}
+                  objectStore.records.set(value[objectStore.keyPath], value)
+                  Promise.resolve().then(() => operation.onsuccess?.())
+                  return operation
+                }
+              }),
+              abort: () => {
+                transaction.aborted = true
+                transaction.onerror?.()
+              }
+            }
+            setTimeout(() => {
+              if (!transaction.aborted) transaction.oncomplete?.()
+            }, 0)
+            return transaction
+          },
+          close: () => {}
+        }
+        databases.set(name, database)
+        request.result = db
+        if (upgraded) request.onupgradeneeded?.()
+        request.onsuccess?.()
+      })
+      return request
+    }
+  }
+}
+
 const makeWindow = (store = new Map()) => {
   const window = {
     window: null,
@@ -301,7 +369,7 @@ const makeWindow = (store = new Map()) => {
       getItem: key => store.get(key) ?? null,
       setItem: (key, value) => store.set(key, String(value))
     },
-    indexedDB: {},
+    indexedDB: makeIndexedDb(store),
     addEventListener: () => {},
     clearTimeout,
     setTimeout,
@@ -340,7 +408,12 @@ const makeLightningFixture = () => {
       descriptor: 'private claim material must remain in-browser'
     }
   }
-  const state = {status: 'quote_ready', sendCount: 0, releaseCount: 0}
+  const state = {
+    status: 'quote_ready',
+    sendCount: 0,
+    releaseCount: 0,
+    lockDuringLightningGet: false
+  }
   const requests = []
   const intentId = 'cc'.repeat(16)
   const intent = () => ({
@@ -383,15 +456,23 @@ const makeLightningFixture = () => {
   fixture.window.LNbits = {
     api: {
       payArkadeLightning: async (_wallet, data) => {
-        requests.push({method: 'PAY', data})
+        requests.push({method: 'PAY', url: '/api/v1/payments', data})
         return {data: {intent: intent()}}
       },
       arkadeOutgoingIntent: async () => {
-        requests.push({method: 'GET'})
+        requests.push({method: 'GET', url: '/api/v1/arkade/outgoing'})
+        if (state.lockDuringLightningGet) {
+          state.lockDuringLightningGet = false
+          fixture.window.ArkadeEnrollment.lock()
+        }
         return {data: intent()}
       },
       arkadeLightningSubmitted: async (_id, data) => {
-        requests.push({method: 'SUBMIT', data})
+        requests.push({
+          method: 'SUBMIT',
+          url: '/api/v1/arkade/outgoing/submit',
+          data
+        })
         state.status = 'submitted'
         return {data: intent()}
       }
@@ -487,11 +568,28 @@ async function lightningBrowserChecks() {
     failed.state.sendCount += 1
     return 'ee'.repeat(32)
   }
-  await failed.window.ArkadeEnrollment.submitLightningSend(failed.intentId, {
-    approved: true
-  })
-  assert.equal(failed.state.status, 'submitted')
-  assert.equal(failed.state.sendCount, 2)
+  await assert.rejects(
+    failed.window.ArkadeEnrollment.submitLightningSend(failed.intentId, {
+      approved: true
+    }),
+    /reconciliation and retry/
+  )
+  assert.equal(failed.state.status, 'quote_ready')
+  assert.equal(failed.state.sendCount, 1)
+
+  const lockedDuringRefetch = makeLightningFixture()
+  await lockedDuringRefetch.window.ArkadeEnrollment.prepareLightningSend(
+    lockedDuringRefetch.lightningBolt11
+  )
+  lockedDuringRefetch.state.lockDuringLightningGet = true
+  await assert.rejects(
+    lockedDuringRefetch.window.ArkadeEnrollment.submitLightningSend(
+      lockedDuringRefetch.intentId,
+      {approved: true}
+    ),
+    /funding failed/
+  )
+  assert.equal(lockedDuringRefetch.state.sendCount, 0)
 
   const duplicate = makeLightningFixture()
   await duplicate.window.ArkadeEnrollment.prepareLightningSend(
@@ -511,9 +609,11 @@ async function lightningBrowserChecks() {
     duplicate.requests.filter(item => item.method === 'SUBMIT').length,
     2
   )
-  const artifact = JSON.stringify(duplicate.requests)
-  assert.equal(artifact.includes('private claim material'), false)
-  assert.equal(artifact.includes('secrets'), false)
+  const forbidden = ['private claim material', 'secrets', 'preimage', 'claim']
+  for (const artifact of duplicate.requests.map(request =>
+    JSON.stringify(request)
+  ))
+    for (const value of forbidden) assert.equal(artifact.includes(value), false)
 }
 
 async function main() {

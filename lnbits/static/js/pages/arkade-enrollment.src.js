@@ -15,6 +15,8 @@ import {
 } from '@arkade-os/sdk'
 import {
   assertFundable,
+  lockupContractParams,
+  rebuildRfqSwap,
   requestLightningSend,
   verifyLockupAddress
 } from '@arkade-os/swap'
@@ -48,6 +50,16 @@ const OUTGOING_JOURNAL_PREFIX = 'lnbits-arkade-outgoing-v1'
 const OUTGOING_JOURNAL_VERSION = 1
 const MAX_OUTGOING_JOURNAL_RECORDS = 32
 const MAX_OUTGOING_JOURNAL_BYTES = 128 * 1024
+const LIGHTNING_JOURNAL_DB_NAME = 'lnbits-arkade-lightning-v1'
+const LIGHTNING_JOURNAL_STORE_NAME = 'plans'
+const LIGHTNING_JOURNAL_VERSION = 1
+const LIGHTNING_JOURNAL_STATES = /* @__PURE__ */ new Set([
+  'quote_ready',
+  'funding',
+  'funded',
+  'submitted',
+  'failed'
+])
 const LIGHTNING_RELAY = 'wss://nostr.arkade.sh'
 const LIGHTNING_SOLVER_PUBKEY =
   '66422c952f8dcb96e4d0c3f049cd1e265b8461b916d9913c65c2494b64b4e3ce'
@@ -91,6 +103,16 @@ class ArkadeOutgoingReconciliationError extends Error {
     super(`Arkade outgoing ${intentId} requires reconciliation`)
     this.name = 'ArkadeOutgoingReconciliationError'
     this.status = status
+  }
+}
+class ArkadeLightningReconciliationError extends Error {
+  reconciliationRequired = true
+  retryRequired = true
+  status
+  constructor(intentId, message = 'requires reconciliation and retry') {
+    super(`Arkade Lightning ${intentId} ${message}`)
+    this.name = 'ArkadeLightningReconciliationError'
+    this.status = 'quote_ready'
   }
 }
 const bytesToHex = bytes =>
@@ -274,6 +296,187 @@ const removeOutgoingJournal = (accountId, intentId) => {
     item => item.intentId !== intentId
   )
   localStorage.setItem(outgoingJournalKey(accountId), JSON.stringify(journal))
+}
+const lightningJournalQuoteFields = [
+  'amount_msat',
+  'lockup_address',
+  'max_fee_msat',
+  'payment_hash',
+  'quote_from_amount_sat',
+  'quote_pair',
+  'quote_to_amount_sat',
+  'quote_valid_until',
+  'refund_locktime',
+  'solver_pubkey',
+  'swap_rfq_id'
+]
+const lightningJournalStateFields = [
+  'accountId',
+  'bolt11',
+  'fundingArkTxid',
+  'fundingState',
+  'idempotencyKey',
+  'intentExpiresAt',
+  'intentId',
+  'paymentHash',
+  'publicQuote',
+  'version',
+  'walletId'
+]
+const strictLightningJournalRecord = value => {
+  if (!value || typeof value !== 'object') return false
+  const record = value
+  if (
+    Object.keys(record).sort().join(',') !==
+    lightningJournalStateFields.slice().sort().join(',')
+  )
+    return false
+  const quote = record.publicQuote
+  if (
+    !quote ||
+    Object.keys(quote).sort().join(',') !==
+      lightningJournalQuoteFields.slice().sort().join(',')
+  )
+    return false
+  return (
+    record.version === LIGHTNING_JOURNAL_VERSION &&
+    typeof record.accountId === 'string' &&
+    HEX32.test(record.idempotencyKey) &&
+    typeof record.bolt11 === 'string' &&
+    record.bolt11.length > 0 &&
+    HEX64.test(record.paymentHash) &&
+    typeof record.walletId === 'string' &&
+    record.walletId.length > 0 &&
+    HEX32.test(record.intentId) &&
+    Number.isSafeInteger(record.intentExpiresAt) &&
+    record.intentExpiresAt >= 0 &&
+    LIGHTNING_JOURNAL_STATES.has(record.fundingState) &&
+    (record.fundingArkTxid === null || HEX64.test(record.fundingArkTxid)) &&
+    quote.payment_hash === record.paymentHash &&
+    Number.isSafeInteger(quote.amount_msat) &&
+    quote.amount_msat > 0 &&
+    Number.isSafeInteger(quote.max_fee_msat) &&
+    quote.max_fee_msat > 0 &&
+    typeof quote.quote_pair === 'string' &&
+    quote.quote_pair === LIGHTNING_QUOTE_PAIR &&
+    Number.isSafeInteger(quote.quote_from_amount_sat) &&
+    quote.quote_from_amount_sat > 0 &&
+    Number.isSafeInteger(quote.quote_to_amount_sat) &&
+    quote.quote_to_amount_sat > 0 &&
+    Number.isSafeInteger(quote.quote_valid_until) &&
+    Number.isSafeInteger(quote.refund_locktime) &&
+    HEX64.test(quote.solver_pubkey) &&
+    typeof quote.swap_rfq_id === 'string' &&
+    quote.swap_rfq_id.length > 0 &&
+    typeof quote.lockup_address === 'string' &&
+    quote.lockup_address.length > 0 &&
+    quote.amount_msat === record.publicQuote.amount_msat
+  )
+}
+const openLightningJournal = () =>
+  new Promise((resolve, reject) => {
+    const request = indexedDB.open(
+      LIGHTNING_JOURNAL_DB_NAME,
+      LIGHTNING_JOURNAL_VERSION
+    )
+    request.onupgradeneeded = () => {
+      if (
+        !request.result.objectStoreNames.contains(LIGHTNING_JOURNAL_STORE_NAME)
+      )
+        request.result.createObjectStore(LIGHTNING_JOURNAL_STORE_NAME, {
+          keyPath: 'intentId'
+        })
+    }
+    request.onsuccess = () => resolve(request.result)
+    request.onerror = () => reject(new Error('Lightning journal unavailable'))
+  })
+const lightningJournalTransaction = async (mode, operation) => {
+  const db = await openLightningJournal()
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(LIGHTNING_JOURNAL_STORE_NAME, mode)
+    const store = transaction.objectStore(LIGHTNING_JOURNAL_STORE_NAME)
+    let result
+    transaction.oncomplete = () => {
+      db.close?.()
+      resolve(result)
+    }
+    transaction.onerror = () => {
+      db.close?.()
+      reject(new Error('Lightning journal unavailable'))
+    }
+    transaction.onabort = () => {
+      db.close?.()
+      reject(new Error('Lightning journal unavailable'))
+    }
+    try {
+      operation(store, value => {
+        result = value
+      })
+    } catch {
+      db.close?.()
+      reject(new Error('Lightning journal unavailable'))
+    }
+  })
+}
+const readLightningJournal = async accountId => {
+  const records = await lightningJournalTransaction(
+    'readonly',
+    (store, set) => {
+      const request = store.getAll()
+      request.onsuccess = () => set(request.result || [])
+      request.onerror = () => request.transaction?.abort?.()
+    }
+  )
+  if (
+    !Array.isArray(records) ||
+    records.some(record => !strictLightningJournalRecord(record))
+  )
+    throw new Error('Lightning journal corrupt')
+  return records.filter(record => record.accountId === accountId)
+}
+const persistLightningJournal = record => {
+  if (!strictLightningJournalRecord(record))
+    throw new Error('Lightning journal record invalid')
+  return lightningJournalTransaction('readwrite', (store, set) => {
+    const request = store.getAll()
+    request.onsuccess = () => {
+      const records = request.result || []
+      const existing = records.find(item => item.intentId === record.intentId)
+      if (existing) {
+        const {
+          fundingArkTxid: _oldTxid,
+          fundingState: _oldState,
+          ...oldImmutable
+        } = existing
+        const {
+          fundingArkTxid: _newTxid,
+          fundingState: _newState,
+          ...newImmutable
+        } = record
+        if (JSON.stringify(oldImmutable) !== JSON.stringify(newImmutable)) {
+          request.transaction?.abort?.()
+          return
+        }
+      } else if (records.length >= MAX_OUTGOING_JOURNAL_RECORDS) {
+        request.transaction?.abort?.()
+        return
+      }
+      store.put(record)
+      set(record)
+    }
+    request.onerror = () => request.transaction?.abort?.()
+  })
+}
+const findLightningJournalPlan = async (accountId, facts) => {
+  const records = await readLightningJournal(accountId)
+  return [...records]
+    .reverse()
+    .find(
+      record =>
+        record.bolt11 === facts.raw &&
+        record.paymentHash === facts.paymentHash &&
+        record.fundingState !== 'failed'
+    )
 }
 const reconcileTerminalOutgoing = async (accountId, journal) => {
   for (const record of journal) {
@@ -615,8 +818,9 @@ const lightningInvoiceFacts = bolt11 => {
     expiresAt
   }
 }
-const lightningMaxFeeMsat = amountSats =>
-  Math.max(1, Math.ceil((amountSats * LIGHTNING_FEE_BPS) / 10_000)) * 1000
+const lightningMaxFeeSat = amountSats =>
+  Math.max(1, Math.ceil((amountSats * LIGHTNING_FEE_BPS) / 10_000))
+const lightningMaxFeeMsat = amountSats => lightningMaxFeeSat(amountSats) * 1000
 const lightningPublicQuote = (facts, swap) => {
   const quote = swap?.quote
   if (
@@ -648,7 +852,7 @@ const lightningPublicQuote = (facts, swap) => {
     quote,
     invoiceExpiresAt: facts.expiresAt,
     now,
-    maxFee: {bps: LIGHTNING_FEE_BPS}
+    maxFee: {sats: lightningMaxFeeSat(facts.amountSats)}
   })
   if (
     !Number.isSafeInteger(swap.fundAmount) ||
@@ -681,10 +885,20 @@ const lightningPublicQuote = (facts, swap) => {
     lockup_address: swap.address
   }
 }
-const sameLightningBinding = (intent, facts, sdkQuote, swap, publicQuote) => {
+const sameLightningBinding = (
+  intent,
+  facts,
+  sdkQuote,
+  swap,
+  publicQuote,
+  expectedBinding
+) => {
   try {
     return (
       intent?.status === 'quote_ready' &&
+      intent.account_id === expectedBinding.accountId &&
+      intent.wallet_id === expectedBinding.walletId &&
+      expirySeconds(intent.expires_at) === expectedBinding.expiresAt &&
       intent.destination_kind === 'lightning' &&
       intent.destination === facts.raw &&
       intent.bolt11 === facts.raw &&
@@ -737,6 +951,112 @@ const lightningApprovalSummary = (facts, intent, swap, quote) =>
     lockupAddress: quote.lockup_address,
     fundAmount: swap.fundAmount
   })
+const lightningSdkQuote = publicQuote => ({
+  v: 1,
+  type: 'rfq_quote',
+  rfq_id: publicQuote.swap_rfq_id,
+  pair: publicQuote.quote_pair,
+  from_amount: publicQuote.quote_from_amount_sat,
+  to_amount: publicQuote.quote_to_amount_sat,
+  solver_pubkey: publicQuote.solver_pubkey,
+  valid_until: publicQuote.quote_valid_until,
+  refund_locktime: publicQuote.refund_locktime
+})
+const lightningIntentFromJournal = record => ({
+  intent_id: record.intentId,
+  account_id: record.accountId,
+  wallet_id: record.walletId,
+  amount_msat: record.publicQuote.amount_msat,
+  max_fee_msat: record.publicQuote.max_fee_msat,
+  destination: record.bolt11,
+  bolt11: record.bolt11,
+  payment_hash: record.paymentHash,
+  quote_pair: record.publicQuote.quote_pair,
+  quote_from_amount_sat: record.publicQuote.quote_from_amount_sat,
+  quote_to_amount_sat: record.publicQuote.quote_to_amount_sat,
+  quote_valid_until: new Date(
+    record.publicQuote.quote_valid_until * 1000
+  ).toISOString(),
+  refund_locktime: record.publicQuote.refund_locktime,
+  solver_pubkey: record.publicQuote.solver_pubkey,
+  swap_rfq_id: record.publicQuote.swap_rfq_id,
+  lockup_address: record.publicQuote.lockup_address,
+  destination_kind: 'lightning',
+  expires_at: new Date(record.intentExpiresAt * 1000).toISOString(),
+  status: 'quote_ready',
+  arkade_txid:
+    record.fundingState === 'submitted' ? record.fundingArkTxid : null
+})
+const restoreLightningSwap = async (wallet, record) => {
+  const manager = await wallet.getContractManager()
+  const restored = rebuildRfqSwap(
+    {
+      kind: 'lightning_send',
+      rfqId: record.publicQuote.swap_rfq_id,
+      lockupAddress: record.publicQuote.lockup_address,
+      profile: {hashlock: {paymentHash: record.paymentHash}},
+      state: 'pending',
+      createdAt: 0,
+      updatedAt: 0
+    },
+    await lockupContractParams(manager, record.publicQuote.lockup_address)
+  )
+  return {
+    ...restored,
+    quote: lightningSdkQuote(record.publicQuote),
+    rfqId: record.publicQuote.swap_rfq_id,
+    address: record.publicQuote.lockup_address,
+    fundAmount: record.publicQuote.quote_from_amount_sat
+  }
+}
+const lightningJournalFromPlan = plan => ({
+  // IndexedDB stores only public intent/quote and funding state. The live
+  // swap's secrets are reconstructed from the wallet's registered contract.
+  version: LIGHTNING_JOURNAL_VERSION,
+  accountId: plan.accountId,
+  walletId: plan.intent.wallet_id,
+  idempotencyKey: plan.idempotencyKey,
+  bolt11: plan.facts.raw,
+  paymentHash: plan.facts.paymentHash,
+  intentId: plan.intent.intent_id,
+  intentExpiresAt: expirySeconds(plan.intent.expires_at),
+  publicQuote: plan.publicQuote,
+  fundingState: plan.fundingState,
+  fundingArkTxid: plan.fundingArkTxid
+})
+const persistLightningPlanState = async (plan, state, arkTxid = null) => {
+  plan.fundingState = state
+  plan.fundingArkTxid = arkTxid
+  await persistLightningJournal(lightningJournalFromPlan(plan))
+}
+const lightningPlanFromRecord = async (record, wallet, current) => {
+  const facts = lightningInvoiceFacts(record.bolt11)
+  const swap = await restoreLightningSwap(wallet, record)
+  const intent = current || lightningIntentFromJournal(record)
+  if (
+    !sameLightningBinding(intent, facts, swap.quote, swap, record.publicQuote, {
+      accountId: record.accountId,
+      walletId: record.walletId,
+      expiresAt: record.intentExpiresAt
+    })
+  )
+    throw new Error('Arkade Lightning intent changed')
+  return {
+    accountId: record.accountId,
+    idempotencyKey: record.idempotencyKey,
+    facts,
+    wallet,
+    swap,
+    publicQuote: record.publicQuote,
+    intent,
+    summary: lightningApprovalSummary(facts, intent, swap, record.publicQuote),
+    generation: unlockGeneration,
+    bindingFingerprint: outgoingBindingFingerprint(activeBinding),
+    fundingPromise: null,
+    fundingState: record.fundingState,
+    fundingArkTxid: record.fundingArkTxid
+  }
+}
 const prepareLightningSend = async bolt11 => {
   const accountId = window.g.user.id
   if (!identity || !activeBinding || activeBinding.state !== 'ready')
@@ -750,6 +1070,19 @@ const prepareLightningSend = async bolt11 => {
       'Arkade Lightning invoice amount is outside the solver range'
     )
   const wallet = await outgoingWallet(accountId, activeBinding)
+  const persisted = await findLightningJournalPlan(accountId, facts)
+  if (persisted) {
+    const current = (await LNbits.api.arkadeOutgoingIntent(persisted.intentId))
+      .data
+    if (current.status !== 'quote_ready')
+      throw new ArkadeLightningReconciliationError(
+        persisted.intentId,
+        'cannot resume this non-quote-ready intent'
+      )
+    const plan = await lightningPlanFromRecord(persisted, wallet, current)
+    lightningPlans.set(persisted.intentId, plan)
+    return plan.summary
+  }
   let swap
   let transport
   try {
@@ -779,24 +1112,33 @@ const prepareLightningSend = async bolt11 => {
   const apiWallet = window.g.wallet || window.g.user?.wallets?.[0]
   if (!apiWallet?.adminkey)
     throw new Error('Arkade Lightning wallet unavailable')
+  const idempotencyKey = randomHex(16)
   let response
   try {
     response = (
       await LNbits.api.payArkadeLightning(
         apiWallet,
         {bolt11: facts.raw, quote: publicQuote},
-        randomHex(16)
+        idempotencyKey
       )
     ).data
   } catch {
     throw new Error('Arkade Lightning reservation failed')
   }
   const intent = response?.intent
-  if (!sameLightningBinding(intent, facts, swap.quote, swap, publicQuote))
+  if (
+    !intent?.wallet_id ||
+    !sameLightningBinding(intent, facts, swap.quote, swap, publicQuote, {
+      accountId,
+      walletId: intent.wallet_id,
+      expiresAt: expirySeconds(intent.expires_at)
+    })
+  )
     throw new Error('Arkade Lightning reservation changed')
   const summary = lightningApprovalSummary(facts, intent, swap, publicQuote)
-  lightningPlans.set(intent.intent_id, {
+  const plan = {
     accountId,
+    idempotencyKey,
     facts,
     wallet,
     swap,
@@ -806,8 +1148,11 @@ const prepareLightningSend = async bolt11 => {
     generation: unlockGeneration,
     bindingFingerprint: outgoingBindingFingerprint(activeBinding),
     fundingPromise: null,
+    fundingState: 'quote_ready',
     fundingArkTxid: null
-  })
+  }
+  await persistLightningJournal(lightningJournalFromPlan(plan))
+  lightningPlans.set(intent.intent_id, plan)
   return summary
 }
 const submitLightningSend = async (intentId, approval) => {
@@ -825,17 +1170,27 @@ const submitLightningSend = async (intentId, approval) => {
     throw new Error('Arkade Lightning preparation is locked')
   const current = (await LNbits.api.arkadeOutgoingIntent(intentId)).data
   if (current.status === 'submitted') {
-    if (current.arkade_txid !== plan.fundingArkTxid)
+    if (!HEX64.test(current.arkade_txid || ''))
       throw new Error('Arkade Lightning funding changed')
+    if (plan.fundingArkTxid && current.arkade_txid !== plan.fundingArkTxid)
+      throw new Error('Arkade Lightning funding changed')
+    await persistLightningPlanState(plan, 'submitted', current.arkade_txid)
     return {status: 'submitted', intentId, arkTxid: current.arkade_txid}
   }
+  if (plan.fundingState === 'failed')
+    throw new ArkadeLightningReconciliationError(intentId)
   if (
     !sameLightningBinding(
       current,
       plan.facts,
       plan.swap.quote,
       plan.swap,
-      plan.publicQuote
+      plan.publicQuote,
+      {
+        accountId: plan.accountId,
+        walletId: plan.intent.wallet_id,
+        expiresAt: expirySeconds(plan.intent.expires_at)
+      }
     )
   )
     throw new Error('Arkade Lightning intent changed')
@@ -844,21 +1199,55 @@ const submitLightningSend = async (intentId, approval) => {
   } catch {
     throw new Error('Arkade Lightning quote is no longer fundable')
   }
-  if (!plan.fundingPromise) {
-    plan.fundingPromise = plan.wallet
-      .send({address: plan.swap.address, amount: plan.swap.fundAmount})
-      .then(arkTxid => {
+  if (plan.fundingState === 'funding' && !plan.fundingPromise)
+    throw new ArkadeLightningReconciliationError(intentId)
+  if (
+    plan.fundingState !== 'quote_ready' &&
+    plan.fundingState !== 'funded' &&
+    plan.fundingState !== 'submitted' &&
+    plan.fundingState !== 'funding'
+  )
+    throw new ArkadeLightningReconciliationError(
+      intentId,
+      'funding state requires reconciliation'
+    )
+  if (!plan.fundingPromise && plan.fundingState === 'quote_ready') {
+    plan.fundingPromise = (async () => {
+      try {
+        await persistLightningPlanState(plan, 'funding')
+        if (
+          !outgoingContextIsLive(
+            plan.accountId,
+            plan.generation,
+            plan.bindingFingerprint
+          )
+        )
+          throw new Error('Arkade Lightning preparation is locked')
+        const arkTxid = await plan.wallet.send({
+          address: plan.swap.address,
+          amount: plan.swap.fundAmount
+        })
         if (typeof arkTxid !== 'string' || !/^[0-9a-f]{64}$/.test(arkTxid))
           throw new Error('Arkade Lightning funding result invalid')
-        plan.fundingArkTxid = arkTxid
+        await persistLightningPlanState(plan, 'funded', arkTxid)
         return arkTxid
-      })
-      .catch(() => {
-        plan.fundingPromise = null
+      } catch {
+        try {
+          await persistLightningPlanState(
+            plan,
+            'failed',
+            plan.fundingArkTxid || null
+          )
+        } catch {}
         throw new Error('Arkade Lightning funding failed')
-      })
+      }
+    })()
   }
-  const arkTxid = await plan.fundingPromise
+  const arkTxid = plan.fundingPromise
+    ? await plan.fundingPromise
+    : plan.fundingArkTxid
+  if (!HEX64.test(arkTxid || ''))
+    throw new ArkadeLightningReconciliationError(intentId)
   const submitted = (
     await LNbits.api.arkadeLightningSubmitted(intentId, {
       ark_txid: arkTxid,
@@ -869,6 +1258,7 @@ const submitLightningSend = async (intentId, approval) => {
   ).data
   if (submitted.status !== 'submitted' || submitted.arkade_txid !== arkTxid)
     throw new Error('Arkade Lightning submission changed')
+  await persistLightningPlanState(plan, 'submitted', arkTxid)
   return {status: 'submitted', intentId, arkTxid}
 }
 const requestMatchesMapping = (request, mapping) =>
