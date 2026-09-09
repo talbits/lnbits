@@ -164,6 +164,18 @@ class ArkadeLightningQuoteInput(BaseModel):
         extra = "forbid"
 
 
+class ArkadeLightningFundingEvidence(BaseModel):
+    """Public evidence that the browser funded the reserved Lightning lockup."""
+
+    ark_txid: str = Field(regex=r"^[0-9a-f]{64}$")
+    lockup_address: str = Field(regex=r"^\S+$", min_length=1, max_length=1023)
+    swap_rfq_id: str = Field(min_length=1, max_length=512)
+    solver_pubkey: str = Field(regex=r"^[0-9a-f]{64}$")
+
+    class Config:
+        extra = "forbid"
+
+
 class ArkadeOutgoingIntent(BaseModel):
     intent_id: str = Field(regex=r"^[0-9a-f]{32}$")
     account_id: str
@@ -287,6 +299,23 @@ class ArkadeOutgoingIntentResponse(BaseModel):
     amount_msat: int
     max_fee_msat: int = Field(default=0, ge=0)
     destination: str
+    bolt11: str | None = Field(default=None, min_length=1, max_length=1023)
+    payment_hash: str | None = Field(default=None, regex=r"^[0-9a-f]{64}$")
+    quote_pair: str | None = Field(default=None, min_length=1, max_length=128)
+    quote_from_amount_sat: int | None = Field(
+        default=None, gt=0, le=2_100_000_000_000_000
+    )
+    quote_to_amount_sat: int | None = Field(
+        default=None, gt=0, le=2_100_000_000_000_000
+    )
+    quote_valid_until: datetime | None = None
+    refund_locktime: int | None = Field(default=None, gt=0)
+    solver_pubkey: str | None = Field(default=None, regex=r"^[0-9a-f]{64}$")
+    swap_rfq_id: str | None = Field(default=None, min_length=1, max_length=512)
+    lockup_address: str | None = Field(
+        default=None, regex=r"^\S+$", min_length=1, max_length=1023
+    )
+    arkade_txid: str | None = Field(default=None, regex=r"^[0-9a-f]{64}$")
     destination_script: str | None = None
     destination_kind: ArkadeOutgoingDestinationKind = "arkade_address"
     status: ArkadeOutgoingStatus

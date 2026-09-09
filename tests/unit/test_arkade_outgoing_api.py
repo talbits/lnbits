@@ -68,12 +68,22 @@ async def test_outgoing_api_requires_auth_for_get_and_authorize():
         post_response = await client.post(
             f"/api/v1/arkade/outgoing/{INTENT_ID}/authorize", json=_authorize_body()
         )
+        submit_response = await client.post(
+            f"/api/v1/arkade/outgoing/{INTENT_ID}/submit",
+            json={
+                "ark_txid": TXID,
+                "lockup_address": "tark1lockup",
+                "swap_rfq_id": "rfq",
+                "solver_pubkey": "44" * 32,
+            },
+        )
         release_response = await client.post(
             f"/api/v1/arkade/outgoing/{INTENT_ID}/release"
         )
     assert get_response.status_code == 401
     assert list_response.status_code == 401
     assert post_response.status_code == 401
+    assert submit_response.status_code == 401
     assert release_response.status_code == 401
 
 
@@ -87,6 +97,10 @@ async def test_outgoing_api_isolation_and_canonical_response(monkeypatch):
     monkeypatch.setattr(
         "lnbits.core.views.arkade_api.authorize_arkade_outgoing",
         AsyncMock(return_value=_response()),
+    )
+    submitted = AsyncMock(return_value=_response())
+    monkeypatch.setattr(
+        "lnbits.core.views.arkade_api.submit_arkade_lightning_intent", submitted
     )
     release = AsyncMock(return_value=True)
     monkeypatch.setattr(
@@ -105,6 +119,15 @@ async def test_outgoing_api_isolation_and_canonical_response(monkeypatch):
         authorized = await client.post(
             f"/api/v1/arkade/outgoing/{INTENT_ID}/authorize", json=_authorize_body()
         )
+        funding = await client.post(
+            f"/api/v1/arkade/outgoing/{INTENT_ID}/submit",
+            json={
+                "ark_txid": TXID,
+                "lockup_address": "tark1lockup",
+                "swap_rfq_id": "rfq",
+                "solver_pubkey": "44" * 32,
+            },
+        )
         released = await client.post(f"/api/v1/arkade/outgoing/{INTENT_ID}/release")
     assert response.status_code == 200
     assert list_response.status_code == 200
@@ -112,6 +135,10 @@ async def test_outgoing_api_isolation_and_canonical_response(monkeypatch):
     assert response.json()["action"] == "lnbits-arkade-outgoing-v1"
     assert response.json()["inputs"][0]["txid"] == TXID
     assert authorized.status_code == 200
+    assert funding.status_code == 200
+    submitted.assert_awaited_once()
+    assert submitted.await_args.args[:2] == (ACCOUNT_ID, INTENT_ID)
+    assert submitted.await_args.args[2].ark_txid == TXID
     assert released.status_code == 200
     assert released.json()["success"] is True
     release.assert_awaited_once_with(ACCOUNT_ID, INTENT_ID)

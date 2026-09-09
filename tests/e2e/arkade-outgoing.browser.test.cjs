@@ -312,6 +312,210 @@ const makeWindow = (store = new Map()) => {
   return window
 }
 
+const makeLightningFixture = () => {
+  const fixture = makeFixture({amountSat: 500, inputValue: 1_000})
+  const lightningBolt11 = 'lnbc-lightning-browser-test'
+  const paymentHash = 'ab'.repeat(32)
+  const solverPubkey =
+    '66422c952f8dcb96e4d0c3f049cd1e265b8461b916d9913c65c2494b64b4e3ce'
+  const now = Math.floor(Date.now() / 1000)
+  const quote = {
+    v: 1,
+    type: 'rfq_quote',
+    rfq_id: 'lightning-browser-rfq',
+    pair: 'arkade:BTC->lightning:BTC',
+    from_amount: 501,
+    to_amount: 500,
+    solver_pubkey: solverPubkey,
+    valid_until: now + 600,
+    refund_locktime: now + 20_000,
+    profile: {receiver_pk_script: '51' + '00'.repeat(32)}
+  }
+  const swap = {
+    rfqId: quote.rfq_id,
+    quote,
+    address: fixture.destination.encode(),
+    fundAmount: quote.from_amount,
+    secrets: {
+      descriptor: 'private claim material must remain in-browser'
+    }
+  }
+  const state = {status: 'quote_ready', sendCount: 0, releaseCount: 0}
+  const requests = []
+  const intentId = 'cc'.repeat(16)
+  const intent = () => ({
+    intent_id: intentId,
+    account_id: fixture.window.g.user.id,
+    wallet_id: 'wallet-1',
+    amount_msat: 500_000,
+    max_fee_msat: 2_000,
+    destination: lightningBolt11,
+    bolt11: lightningBolt11,
+    payment_hash: paymentHash,
+    quote_pair: quote.pair,
+    quote_from_amount_sat: quote.from_amount,
+    quote_to_amount_sat: quote.to_amount,
+    quote_valid_until: new Date(quote.valid_until * 1000).toISOString(),
+    refund_locktime: quote.refund_locktime,
+    solver_pubkey: quote.solver_pubkey,
+    swap_rfq_id: quote.rfq_id,
+    lockup_address: swap.address,
+    arkade_txid: state.status === 'submitted' ? 'ee'.repeat(32) : null,
+    destination_kind: 'lightning',
+    status: state.status,
+    expires_at: new Date((now + 600) * 1000).toISOString()
+  })
+  fixture.window.decode = () => ({
+    human_readable_part: {amount: 500_000},
+    data: {
+      time_stamp: now,
+      tags: [
+        {description: 'payment_hash', value: paymentHash},
+        {description: 'expiry', value: 3_600}
+      ]
+    }
+  })
+  fixture.window.g.wallet = {adminkey: 'admin'}
+  fixture.window.__ARKADE_ENROLLMENT_TEST__.requestLightningSend = async () =>
+    swap
+  fixture.window.__ARKADE_ENROLLMENT_TEST__.verifyLockupAddress = () =>
+    swap.address
+  fixture.window.LNbits = {
+    api: {
+      payArkadeLightning: async (_wallet, data) => {
+        requests.push({method: 'PAY', data})
+        return {data: {intent: intent()}}
+      },
+      arkadeOutgoingIntent: async () => {
+        requests.push({method: 'GET'})
+        return {data: intent()}
+      },
+      arkadeLightningSubmitted: async (_id, data) => {
+        requests.push({method: 'SUBMIT', data})
+        state.status = 'submitted'
+        return {data: intent()}
+      }
+    }
+  }
+  fixture.wallet.send = async () => {
+    state.sendCount += 1
+    return 'ee'.repeat(32)
+  }
+  fixture.wallet.release = async () => {
+    state.releaseCount += 1
+  }
+  return {
+    ...fixture,
+    state,
+    requests,
+    quote,
+    swap,
+    lightningBolt11,
+    paymentHash,
+    solverPubkey,
+    intentId
+  }
+}
+
+async function lightningBrowserChecks() {
+  const fixture = makeLightningFixture()
+  const summary = await fixture.window.ArkadeEnrollment.prepareLightningSend(
+    fixture.lightningBolt11
+  )
+  assert.deepEqual(
+    {
+      bolt11: summary.bolt11,
+      paymentHash: summary.paymentHash,
+      amountMsat: summary.amountMsat,
+      maxFeeMsat: summary.maxFeeMsat,
+      quotePair: summary.quotePair,
+      quoteFromAmountSat: summary.quoteFromAmountSat,
+      quoteToAmountSat: summary.quoteToAmountSat,
+      quoteValidUntil: summary.quoteValidUntil,
+      refundLocktime: summary.refundLocktime,
+      solverPubkey: summary.solverPubkey,
+      swapRfqId: summary.swapRfqId,
+      lockupAddress: summary.lockupAddress,
+      fundAmount: summary.fundAmount
+    },
+    {
+      bolt11: fixture.lightningBolt11,
+      paymentHash: fixture.paymentHash,
+      amountMsat: 500_000,
+      maxFeeMsat: 2_000,
+      quotePair: fixture.quote.pair,
+      quoteFromAmountSat: 501,
+      quoteToAmountSat: 500,
+      quoteValidUntil: fixture.quote.valid_until,
+      refundLocktime: fixture.quote.refund_locktime,
+      solverPubkey: fixture.solverPubkey,
+      swapRfqId: fixture.quote.rfq_id,
+      lockupAddress: fixture.swap.address,
+      fundAmount: 501
+    }
+  )
+  assert.equal(summary.status, 'quote_ready')
+  assert.equal(fixture.requests[0].data.quote.secrets, undefined)
+
+  await assert.rejects(
+    fixture.window.ArkadeEnrollment.submitLightningSend(fixture.intentId, {
+      approved: false
+    }),
+    /approval required/
+  )
+  assert.equal(fixture.state.sendCount, 0)
+  assert.equal(fixture.state.status, 'quote_ready')
+  assert.equal(fixture.state.releaseCount, 0)
+
+  const failed = makeLightningFixture()
+  await failed.window.ArkadeEnrollment.prepareLightningSend(
+    failed.lightningBolt11
+  )
+  failed.wallet.send = async () => {
+    failed.state.sendCount += 1
+    throw new Error('network disconnected')
+  }
+  await assert.rejects(
+    failed.window.ArkadeEnrollment.submitLightningSend(failed.intentId, {
+      approved: true
+    }),
+    /funding failed/
+  )
+  assert.equal(failed.state.status, 'quote_ready')
+  assert.equal(failed.state.releaseCount, 0)
+  failed.wallet.send = async () => {
+    failed.state.sendCount += 1
+    return 'ee'.repeat(32)
+  }
+  await failed.window.ArkadeEnrollment.submitLightningSend(failed.intentId, {
+    approved: true
+  })
+  assert.equal(failed.state.status, 'submitted')
+  assert.equal(failed.state.sendCount, 2)
+
+  const duplicate = makeLightningFixture()
+  await duplicate.window.ArkadeEnrollment.prepareLightningSend(
+    duplicate.lightningBolt11
+  )
+  await Promise.all([
+    duplicate.window.ArkadeEnrollment.submitLightningSend(duplicate.intentId, {
+      approved: true
+    }),
+    duplicate.window.ArkadeEnrollment.submitLightningSend(duplicate.intentId, {
+      approved: true
+    })
+  ])
+  assert.equal(duplicate.state.sendCount, 1)
+  assert.equal(duplicate.state.status, 'submitted')
+  assert.equal(
+    duplicate.requests.filter(item => item.method === 'SUBMIT').length,
+    2
+  )
+  const artifact = JSON.stringify(duplicate.requests)
+  assert.equal(artifact.includes('private claim material'), false)
+  assert.equal(artifact.includes('secrets'), false)
+}
+
 async function main() {
   const noChange = makeFixture({amountSat: 1_000, inputValue: 1_000})
   const prepared = await noChange.window.ArkadeEnrollment.prepareOutgoing(
@@ -511,6 +715,8 @@ async function main() {
     })
   assert.equal(committedResult.reconciliationRequired, true)
   assert.equal(committed.wallet.submitCount, 1)
+
+  await lightningBrowserChecks()
 
   const unknown = makeFixture({amountSat: 1_000, inputValue: 1_000})
   const unknownPlan = await unknown.window.ArkadeEnrollment.prepareOutgoing(

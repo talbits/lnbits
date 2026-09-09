@@ -12,6 +12,7 @@ _TRANSITIONS = {
     ("reserved", "submitted"),
     ("reserved", "quote_ready"),
     ("reserved", "released"),
+    ("quote_ready", "submitted"),
     ("submitted", "settled"),
     ("submitted", "disputed"),
 }
@@ -436,6 +437,39 @@ async def submit_arkade_outgoing_intent(
     return await _transition_arkade_outgoing_intent(
         intent_id,
         "reserved",
+        "submitted",
+        arkade_txid=arkade_txid,
+        conn=database,
+    )
+
+
+async def submit_arkade_lightning_intent(
+    intent_id: str,
+    arkade_txid: str,
+    *,
+    lockup_address: str,
+    swap_rfq_id: str,
+    solver_pubkey: str,
+    conn: Connection,
+) -> bool:
+    """CAS a funded Lightning lockup from quote-ready to submitted."""
+    if not re.fullmatch(r"[0-9a-f]{64}", arkade_txid):
+        raise ValueError("ARKADE_TRANSACTION_ID_INVALID")
+    database = _require_active_transaction(conn)
+    intent = await get_arkade_outgoing_intent(intent_id, conn=database)
+    if not intent:
+        raise ValueError("ARKADE_INTENT_NOT_FOUND")
+    if intent.destination_kind != "lightning":
+        raise ValueError("ARKADE_INTENT_INVALID_TRANSITION")
+    if (
+        intent.lockup_address != lockup_address
+        or intent.swap_rfq_id != swap_rfq_id
+        or intent.solver_pubkey != solver_pubkey
+    ):
+        raise ValueError("ARKADE_OUTGOING_OUTPUT_CONFLICT")
+    return await _transition_arkade_outgoing_intent(
+        intent_id,
+        "quote_ready",
         "submitted",
         arkade_txid=arkade_txid,
         conn=database,

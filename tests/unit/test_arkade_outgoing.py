@@ -26,6 +26,7 @@ from lnbits.core.crud.arkade_outgoing import (
 )
 from lnbits.core.crud.payments import get_payment_by_native_id
 from lnbits.core.models.arkade import (
+    ArkadeLightningFundingEvidence,
     ArkadeLightningQuoteInput,
     ArkadeOutgoingChangeCommitment,
     ArkadeOutgoingEvidenceResult,
@@ -299,7 +300,7 @@ def _lightning_quote(**updates):
         "quote_from_amount_sat": 5_001,
         "quote_to_amount_sat": 5_000,
         "quote_valid_until": datetime.now(timezone.utc) + timedelta(hours=1),
-        "refund_locktime": int(datetime.now(timezone.utc).timestamp()) + 10_800,
+        "refund_locktime": int(datetime.now(timezone.utc).timestamp()) + 20_000,
         "solver_pubkey": "cd" * 32,
         "swap_rfq_id": "rfq-lightning-test",
         "lockup_address": "tark1lightninglockup",
@@ -1707,3 +1708,63 @@ async def test_lightning_quote_ready_is_atomic_and_idempotent(connection, monkey
     with pytest.raises(ValueError, match="INVALID_TRANSITION"):
         async with connection.transaction():
             await release_arkade_outgoing_intent(accepted.intent_id, connection)
+
+
+@pytest.mark.anyio
+async def test_lightning_submit_records_public_funding_and_is_idempotent(
+    connection, monkeypatch
+):
+    monkeypatch.setattr(
+        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
+    )
+    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", _lightning_backing)
+    monkeypatch.setattr(arkade.bolt11, "decode", lambda _bolt11: _LightningInvoice())
+    await _credit(connection, WALLET_ID, 10_000_000)
+    quote = _lightning_quote(
+        quote_valid_until=datetime.now(timezone.utc) + timedelta(hours=1),
+        refund_locktime=int(datetime.now(timezone.utc).timestamp()) + 20_000,
+    )
+    accepted, _ = await arkade.reserve_arkade_lightning_intent(
+        ACCOUNT_ID,
+        WALLET_ID,
+        quote,
+        connection,
+        idempotency_key="04" * 16,
+    )
+    funding = ArkadeLightningFundingEvidence(
+        ark_txid="55" * 32,
+        lockup_address=quote.lockup_address,
+        swap_rfq_id=quote.swap_rfq_id,
+        solver_pubkey=quote.solver_pubkey,
+    )
+
+    submitted = await arkade.submit_arkade_lightning_intent(
+        ACCOUNT_ID, accepted.intent_id, funding, conn=connection
+    )
+    assert submitted.status == "submitted"
+    assert submitted.arkade_txid == funding.ark_txid
+    assert submitted.destination_kind == "lightning"
+    assert submitted.quote_pair == quote.quote_pair
+    assert submitted.quote_from_amount_sat == quote.quote_from_amount_sat
+    assert submitted.quote_to_amount_sat == quote.quote_to_amount_sat
+    assert submitted.quote_valid_until is not None
+    assert submitted.refund_locktime == quote.refund_locktime
+    assert submitted.solver_pubkey == quote.solver_pubkey
+    assert submitted.swap_rfq_id == quote.swap_rfq_id
+    assert submitted.lockup_address == quote.lockup_address
+
+    replay = await arkade.submit_arkade_lightning_intent(
+        ACCOUNT_ID, accepted.intent_id, funding, conn=connection
+    )
+    assert replay == submitted
+    with pytest.raises(arkade.ArkadeOutgoingError, match="IDEMPOTENCY_CONFLICT"):
+        await arkade.submit_arkade_lightning_intent(
+            ACCOUNT_ID,
+            accepted.intent_id,
+            funding.copy(update={"ark_txid": "66" * 32}),
+            conn=connection,
+        )
+    with pytest.raises(arkade.ArkadeOutgoingError, match="INVALID_TRANSITION"):
+        await arkade.release_arkade_outgoing_payment(
+            ACCOUNT_ID, accepted.intent_id, conn=connection
+        )

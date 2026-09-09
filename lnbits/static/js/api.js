@@ -65,6 +65,33 @@ window._lnbitsApi = {
       }
     )
   },
+  payArkadeLightning(wallet, {bolt11, quote}, idempotencyKey) {
+    const publicQuote = {
+      payment_hash: quote.payment_hash,
+      amount_msat: quote.amount_msat,
+      max_fee_msat: quote.max_fee_msat,
+      quote_pair: quote.quote_pair,
+      quote_from_amount_sat: quote.quote_from_amount_sat,
+      quote_to_amount_sat: quote.quote_to_amount_sat,
+      quote_valid_until: quote.quote_valid_until,
+      refund_locktime: quote.refund_locktime,
+      solver_pubkey: quote.solver_pubkey,
+      swap_rfq_id: quote.swap_rfq_id,
+      lockup_address: quote.lockup_address
+    }
+    return this.request(
+      'post',
+      '/api/v1/payments',
+      wallet.adminkey,
+      {out: true, bolt11, arkade_quote: publicQuote},
+      {
+        headers: {
+          'X-Api-Key': wallet.adminkey,
+          'Idempotency-Key': idempotencyKey
+        }
+      }
+    )
+  },
   cancelInvoice(wallet, paymentHash) {
     return this.request('post', '/api/v1/payments/cancel', wallet.adminkey, {
       payment_hash: paymentHash
@@ -160,6 +187,13 @@ window._lnbitsApi = {
     return axios({
       method: 'POST',
       url: `/api/v1/arkade/outgoing/${intentId}/release`
+    })
+  },
+  arkadeLightningSubmitted(intentId, fundingEvidence) {
+    return axios({
+      method: 'POST',
+      url: `/api/v1/arkade/outgoing/${intentId}/submit`,
+      data: fundingEvidence
     })
   },
   login(username, password) {

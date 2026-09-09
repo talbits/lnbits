@@ -49,6 +49,9 @@ from lnbits.core.crud.arkade_outgoing import (
     release_arkade_outgoing_intent,
     settle_arkade_outgoing_intent_verified,
 )
+from lnbits.core.crud.arkade_outgoing import (
+    submit_arkade_lightning_intent as submit_arkade_lightning_intent_crud,
+)
 from lnbits.core.crud.payments import (
     compare_and_set_payment_success,
     create_payment,
@@ -64,6 +67,7 @@ from lnbits.core.models import (
     ArkadeEnrollmentChallenge,
     ArkadeEnrollmentCompletion,
     ArkadeIndexerVtxo,
+    ArkadeLightningFundingEvidence,
     ArkadeOutgoingChangeCommitment,
     ArkadeOutgoingEvidenceResult,
     ArkadeOutgoingEvidenceStatus,
@@ -675,6 +679,87 @@ async def reserve_arkade_lightning_intent(  # noqa: C901
         raise
 
 
+async def submit_arkade_lightning_intent(  # noqa: C901
+    account_id: str,
+    intent_id: str,
+    funding: ArkadeLightningFundingEvidence,
+    conn: Connection | None = None,
+) -> ArkadeOutgoingIntentResponse:
+    """Record browser funding and CAS a Lightning intent to submitted."""
+    if settings.lnbits_effective_installation_mode != "arkade_noncustodial":
+        raise ArkadeOutgoingError("ARKADE_OUTGOING_UNAVAILABLE")
+
+    try:
+        async with db.reuse_conn(conn) if conn else db.connect() as database:
+            async with database.transaction():
+                intent = await get_arkade_outgoing_intent(intent_id, conn=database)
+                if not intent or intent.account_id != account_id:
+                    raise ArkadeOutgoingError("ARKADE_OUTGOING_NOT_FOUND")
+                binding = await get_arkade_binding(account_id, conn=database)
+                if not binding or binding.state != "ready":
+                    raise ArkadeOutgoingError("ARKADE_ENROLLMENT_REQUIRED")
+                if intent.destination_kind != "lightning":
+                    raise ArkadeOutgoingError("ARKADE_INTENT_INVALID_TRANSITION")
+                if intent.status == "submitted":
+                    if (
+                        intent.arkade_txid != funding.ark_txid
+                        or intent.lockup_address != funding.lockup_address
+                        or intent.swap_rfq_id != funding.swap_rfq_id
+                        or intent.solver_pubkey != funding.solver_pubkey
+                    ):
+                        raise ArkadeOutgoingError(
+                            "ARKADE_OUTGOING_IDEMPOTENCY_CONFLICT"
+                        )
+                    return _outgoing_response(
+                        intent,
+                        binding,
+                        await get_arkade_outgoing_intent_inputs(
+                            intent_id, conn=database
+                        ),
+                    )
+                if intent.status != "quote_ready":
+                    raise ArkadeOutgoingError("ARKADE_INTENT_INVALID_TRANSITION")
+                payment = await get_payment_by_native_id(intent_id, conn=database)
+                if (
+                    not payment
+                    or not _outgoing_payment_matches(payment, intent)
+                    or payment.status != PaymentState.PENDING.value
+                ):
+                    raise ArkadeOutgoingError("ARKADE_OUTGOING_CORRUPT")
+                try:
+                    submitted = await submit_arkade_lightning_intent_crud(
+                        intent_id,
+                        funding.ark_txid,
+                        lockup_address=funding.lockup_address,
+                        swap_rfq_id=funding.swap_rfq_id,
+                        solver_pubkey=funding.solver_pubkey,
+                        conn=database,
+                    )
+                except ValueError as exc:
+                    code = str(exc)
+                    if code in {
+                        "ARKADE_OUTGOING_OUTPUT_CONFLICT",
+                        "ARKADE_INTENT_INVALID_TRANSITION",
+                        "ARKADE_TRANSACTION_ID_INVALID",
+                    }:
+                        raise ArkadeOutgoingError(code) from None
+                    raise ArkadeOutgoingError("ARKADE_OUTGOING_CORRUPT") from None
+                if not submitted:
+                    raise ArkadeOutgoingError("ARKADE_INTENT_INVALID_TRANSITION")
+                intent = await get_arkade_outgoing_intent(intent_id, conn=database)
+                if not intent or intent.status != "submitted":
+                    raise ArkadeOutgoingError("ARKADE_OUTGOING_CORRUPT")
+                return _outgoing_response(
+                    intent,
+                    binding,
+                    await get_arkade_outgoing_intent_inputs(intent_id, conn=database),
+                )
+    except OperationalError as exc:
+        if _is_database_busy(exc):
+            raise ArkadeOutgoingError("ARKADE_OUTGOING_BUSY") from None
+        raise
+
+
 def _outgoing_intent_matches(
     current: ArkadeOutgoingIntent, requested: ArkadeOutgoingIntent
 ) -> bool:
@@ -790,6 +875,17 @@ def _outgoing_response(
         amount_msat=intent.amount_msat,
         max_fee_msat=intent.max_fee_msat,
         destination=intent.destination,
+        bolt11=intent.bolt11,
+        payment_hash=intent.payment_hash,
+        quote_pair=intent.quote_pair,
+        quote_from_amount_sat=intent.quote_from_amount_sat,
+        quote_to_amount_sat=intent.quote_to_amount_sat,
+        quote_valid_until=intent.quote_valid_until,
+        refund_locktime=intent.refund_locktime,
+        solver_pubkey=intent.solver_pubkey,
+        swap_rfq_id=intent.swap_rfq_id,
+        lockup_address=intent.lockup_address,
+        arkade_txid=intent.arkade_txid,
         destination_kind=intent.destination_kind,
         status=intent.status,
         expires_at=intent.expires_at,

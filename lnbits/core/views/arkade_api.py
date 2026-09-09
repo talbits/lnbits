@@ -7,6 +7,7 @@ from lnbits.core.models import (
     ArkadeEnrollmentBindingResponse,
     ArkadeEnrollmentChallenge,
     ArkadeEnrollmentCompletion,
+    ArkadeLightningFundingEvidence,
     ArkadeOutgoingAuthorizeRequest,
     ArkadeOutgoingIntentResponse,
     ArkadeReceiveAcknowledgement,
@@ -26,6 +27,7 @@ from lnbits.core.services.arkade import (
     get_arkade_receive_request_for_account,
     list_arkade_submitted_outgoing_intents,
     release_arkade_outgoing_payment,
+    submit_arkade_lightning_intent,
 )
 from lnbits.decorators import check_authenticated_account
 
@@ -94,6 +96,7 @@ def _public_outgoing_error(exc: ArkadeOutgoingError) -> HTTPException:
         "ARKADE_TRANSFER_RECEIVER_INVALID",
         "ARKADE_TRANSFER_CORRUPT",
         "ARKADE_TRANSFER_REQUEST_CONSUMED",
+        "ARKADE_TRANSACTION_ID_INVALID",
     }:
         code = "ARKADE_OUTGOING_ERROR"
     return HTTPException(HTTPStatus.BAD_REQUEST, code)
@@ -214,5 +217,20 @@ async def api_arkade_outgoing_release(
     try:
         await release_arkade_outgoing_payment(account.id, intent_id)
         return SimpleStatus(success=True, message="Arkade reservation released.")
+    except ArkadeOutgoingError as exc:
+        raise _public_outgoing_error(exc) from exc
+
+
+@arkade_router.post(
+    "/outgoing/{intent_id}/submit",
+    response_model=ArkadeOutgoingIntentResponse,
+)
+async def api_arkade_lightning_submit(
+    intent_id: str,
+    data: ArkadeLightningFundingEvidence,
+    account: Account = Depends(check_authenticated_account),
+):
+    try:
+        return await submit_arkade_lightning_intent(account.id, intent_id, data)
     except ArkadeOutgoingError as exc:
         raise _public_outgoing_error(exc) from exc

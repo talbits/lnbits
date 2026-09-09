@@ -13,6 +13,12 @@ import {
   isSpendable,
   selectVirtualCoins
 } from '@arkade-os/sdk'
+import {
+  assertFundable,
+  requestLightningSend,
+  verifyLockupAddress
+} from '@arkade-os/swap'
+import {nostrRfqTransport} from '@arkade-os/swap/nostr'
 import {generateMnemonic, validateMnemonic} from '@scure/bip39'
 import {wordlist} from '@scure/bip39/wordlists/english.js'
 const DB_NAME = 'lnbits-arkade-vault-v1'
@@ -42,6 +48,14 @@ const OUTGOING_JOURNAL_PREFIX = 'lnbits-arkade-outgoing-v1'
 const OUTGOING_JOURNAL_VERSION = 1
 const MAX_OUTGOING_JOURNAL_RECORDS = 32
 const MAX_OUTGOING_JOURNAL_BYTES = 128 * 1024
+const LIGHTNING_RELAY = 'wss://nostr.arkade.sh'
+const LIGHTNING_SOLVER_PUBKEY =
+  '66422c952f8dcb96e4d0c3f049cd1e265b8461b916d9913c65c2494b64b4e3ce'
+const LIGHTNING_QUOTE_PAIR = 'arkade:BTC->lightning:BTC'
+const LIGHTNING_FEE_BPS = 30
+const LIGHTNING_MIN_AMOUNT_SAT = 500
+const LIGHTNING_MAX_AMOUNT_SAT = 50_000
+const LIGHTNING_REFUND_HEADROOM_SECONDS = 10_800
 const OUTGOING_PHASES = /* @__PURE__ */ new Set([
   'prepared',
   'authorization_unknown',
@@ -69,6 +83,7 @@ let allocationWalletKey = ''
 let unlockGeneration = 0
 const outgoingPlans = /* @__PURE__ */ new WeakMap()
 const outgoingRecoveries = /* @__PURE__ */ new Map()
+const lightningPlans = /* @__PURE__ */ new Map()
 class ArkadeOutgoingReconciliationError extends Error {
   reconciliationRequired = true
   status
@@ -561,6 +576,300 @@ const outgoingWallet = async (accountId, binding) => {
     ? window.__ARKADE_ENROLLMENT_TEST__?.wallet
     : void 0
   return testWallet || getAllocationWallet(accountId, binding)
+}
+const lightningInvoiceFacts = bolt11 => {
+  const value = String(bolt11 || '')
+    .trim()
+    .toLowerCase()
+  const decoder = window.decode
+  if (!value || typeof decoder !== 'function')
+    throw new Error('Arkade Lightning invoice decoder unavailable')
+  let decoded
+  try {
+    decoded = decoder(value)
+  } catch {
+    throw new Error('Arkade Lightning invoice is invalid')
+  }
+  const amountMsat = decoded?.human_readable_part?.amount
+  const timestamp = decoded?.data?.time_stamp
+  const tags = Array.isArray(decoded?.data?.tags) ? decoded.data.tags : []
+  const paymentHash = tags.find(
+    tag => tag?.description === 'payment_hash'
+  )?.value
+  const expiry = tags.find(tag => tag?.description === 'expiry')?.value ?? 3600
+  const expiresAt = timestamp + expiry
+  if (
+    !Number.isSafeInteger(amountMsat) ||
+    amountMsat <= 0 ||
+    amountMsat % 1000 !== 0 ||
+    !Number.isSafeInteger(timestamp) ||
+    !Number.isSafeInteger(expiresAt) ||
+    !HEX64.test(paymentHash || '')
+  )
+    throw new Error('Arkade Lightning invoice is invalid')
+  return {
+    raw: value,
+    paymentHash: paymentHash.toLowerCase(),
+    amountMsat,
+    amountSats: amountMsat / 1000,
+    expiresAt
+  }
+}
+const lightningMaxFeeMsat = amountSats =>
+  Math.max(1, Math.ceil((amountSats * LIGHTNING_FEE_BPS) / 10_000)) * 1000
+const lightningPublicQuote = (facts, swap) => {
+  const quote = swap?.quote
+  if (
+    !quote ||
+    quote.v !== 1 ||
+    quote.type !== 'rfq_quote' ||
+    quote.pair !== LIGHTNING_QUOTE_PAIR ||
+    !Number.isSafeInteger(quote.from_amount) ||
+    !Number.isSafeInteger(quote.to_amount) ||
+    !Number.isSafeInteger(quote.valid_until) ||
+    !Number.isSafeInteger(quote.refund_locktime) ||
+    !HEX64.test(quote.solver_pubkey || '') ||
+    typeof quote.rfq_id !== 'string' ||
+    !quote.rfq_id ||
+    quote.rfq_id !== swap.rfqId
+  )
+    throw new Error('Arkade Lightning quote binding changed')
+  if (quote.solver_pubkey !== LIGHTNING_SOLVER_PUBKEY)
+    throw new Error('Arkade Lightning solver is not approved')
+  if (
+    quote.to_amount !== facts.amountSats ||
+    quote.from_amount < quote.to_amount
+  )
+    throw new Error('Arkade Lightning quote amount changed')
+  const now = Math.floor(Date.now() / 1000)
+  if (quote.refund_locktime < now + LIGHTNING_REFUND_HEADROOM_SECONDS)
+    throw new Error('Arkade Lightning refund window is too short')
+  assertFundable({
+    quote,
+    invoiceExpiresAt: facts.expiresAt,
+    now,
+    maxFee: {bps: LIGHTNING_FEE_BPS}
+  })
+  if (
+    !Number.isSafeInteger(swap.fundAmount) ||
+    typeof swap.address !== 'string' ||
+    !swap.address ||
+    swap.fundAmount !== quote.from_amount
+  )
+    throw new Error('Arkade Lightning lockup changed')
+  try {
+    const testVerifier =
+      ARKADE_ENROLLMENT_TEST &&
+      window.__ARKADE_ENROLLMENT_TEST__?.verifyLockupAddress
+    const verifier =
+      typeof testVerifier === 'function' ? testVerifier : verifyLockupAddress
+    verifier(quote, swap.address)
+  } catch {
+    throw new Error('Arkade Lightning lockup changed')
+  }
+  return {
+    payment_hash: facts.paymentHash,
+    amount_msat: facts.amountMsat,
+    max_fee_msat: lightningMaxFeeMsat(facts.amountSats),
+    quote_pair: quote.pair,
+    quote_from_amount_sat: quote.from_amount,
+    quote_to_amount_sat: quote.to_amount,
+    quote_valid_until: quote.valid_until,
+    refund_locktime: quote.refund_locktime,
+    solver_pubkey: quote.solver_pubkey,
+    swap_rfq_id: quote.rfq_id,
+    lockup_address: swap.address
+  }
+}
+const sameLightningBinding = (intent, facts, sdkQuote, swap, publicQuote) => {
+  try {
+    return (
+      intent?.status === 'quote_ready' &&
+      intent.destination_kind === 'lightning' &&
+      intent.destination === facts.raw &&
+      intent.bolt11 === facts.raw &&
+      intent.payment_hash === facts.paymentHash &&
+      intent.amount_msat === facts.amountMsat &&
+      intent.max_fee_msat === publicQuote.max_fee_msat &&
+      intent.quote_pair === publicQuote.quote_pair &&
+      intent.quote_from_amount_sat === publicQuote.quote_from_amount_sat &&
+      intent.quote_to_amount_sat === publicQuote.quote_to_amount_sat &&
+      expirySeconds(intent.quote_valid_until) === sdkQuote.valid_until &&
+      intent.refund_locktime === sdkQuote.refund_locktime &&
+      intent.solver_pubkey === LIGHTNING_SOLVER_PUBKEY &&
+      intent.solver_pubkey === sdkQuote.solver_pubkey &&
+      intent.swap_rfq_id === sdkQuote.rfq_id &&
+      intent.swap_rfq_id === swap.rfqId &&
+      intent.lockup_address === swap.address &&
+      publicQuote.lockup_address === swap.address &&
+      swap.fundAmount === intent.quote_from_amount_sat &&
+      swap.quote.to_amount === intent.quote_to_amount_sat &&
+      swap.quote.from_amount === intent.quote_from_amount_sat &&
+      swap.quote.pair === intent.quote_pair &&
+      swap.quote.valid_until === sdkQuote.valid_until &&
+      swap.quote.refund_locktime === sdkQuote.refund_locktime
+    )
+  } catch {
+    return false
+  }
+}
+const lightningApprovalSummary = (facts, intent, swap, quote) =>
+  Object.freeze({
+    status: 'quote_ready',
+    intentId: intent.intent_id,
+    bolt11: facts.raw,
+    paymentHash: facts.paymentHash,
+    amountMsat: facts.amountMsat,
+    amountSat: facts.amountSats,
+    invoiceExpiresAt: facts.expiresAt,
+    intentExpiresAt: intent.expires_at,
+    maxFeeMsat: quote.max_fee_msat,
+    maxFeeSat: quote.max_fee_msat / 1000,
+    feeMsat: (quote.quote_from_amount_sat - quote.quote_to_amount_sat) * 1000,
+    feeSat: quote.quote_from_amount_sat - quote.quote_to_amount_sat,
+    quotePair: quote.quote_pair,
+    quoteFromAmountSat: quote.quote_from_amount_sat,
+    quoteToAmountSat: quote.quote_to_amount_sat,
+    quoteValidUntil: quote.quote_valid_until,
+    refundLocktime: quote.refund_locktime,
+    solverPubkey: quote.solver_pubkey,
+    swapRfqId: quote.swap_rfq_id,
+    lockupAddress: quote.lockup_address,
+    fundAmount: swap.fundAmount
+  })
+const prepareLightningSend = async bolt11 => {
+  const accountId = window.g.user.id
+  if (!identity || !activeBinding || activeBinding.state !== 'ready')
+    throw new Error('wallet is locked')
+  const facts = lightningInvoiceFacts(bolt11)
+  if (
+    facts.amountSats < LIGHTNING_MIN_AMOUNT_SAT ||
+    facts.amountSats > LIGHTNING_MAX_AMOUNT_SAT
+  )
+    throw new Error(
+      'Arkade Lightning invoice amount is outside the solver range'
+    )
+  const wallet = await outgoingWallet(accountId, activeBinding)
+  let swap
+  let transport
+  try {
+    const testRequest =
+      ARKADE_ENROLLMENT_TEST &&
+      window.__ARKADE_ENROLLMENT_TEST__?.requestLightningSend
+    if (typeof testRequest === 'function') {
+      swap = await testRequest(wallet, activeBinding.server_url, facts)
+    } else {
+      transport = nostrRfqTransport({
+        relays: [LIGHTNING_RELAY],
+        solverPubkey: LIGHTNING_SOLVER_PUBKEY
+      })
+      swap = await requestLightningSend(
+        wallet,
+        activeBinding.server_url,
+        transport,
+        {invoice: facts}
+      )
+    }
+  } catch {
+    throw new Error('Arkade Lightning quote request failed')
+  } finally {
+    await transport?.close?.()
+  }
+  const publicQuote = lightningPublicQuote(facts, swap)
+  const apiWallet = window.g.wallet || window.g.user?.wallets?.[0]
+  if (!apiWallet?.adminkey)
+    throw new Error('Arkade Lightning wallet unavailable')
+  let response
+  try {
+    response = (
+      await LNbits.api.payArkadeLightning(
+        apiWallet,
+        {bolt11: facts.raw, quote: publicQuote},
+        randomHex(16)
+      )
+    ).data
+  } catch {
+    throw new Error('Arkade Lightning reservation failed')
+  }
+  const intent = response?.intent
+  if (!sameLightningBinding(intent, facts, swap.quote, swap, publicQuote))
+    throw new Error('Arkade Lightning reservation changed')
+  const summary = lightningApprovalSummary(facts, intent, swap, publicQuote)
+  lightningPlans.set(intent.intent_id, {
+    accountId,
+    facts,
+    wallet,
+    swap,
+    publicQuote,
+    intent,
+    summary,
+    generation: unlockGeneration,
+    bindingFingerprint: outgoingBindingFingerprint(activeBinding),
+    fundingPromise: null,
+    fundingArkTxid: null
+  })
+  return summary
+}
+const submitLightningSend = async (intentId, approval) => {
+  if (!approval || approval.approved !== true)
+    throw new Error('Arkade Lightning approval required')
+  const plan = lightningPlans.get(intentId)
+  if (!plan) throw new Error('Arkade Lightning preparation is invalid')
+  if (
+    !outgoingContextIsLive(
+      plan.accountId,
+      plan.generation,
+      plan.bindingFingerprint
+    )
+  )
+    throw new Error('Arkade Lightning preparation is locked')
+  const current = (await LNbits.api.arkadeOutgoingIntent(intentId)).data
+  if (current.status === 'submitted') {
+    if (current.arkade_txid !== plan.fundingArkTxid)
+      throw new Error('Arkade Lightning funding changed')
+    return {status: 'submitted', intentId, arkTxid: current.arkade_txid}
+  }
+  if (
+    !sameLightningBinding(
+      current,
+      plan.facts,
+      plan.swap.quote,
+      plan.swap,
+      plan.publicQuote
+    )
+  )
+    throw new Error('Arkade Lightning intent changed')
+  try {
+    lightningPublicQuote(plan.facts, plan.swap)
+  } catch {
+    throw new Error('Arkade Lightning quote is no longer fundable')
+  }
+  if (!plan.fundingPromise) {
+    plan.fundingPromise = plan.wallet
+      .send({address: plan.swap.address, amount: plan.swap.fundAmount})
+      .then(arkTxid => {
+        if (typeof arkTxid !== 'string' || !/^[0-9a-f]{64}$/.test(arkTxid))
+          throw new Error('Arkade Lightning funding result invalid')
+        plan.fundingArkTxid = arkTxid
+        return arkTxid
+      })
+      .catch(() => {
+        plan.fundingPromise = null
+        throw new Error('Arkade Lightning funding failed')
+      })
+  }
+  const arkTxid = await plan.fundingPromise
+  const submitted = (
+    await LNbits.api.arkadeLightningSubmitted(intentId, {
+      ark_txid: arkTxid,
+      lockup_address: plan.swap.address,
+      swap_rfq_id: plan.swap.rfqId,
+      solver_pubkey: plan.swap.quote.solver_pubkey
+    })
+  ).data
+  if (submitted.status !== 'submitted' || submitted.arkade_txid !== arkTxid)
+    throw new Error('Arkade Lightning submission changed')
+  return {status: 'submitted', intentId, arkTxid}
 }
 const requestMatchesMapping = (request, mapping) =>
   !!request &&
@@ -1784,6 +2093,12 @@ window.ArkadeEnrollment = {
   },
   async submitOutgoing(prepared, approval) {
     return submitOutgoing(prepared, approval)
+  },
+  async prepareLightningSend(bolt11) {
+    return prepareLightningSend(bolt11)
+  },
+  async submitLightningSend(intentId, approval) {
+    return submitLightningSend(intentId, approval)
   },
   async listOutgoing() {
     return listOutgoing()
