@@ -10,6 +10,7 @@ from lnbits.db import SQLITE, Connection
 
 _TRANSITIONS = {
     ("reserved", "submitted"),
+    ("reserved", "quote_ready"),
     ("reserved", "released"),
     ("submitted", "settled"),
     ("submitted", "disputed"),
@@ -23,6 +24,16 @@ _IMMUTABLE_FIELDS = (
     "destination",
     "destination_kind",
     "expires_at",
+    "bolt11",
+    "payment_hash",
+    "quote_pair",
+    "quote_from_amount_sat",
+    "quote_to_amount_sat",
+    "quote_valid_until",
+    "refund_locktime",
+    "solver_pubkey",
+    "swap_rfq_id",
+    "lockup_address",
 )
 
 
@@ -137,12 +148,19 @@ async def create_arkade_outgoing_intent(
         f"""
         INSERT INTO arkade_outgoing_intents (
             intent_id, account_id, wallet_id, amount_msat, max_fee_msat,
-            destination, destination_kind, status, arkade_txid,
+            destination, destination_kind, status, bolt11, payment_hash,
+            quote_pair, quote_from_amount_sat, quote_to_amount_sat,
+            quote_valid_until, refund_locktime, solver_pubkey, swap_rfq_id,
+            lockup_address, arkade_txid,
             actual_fee_msat, expires_at, created_at, updated_at, reserved_at,
             submitted_at, settled_at, released_at, disputed_at
         ) VALUES (
             :intent_id, :account_id, :wallet_id, :amount_msat, :max_fee_msat,
-            :destination, :destination_kind, :status, :arkade_txid,
+            :destination, :destination_kind, :status, :bolt11, :payment_hash,
+            :quote_pair, :quote_from_amount_sat, :quote_to_amount_sat,
+            {connection.timestamp_placeholder('quote_valid_until')},
+            :refund_locktime, :solver_pubkey, :swap_rfq_id, :lockup_address,
+            :arkade_txid,
             :actual_fee_msat, {connection.timestamp_placeholder('expires_at')},
             {connection.timestamp_placeholder('created_at')},
             {connection.timestamp_placeholder('updated_at')},
@@ -161,6 +179,54 @@ async def create_arkade_outgoing_intent(
     if not _same_immutable_fields(created, intent):
         raise ValueError("ARKADE_INTENT_IDEMPOTENCY_CONFLICT")
     return created
+
+
+async def mark_arkade_outgoing_intent_quote_ready(
+    intent_id: str,
+    *,
+    bolt11: str,
+    payment_hash: str,
+    quote_pair: str,
+    quote_from_amount_sat: int,
+    quote_to_amount_sat: int,
+    quote_valid_until: datetime,
+    refund_locktime: int,
+    solver_pubkey: str,
+    swap_rfq_id: str,
+    lockup_address: str,
+    conn: Connection,
+) -> bool:
+    """Bind an accepted browser quote to a still-unfunded reservation."""
+    database = _require_active_transaction(conn)
+    result = await database.execute(
+        f"""
+        UPDATE arkade_outgoing_intents
+        SET status = 'quote_ready', bolt11 = :bolt11,
+            payment_hash = :payment_hash, quote_pair = :quote_pair,
+            quote_from_amount_sat = :quote_from_amount_sat,
+            quote_to_amount_sat = :quote_to_amount_sat,
+            quote_valid_until = {database.timestamp_placeholder('quote_valid_until')},
+            refund_locktime = :refund_locktime, solver_pubkey = :solver_pubkey,
+            swap_rfq_id = :swap_rfq_id, lockup_address = :lockup_address,
+            updated_at = {database.timestamp_placeholder('updated_at')}
+        WHERE intent_id = :intent_id AND status = 'reserved'
+        """,  # noqa: S608
+        {
+            "intent_id": intent_id,
+            "bolt11": bolt11,
+            "payment_hash": payment_hash,
+            "quote_pair": quote_pair,
+            "quote_from_amount_sat": quote_from_amount_sat,
+            "quote_to_amount_sat": quote_to_amount_sat,
+            "quote_valid_until": quote_valid_until,
+            "refund_locktime": refund_locktime,
+            "solver_pubkey": solver_pubkey,
+            "swap_rfq_id": swap_rfq_id,
+            "lockup_address": lockup_address,
+            "updated_at": datetime.now(timezone.utc),
+        },
+    )
+    return bool(result.rowcount)
 
 
 async def claim_arkade_outgoing_inputs(
@@ -283,7 +349,7 @@ async def _claim_arkade_outgoing_inputs(
     return await get_arkade_outgoing_intent_inputs(inputs[0].intent_id, conn=conn)
 
 
-async def _transition_arkade_outgoing_intent(
+async def _transition_arkade_outgoing_intent(  # noqa: C901
     intent_id: str,
     from_status: str,
     to_status: str,
@@ -328,6 +394,8 @@ async def _transition_arkade_outgoing_intent(
                 "submitted_at = " + database.timestamp_placeholder("now"),
             ]
         )
+    elif to_status == "quote_ready":
+        pass
     elif to_status == "settled":
         columns.extend(
             [

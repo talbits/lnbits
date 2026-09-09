@@ -13,6 +13,7 @@ from embit.descriptor import Descriptor
 from embit.psbt import PSBT
 from sqlalchemy.exc import IntegrityError, OperationalError
 
+from lnbits import bolt11
 from lnbits.core.crud.arkade import (
     complete_arkade_binding,
     create_arkade_receive_outpoint,
@@ -44,6 +45,7 @@ from lnbits.core.crud.arkade_outgoing import (
     get_arkade_outgoing_intent,
     get_arkade_outgoing_intent_inputs,
     get_arkade_submitted_outgoing_intents,
+    mark_arkade_outgoing_intent_quote_ready,
     release_arkade_outgoing_intent,
     settle_arkade_outgoing_intent_verified,
 )
@@ -74,6 +76,7 @@ from lnbits.core.models import (
     Payment,
     PaymentState,
 )
+from lnbits.core.models.arkade import ArkadeLightningQuoteInput
 from lnbits.core.models.payments import CreatePayment
 from lnbits.core.models.users import Account
 from lnbits.db import SQLITE, Connection
@@ -99,6 +102,10 @@ MAX_VOUT = 4_294_967_295
 _INDEXER_TIMESTAMP_BOUNDARY_MS = 1_735_689_600_000
 _MAX_INDEXER_PSBT_BYTES = 4 * 1024 * 1024
 _MAX_INDEXER_PSBT_BASE64_LENGTH = 4 * ((_MAX_INDEXER_PSBT_BYTES + 2) // 3)
+LIGHTNING_MIN_QUOTE_AMOUNT_SAT = 500
+LIGHTNING_MAX_QUOTE_AMOUNT_SAT = 50_000
+LIGHTNING_REFUND_HEADROOM_SECONDS = 10_800
+LIGHTNING_QUOTE_PAIR = "arkade:BTC->lightning:BTC"
 _TAPROOT_UNSPENDABLE_KEY = bytes.fromhex(
     "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0"
 )
@@ -335,6 +342,22 @@ def _is_database_busy(exc: OperationalError) -> bool:
     )
 
 
+async def _arkade_backing_msat(account_id: str) -> int:
+    """Read public spendable backing before entering the reservation transaction."""
+    evidence = await fetch_arkade_indexer_vtxos(account_id, spendable_only=True)
+    unique_vtxos: dict[tuple[str, int], ArkadeIndexerVtxo] = {}
+    for vtxo in evidence:
+        key = (vtxo.txid, vtxo.vout)
+        if key in unique_vtxos and unique_vtxos[key] != vtxo:
+            raise ArkadeOutgoingError("ARKADE_INDEXER_INVALID_RESPONSE")
+        unique_vtxos[key] = vtxo
+    return sum(
+        vtxo.amount_sat * 1000
+        for vtxo in unique_vtxos.values()
+        if _is_spendable_vtxo(vtxo)
+    )
+
+
 async def reserve_arkade_outgoing_intent(  # noqa: C901
     account_id: str,
     intent: ArkadeOutgoingIntent,
@@ -348,7 +371,11 @@ async def reserve_arkade_outgoing_intent(  # noqa: C901
         raise ArkadeOutgoingError("ARKADE_OUTGOING_UNAVAILABLE")
     if intent.account_id != account_id:
         raise ArkadeOutgoingError("ARKADE_OUTGOING_ACCOUNT_MISMATCH")
-    if intent.status != "reserved" or intent.max_fee_msat != 0:
+    if (
+        intent.status != "reserved"
+        or intent.destination_kind != "arkade_address"
+        or intent.max_fee_msat != 0
+    ):
         raise ArkadeOutgoingError("ARKADE_OUTGOING_INVALID_REQUEST")
     if (conn or db).type == SQLITE:
         intent = intent.copy(
@@ -361,14 +388,15 @@ async def reserve_arkade_outgoing_intent(  # noqa: C901
     binding = await get_arkade_binding(account_id, conn=conn)
     if not binding or binding.state != "ready":
         raise ArkadeOutgoingError("ARKADE_ENROLLMENT_REQUIRED")
-    try:
-        decode_arkade_address_script(
-            intent.destination,
-            binding.server_pubkey,
-            ARKADE_HRPS[binding.network],
-        )
-    except (ArkadeReceiveError, KeyError):
-        raise ArkadeOutgoingError("ARKADE_OUTGOING_OUTPUT_INVALID") from None
+    if intent.destination_kind == "arkade_address":
+        try:
+            decode_arkade_address_script(
+                intent.destination,
+                binding.server_pubkey,
+                ARKADE_HRPS[binding.network],
+            )
+        except (ArkadeReceiveError, KeyError):
+            raise ArkadeOutgoingError("ARKADE_OUTGOING_OUTPUT_INVALID") from None
 
     try:
         existing_intent = await get_arkade_outgoing_intent(intent.intent_id, conn=conn)
@@ -381,18 +409,7 @@ async def reserve_arkade_outgoing_intent(  # noqa: C901
         return _existing_outgoing_pair(intent, existing_intent, existing_payment)
 
     # The public observation must not share the reservation transaction.
-    evidence = await fetch_arkade_indexer_vtxos(account_id, spendable_only=True)
-    unique_vtxos: dict[tuple[str, int], ArkadeIndexerVtxo] = {}
-    for vtxo in evidence:
-        key = (vtxo.txid, vtxo.vout)
-        if key in unique_vtxos and unique_vtxos[key] != vtxo:
-            raise ArkadeOutgoingError("ARKADE_INDEXER_INVALID_RESPONSE")
-        unique_vtxos[key] = vtxo
-    backing_msat = sum(
-        vtxo.amount_sat * 1000
-        for vtxo in unique_vtxos.values()
-        if _is_spendable_vtxo(vtxo)
-    )
+    backing_msat = await _arkade_backing_msat(account_id)
 
     try:
         async with db.reuse_conn(conn) if conn else db.connect() as database:
@@ -506,7 +523,8 @@ async def _reserve_arkade_outgoing_intent(  # noqa: C901
     reservations = await conn.fetchone(
         "SELECT COALESCE(SUM(amount_msat + max_fee_msat), 0) AS obligations_msat "
         "FROM arkade_outgoing_intents "
-        "WHERE account_id = :account_id AND status IN ('reserved', 'submitted')",
+        "WHERE account_id = :account_id "
+        "AND status IN ('reserved', 'quote_ready', 'submitted')",
         {"account_id": account_id},
     )
     gross_obligations = int(balances["balance_msat"]) + int(
@@ -532,6 +550,131 @@ async def _reserve_arkade_outgoing_intent(  # noqa: C901
     return created_intent, payment
 
 
+async def reserve_arkade_lightning_intent(  # noqa: C901
+    account_id: str,
+    wallet_id: str,
+    quote: ArkadeLightningQuoteInput,
+    conn: Connection | None = None,
+    *,
+    idempotency_key: str,
+) -> tuple[ArkadeOutgoingIntent, Payment]:
+    """Validate a browser quote and atomically reserve its quote-ready intent."""
+    if settings.lnbits_effective_installation_mode != "arkade_noncustodial":
+        raise ArkadeOutgoingError("ARKADE_OUTGOING_UNAVAILABLE")
+
+    now = datetime.now(timezone.utc)
+    try:
+        invoice = bolt11.decode(quote.bolt11)
+        invoice_amount_msat = int(invoice.amount_msat or 0)
+        invoice_payment_hash = invoice.payment_hash.lower()
+    except Exception:
+        raise ArkadeOutgoingError("ARKADE_OUTGOING_INVALID_REQUEST") from None
+    if invoice_amount_msat <= 0 or invoice_amount_msat % 1000:
+        raise ArkadeOutgoingError("ARKADE_OUTGOING_AMOUNT_INVALID")
+    invoice_amount_sat = invoice_amount_msat // 1000
+    if not (
+        LIGHTNING_MIN_QUOTE_AMOUNT_SAT
+        <= invoice_amount_sat
+        <= LIGHTNING_MAX_QUOTE_AMOUNT_SAT
+    ):
+        raise ArkadeOutgoingError("ARKADE_OUTGOING_AMOUNT_INVALID")
+    if invoice.expiry_time <= int(now.timestamp()):
+        raise ArkadeOutgoingError("ARKADE_OUTGOING_EXPIRED")
+    if quote.payment_hash != invoice_payment_hash:
+        raise ArkadeOutgoingError("ARKADE_OUTGOING_OUTPUT_INVALID")
+    if quote.amount_msat is not None and quote.amount_msat != invoice_amount_msat:
+        raise ArkadeOutgoingError("ARKADE_TRANSFER_AMOUNT_CONFLICT")
+    if quote.quote_pair != LIGHTNING_QUOTE_PAIR:
+        raise ArkadeOutgoingError("ARKADE_OUTGOING_OUTPUT_INVALID")
+    if quote.quote_to_amount_sat != invoice_amount_sat:
+        raise ArkadeOutgoingError("ARKADE_TRANSFER_AMOUNT_CONFLICT")
+    if quote.quote_from_amount_sat < quote.quote_to_amount_sat:
+        raise ArkadeOutgoingError("ARKADE_OUTGOING_INVALID_REQUEST")
+    if (
+        quote.quote_from_amount_sat - quote.quote_to_amount_sat
+    ) * 1000 > quote.max_fee_msat:
+        raise ArkadeOutgoingError("ARKADE_OUTGOING_INVALID_REQUEST")
+
+    quote_valid_until = quote.quote_valid_until
+    if quote_valid_until.tzinfo is None:
+        quote_valid_until = quote_valid_until.replace(tzinfo=timezone.utc)
+    else:
+        quote_valid_until = quote_valid_until.astimezone(timezone.utc)
+    if (conn or db).type == SQLITE:
+        quote_valid_until = quote_valid_until.replace(microsecond=0)
+    if quote_valid_until <= now:
+        raise ArkadeOutgoingError("ARKADE_OUTGOING_EXPIRED")
+    if quote.refund_locktime < int(now.timestamp()) + LIGHTNING_REFUND_HEADROOM_SECONDS:
+        raise ArkadeOutgoingError("ARKADE_OUTGOING_OUTPUT_INVALID")
+
+    if not re.fullmatch(r"[0-9a-f]{32}", idempotency_key):
+        raise ArkadeOutgoingError("ARKADE_OUTGOING_INVALID_REQUEST")
+    intent_id = hashlib.sha256(
+        f"lnbits-arkade-lightning-v1:{account_id}:{idempotency_key}".encode()
+    ).hexdigest()[:32]
+    existing = await get_arkade_outgoing_intent(intent_id, conn=conn)
+    expires_at = existing.expires_at if existing else now + timedelta(minutes=10)
+    intent = ArkadeOutgoingIntent(
+        intent_id=intent_id,
+        account_id=account_id,
+        wallet_id=wallet_id,
+        amount_msat=invoice_amount_msat,
+        max_fee_msat=quote.max_fee_msat,
+        destination=quote.bolt11,
+        destination_kind="lightning",
+        bolt11=quote.bolt11,
+        payment_hash=quote.payment_hash,
+        quote_pair=quote.quote_pair,
+        quote_from_amount_sat=quote.quote_from_amount_sat,
+        quote_to_amount_sat=quote.quote_to_amount_sat,
+        quote_valid_until=quote_valid_until,
+        refund_locktime=quote.refund_locktime,
+        solver_pubkey=quote.solver_pubkey,
+        swap_rfq_id=quote.swap_rfq_id,
+        lockup_address=quote.lockup_address,
+        expires_at=expires_at,
+    )
+    try:
+        backing_msat = await _arkade_backing_msat(account_id)
+        async with db.reuse_conn(conn) if conn else db.connect() as database:
+            async with database.transaction():
+                reserved, payment = await _reserve_arkade_outgoing_intent(
+                    account_id, intent, backing_msat, database
+                )
+                if reserved.status == "reserved":
+                    marked = await mark_arkade_outgoing_intent_quote_ready(
+                        intent_id,
+                        bolt11=quote.bolt11,
+                        payment_hash=quote.payment_hash,
+                        quote_pair=quote.quote_pair,
+                        quote_from_amount_sat=quote.quote_from_amount_sat,
+                        quote_to_amount_sat=quote.quote_to_amount_sat,
+                        quote_valid_until=quote_valid_until,
+                        refund_locktime=quote.refund_locktime,
+                        solver_pubkey=quote.solver_pubkey,
+                        swap_rfq_id=quote.swap_rfq_id,
+                        lockup_address=quote.lockup_address,
+                        conn=database,
+                    )
+                    if not marked:
+                        raise ArkadeOutgoingError(
+                            "ARKADE_OUTGOING_IDEMPOTENCY_CONFLICT"
+                        )
+                    accepted = await get_arkade_outgoing_intent(
+                        intent_id, conn=database
+                    )
+                    if not accepted:
+                        raise ArkadeOutgoingError("ARKADE_OUTGOING_CORRUPT")
+                    reserved = accepted
+                return reserved, payment
+    except IntegrityError:
+        raise ArkadeOutgoingError("ARKADE_OUTGOING_IDEMPOTENCY_CONFLICT") from None
+    except OperationalError as exc:
+        if _is_database_busy(exc):
+            raise ArkadeOutgoingError("ARKADE_OUTGOING_BUSY") from None
+        raise
+
+
 def _outgoing_intent_matches(
     current: ArkadeOutgoingIntent, requested: ArkadeOutgoingIntent
 ) -> bool:
@@ -546,6 +689,16 @@ def _outgoing_intent_matches(
             "destination",
             "destination_kind",
             "expires_at",
+            "bolt11",
+            "payment_hash",
+            "quote_pair",
+            "quote_from_amount_sat",
+            "quote_to_amount_sat",
+            "quote_valid_until",
+            "refund_locktime",
+            "solver_pubkey",
+            "swap_rfq_id",
+            "lockup_address",
         )
     )
 
@@ -563,10 +716,12 @@ def _existing_outgoing_pair(
         raise ArkadeOutgoingError("ARKADE_OUTGOING_CORRUPT")
     expected_status = {
         "reserved": PaymentState.PENDING.value,
+        "quote_ready": PaymentState.PENDING.value,
         "submitted": PaymentState.PENDING.value,
         "disputed": PaymentState.PENDING.value,
         "released": PaymentState.FAILED.value,
         "settled": PaymentState.SUCCESS.value,
+        "refunded": PaymentState.FAILED.value,
     }[existing_intent.status]
     if existing_payment.status != expected_status:
         raise ArkadeOutgoingError("ARKADE_OUTGOING_CORRUPT")

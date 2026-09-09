@@ -26,6 +26,7 @@ from lnbits.core.crud.arkade_outgoing import (
 )
 from lnbits.core.crud.payments import get_payment_by_native_id
 from lnbits.core.models.arkade import (
+    ArkadeLightningQuoteInput,
     ArkadeOutgoingChangeCommitment,
     ArkadeOutgoingEvidenceResult,
     ArkadeOutgoingIntent,
@@ -148,6 +149,7 @@ async def connection(monkeypatch):
         )
         await migrations.m055_create_arkade_outgoing_tables(connection)
         await migrations.m057_add_arkade_outgoing_outputs(connection)
+        await migrations.m058_add_arkade_lightning_quote_fields(connection)
         yield connection
     await engine.dispose()
 
@@ -221,6 +223,17 @@ async def _exact_backing(_account_id, **_kwargs):
     ]
 
 
+async def _lightning_backing(_account_id, **_kwargs):
+    return [
+        arkade.ArkadeIndexerVtxo(
+            txid="96" * 32,
+            vout=0,
+            amount_sat=10_000,
+            script="aa",
+        )
+    ]
+
+
 def _selected(txid: str = "97" * 32, amount_sat: int = 40):
     return [ArkadeOutgoingSelectedInput(txid=txid, vout=0, amount_sat=amount_sat)]
 
@@ -262,6 +275,37 @@ def _observed(
     return arkade.ArkadeIndexerVtxo(
         txid=txid, vout=0, amount_sat=amount_sat, script=script, **flags
     )
+
+
+LIGHTNING_HASH = "ab" * 32
+
+
+class _LightningInvoice:
+    def __init__(self, amount_msat=5_000_000, expiry_time=None):
+        self.amount_msat = amount_msat
+        self.payment_hash = LIGHTNING_HASH
+        self.expiry_time = (
+            expiry_time or int(datetime.now(timezone.utc).timestamp()) + 3600
+        )
+
+
+def _lightning_quote(**updates):
+    data = {
+        "bolt11": "lnbc-lightning-test",
+        "payment_hash": LIGHTNING_HASH,
+        "amount_msat": 5_000_000,
+        "max_fee_msat": 100_000,
+        "quote_pair": "arkade:BTC->lightning:BTC",
+        "quote_from_amount_sat": 5_001,
+        "quote_to_amount_sat": 5_000,
+        "quote_valid_until": datetime.now(timezone.utc) + timedelta(hours=1),
+        "refund_locktime": int(datetime.now(timezone.utc).timestamp()) + 10_800,
+        "solver_pubkey": "cd" * 32,
+        "swap_rfq_id": "rfq-lightning-test",
+        "lockup_address": "tark1lightninglockup",
+    }
+    data.update(updates)
+    return ArkadeLightningQuoteInput(**data)
 
 
 @pytest.mark.anyio
@@ -1559,3 +1603,107 @@ def test_indexer_parser_rejects_invalid_expiry(value):
 def test_indexer_parser_rejects_oversized_decimal(field):
     with pytest.raises(arkade.ArkadeReceiveError, match="INVALID_RESPONSE"):
         arkade.parse_indexer_vtxos(_wire_vtxo(**{field: "9" * 5000}))
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "invoice",
+    [
+        _LightningInvoice(amount_msat=None),
+        _LightningInvoice(expiry_time=int(datetime.now(timezone.utc).timestamp()) - 1),
+        _LightningInvoice(amount_msat=499_000),
+        _LightningInvoice(amount_msat=50_001_000),
+    ],
+    ids=["amountless", "expired", "below-card-bound", "above-card-bound"],
+)
+async def test_lightning_quote_rejects_invalid_invoice_facts(
+    connection, monkeypatch, invoice
+):
+    monkeypatch.setattr(arkade.bolt11, "decode", lambda _bolt11: invoice)
+    with pytest.raises(arkade.ArkadeOutgoingError):
+        await arkade.reserve_arkade_lightning_intent(
+            ACCOUNT_ID,
+            WALLET_ID,
+            _lightning_quote(),
+            connection,
+            idempotency_key="01" * 16,
+        )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"quote_to_amount_sat": 5_001},
+        {"max_fee_msat": 1},
+        {"quote_pair": "arkade:BTC->arkade:BTC"},
+        {"quote_valid_until": datetime.now(timezone.utc) - timedelta(seconds=1)},
+        {"refund_locktime": int(datetime.now(timezone.utc).timestamp()) + 60},
+    ],
+    ids=["amount-conflict", "fee-cap", "pair", "quote-expiry", "refund-headroom"],
+)
+async def test_lightning_quote_rejects_binding_and_fee_violations(
+    connection, monkeypatch, updates
+):
+    monkeypatch.setattr(arkade.bolt11, "decode", lambda _bolt11: _LightningInvoice())
+    with pytest.raises(arkade.ArkadeOutgoingError):
+        await arkade.reserve_arkade_lightning_intent(
+            ACCOUNT_ID,
+            WALLET_ID,
+            _lightning_quote(**updates),
+            connection,
+            idempotency_key="02" * 16,
+        )
+
+
+def test_lightning_quote_model_rejects_missing_or_invalid_bindings():
+    with pytest.raises(ValidationError):
+        _lightning_quote(solver_pubkey="invalid")
+    with pytest.raises(ValidationError):
+        _lightning_quote(lockup_address="has whitespace")
+    with pytest.raises(ValidationError):
+        ArkadeLightningQuoteInput(**{**_lightning_quote().dict(), "extra": True})
+
+
+@pytest.mark.anyio
+async def test_lightning_quote_ready_is_atomic_and_idempotent(connection, monkeypatch):
+    monkeypatch.setattr(
+        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
+    )
+    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", _lightning_backing)
+    monkeypatch.setattr(arkade.bolt11, "decode", lambda _bolt11: _LightningInvoice())
+    await _credit(connection, WALLET_ID, 10_000_000)
+    quote = _lightning_quote()
+    accepted, payment = await arkade.reserve_arkade_lightning_intent(
+        ACCOUNT_ID,
+        WALLET_ID,
+        quote,
+        connection,
+        idempotency_key="03" * 16,
+    )
+    assert accepted.status == "quote_ready"
+    assert accepted.destination == quote.bolt11
+    assert accepted.quote_from_amount_sat == quote.quote_from_amount_sat
+    assert payment.status == PaymentState.PENDING.value
+
+    replay, replay_payment = await arkade.reserve_arkade_lightning_intent(
+        ACCOUNT_ID,
+        WALLET_ID,
+        quote,
+        connection,
+        idempotency_key="03" * 16,
+    )
+    assert replay == accepted
+    assert replay_payment == payment
+
+    with pytest.raises(arkade.ArkadeOutgoingError, match="IDEMPOTENCY_CONFLICT"):
+        await arkade.reserve_arkade_lightning_intent(
+            ACCOUNT_ID,
+            WALLET_ID,
+            quote.copy(update={"swap_rfq_id": "different-rfq"}),
+            connection,
+            idempotency_key="03" * 16,
+        )
+    with pytest.raises(ValueError, match="INVALID_TRANSITION"):
+        async with connection.transaction():
+            await release_arkade_outgoing_intent(accepted.intent_id, connection)

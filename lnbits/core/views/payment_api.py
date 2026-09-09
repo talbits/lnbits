@@ -10,10 +10,12 @@ from fastapi import (
     Header,
     HTTPException,
     Query,
+    Request,
 )
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from lnurl import url_decode
+from pydantic import ValidationError
 
 from lnbits import bolt11
 from lnbits.core.crud.arkade import get_arkade_receive_request_by_destination
@@ -75,6 +77,7 @@ from ..crud import (
     get_wallet_for_key,
 )
 from ..models import ArkadeOutgoingIntent
+from ..models.arkade import ArkadeLightningQuoteInput
 from ..services import (
     cancel_hold_invoice,
     create_payment_request,
@@ -88,12 +91,104 @@ from ..services import (
 from ..services.arkade import (
     ArkadeOutgoingError,
     arkade_internal_transfer_id,
+    reserve_arkade_lightning_intent,
     reserve_arkade_outgoing_intent,
     settle_arkade_same_account_transfer,
 )
 from .arkade_api import _public_outgoing_error
 
 payment_router = APIRouter(prefix="/api/v1/payments", tags=["Payments"])
+
+
+async def _arkade_lightning_quote_input(
+    invoice_data: CreateInvoice, request: Request
+) -> ArkadeLightningQuoteInput:
+    payload = await request.json()
+    quote_data = payload.get("arkade_quote") or payload.get("quote")
+    if not isinstance(quote_data, dict):
+        quote_data = (invoice_data.extra or {}).get("arkade_quote")
+    if not isinstance(quote_data, dict):
+        quote_data = payload
+
+    profile = quote_data.get("profile")
+    if not isinstance(profile, dict):
+        profile = {}
+
+    def value(*names: str):
+        for name in names:
+            if name in quote_data:
+                return quote_data[name]
+        return None
+
+    data = {
+        "bolt11": invoice_data.bolt11,
+        "payment_hash": payload.get("payment_hash") or value("payment_hash"),
+        "amount_msat": payload.get("amount_msat")
+        or (
+            invoice_data.amount * 1000
+            if invoice_data.amount is not None and invoice_data.unit == "sat"
+            else value("amount_msat")
+        ),
+        "max_fee_msat": payload.get("max_fee_msat") or value("max_fee_msat"),
+        "quote_pair": value("quote_pair", "pair"),
+        "quote_from_amount_sat": value("quote_from_amount_sat", "from_amount"),
+        "quote_to_amount_sat": value("quote_to_amount_sat", "to_amount"),
+        "quote_valid_until": value("quote_valid_until", "valid_until"),
+        "refund_locktime": value("refund_locktime"),
+        "solver_pubkey": value("solver_pubkey") or profile.get("solver_pubkey"),
+        "swap_rfq_id": value("swap_rfq_id", "rfq_id"),
+        "lockup_address": value("lockup_address") or profile.get("lockup_address"),
+    }
+    try:
+        return ArkadeLightningQuoteInput.parse_obj(data)
+    except ValidationError:
+        raise HTTPException(
+            HTTPStatus.BAD_REQUEST, "ARKADE_OUTGOING_INVALID_REQUEST"
+        ) from None
+
+
+async def _create_arkade_lightning_payment(
+    invoice_data: CreateInvoice,
+    key_info: BaseWalletTypeInfo,
+    idempotency_key: str | None,
+    quote: ArkadeLightningQuoteInput,
+) -> JSONResponse:
+    if key_info.key_type != KeyType.admin:
+        raise HTTPException(
+            status_code=HTTPStatus.FORBIDDEN,
+            detail="Invoice (or Admin) key required.",
+        )
+    if not idempotency_key or not re.fullmatch(r"[0-9a-f]{32}", idempotency_key):
+        raise HTTPException(HTTPStatus.BAD_REQUEST, "ARKADE_IDEMPOTENCY_REQUIRED")
+    if invoice_data.amount is not None:
+        if (
+            invoice_data.unit != "sat"
+            or not invoice_data.amount.is_integer()
+            or quote.quote_to_amount_sat != int(invoice_data.amount)
+            or (
+                quote.amount_msat is not None
+                and quote.amount_msat != int(invoice_data.amount) * 1000
+            )
+        ):
+            raise HTTPException(
+                HTTPStatus.BAD_REQUEST, "ARKADE_TRANSFER_AMOUNT_CONFLICT"
+            )
+    try:
+        intent, payment = await reserve_arkade_lightning_intent(
+            key_info.wallet.user,
+            key_info.wallet.id,
+            quote,
+            idempotency_key=idempotency_key,
+        )
+    except ArkadeOutgoingError as exc:
+        raise _public_outgoing_error(exc) from exc
+    response = jsonable_encoder(payment)
+    response.update(
+        browser_required=True,
+        intent_id=intent.intent_id,
+        intent=jsonable_encoder(intent),
+    )
+    return JSONResponse(status_code=HTTPStatus.ACCEPTED, content=response)
 
 
 async def _create_arkade_outgoing_payment(  # noqa: C901
@@ -412,11 +507,22 @@ async def api_all_payments_paginated(
     },
 )
 async def api_payments_create(
+    request: Request,
     invoice_data: CreateInvoice,
     key_info: BaseWalletTypeInfo = Depends(require_base_invoice_key),
     idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
 ) -> Payment | JSONResponse:
     wallet_id = key_info.wallet.id
+    if (
+        settings.lnbits_effective_installation_mode == "arkade_noncustodial"
+        and invoice_data.out
+        and invoice_data.bolt11
+        and invoice_data.arkade_address is None
+    ):
+        quote = await _arkade_lightning_quote_input(invoice_data, request)
+        return await _create_arkade_lightning_payment(
+            invoice_data, key_info, idempotency_key, quote
+        )
     if (
         settings.lnbits_effective_installation_mode == "arkade_noncustodial"
         and invoice_data.out

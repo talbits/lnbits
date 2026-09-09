@@ -132,10 +132,36 @@ class ArkadeReconciliation(BaseModel):
 
 
 ArkadeOutgoingStatus = Literal[
-    "reserved", "submitted", "settled", "released", "disputed"
+    "reserved",
+    "quote_ready",
+    "submitted",
+    "settled",
+    "refunded",
+    "released",
+    "disputed",
 ]
 ArkadeOutgoingEvidenceStatus = Literal["verified", "pending", "contradictory"]
-ArkadeOutgoingDestinationKind = Literal["arkade_address"]
+ArkadeOutgoingDestinationKind = Literal["arkade_address", "lightning"]
+
+
+class ArkadeLightningQuoteInput(BaseModel):
+    """Unfunded browser quote and public lockup binding."""
+
+    bolt11: str = Field(min_length=1, max_length=1023)
+    payment_hash: str = Field(regex=r"^[0-9a-f]{64}$")
+    amount_msat: int | None = Field(default=None, gt=0, multiple_of=1000)
+    max_fee_msat: int = Field(gt=0)
+    quote_pair: str = Field(min_length=1, max_length=128)
+    quote_from_amount_sat: int = Field(gt=0, le=2_100_000_000_000_000)
+    quote_to_amount_sat: int = Field(gt=0, le=2_100_000_000_000_000)
+    quote_valid_until: datetime
+    refund_locktime: int = Field(gt=0)
+    solver_pubkey: str = Field(regex=r"^[0-9a-f]{64}$")
+    swap_rfq_id: str = Field(min_length=1, max_length=512)
+    lockup_address: str = Field(regex=r"^\S+$", min_length=1, max_length=1023)
+
+    class Config:
+        extra = "forbid"
 
 
 class ArkadeOutgoingIntent(BaseModel):
@@ -143,8 +169,26 @@ class ArkadeOutgoingIntent(BaseModel):
     account_id: str
     wallet_id: str
     amount_msat: int = Field(gt=0, multiple_of=1000)
-    max_fee_msat: Literal[0] = 0
+    max_fee_msat: int = Field(default=0, ge=0)
     destination: str = Field(min_length=1, max_length=1023)
+    bolt11: str | None = Field(default=None, min_length=1, max_length=1023)
+    payment_hash: str | None = Field(default=None, regex=r"^[0-9a-f]{64}$")
+    quote_pair: str | None = Field(default=None, min_length=1, max_length=128)
+    quote_from_amount_sat: int | None = Field(
+        default=None, gt=0, le=2_100_000_000_000_000
+    )
+    quote_to_amount_sat: int | None = Field(
+        default=None, gt=0, le=2_100_000_000_000_000
+    )
+    quote_valid_until: datetime | None = None
+    refund_locktime: int | None = Field(default=None, gt=0)
+    solver_pubkey: str | None = Field(default=None, regex=r"^[0-9a-f]{64}$")
+    swap_rfq_id: str | None = Field(default=None, min_length=1, max_length=512)
+    lockup_address: str | None = Field(
+        default=None, regex=r"^\S+$", min_length=1, max_length=1023
+    )
+    settlement_ark_txid: str | None = Field(default=None, regex=r"^[0-9a-f]{64}$")
+    refund_ark_txid: str | None = Field(default=None, regex=r"^[0-9a-f]{64}$")
     destination_script: str | None = None
     change_index: int | None = Field(default=None, ge=0, le=2_147_483_647)
     change_script: str | None = None
@@ -152,7 +196,7 @@ class ArkadeOutgoingIntent(BaseModel):
     destination_kind: ArkadeOutgoingDestinationKind = "arkade_address"
     status: ArkadeOutgoingStatus = "reserved"
     arkade_txid: str | None = Field(default=None, regex=r"^[0-9a-f]{64}$")
-    actual_fee_msat: Literal[0] | None = None
+    actual_fee_msat: int | None = Field(default=None, ge=0)
     expires_at: datetime
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -168,6 +212,22 @@ class ArkadeOutgoingIntent(BaseModel):
         reserved_at = values.get("reserved_at")
         if expires_at and reserved_at and expires_at <= reserved_at:
             raise ValueError("Arkade outgoing intent must expire after reservation")
+        return values
+
+    @root_validator
+    def validate_fee_kind(cls, values):
+        destination_kind = values.get("destination_kind")
+        max_fee_msat = values.get("max_fee_msat")
+        if destination_kind == "arkade_address" and max_fee_msat != 0:
+            raise ValueError("Arkade address intents must have zero fee")
+        if destination_kind == "arkade_address" and values.get(
+            "actual_fee_msat"
+        ) not in (None, 0):
+            raise ValueError("Arkade address intents must have zero actual fee")
+        if destination_kind == "lightning" and (
+            max_fee_msat is None or max_fee_msat <= 0
+        ):
+            raise ValueError("Lightning intents must have a positive fee cap")
         return values
 
 
@@ -225,7 +285,7 @@ class ArkadeOutgoingIntentResponse(BaseModel):
     account_id: str
     wallet_id: str
     amount_msat: int
-    max_fee_msat: Literal[0] = 0
+    max_fee_msat: int = Field(default=0, ge=0)
     destination: str
     destination_script: str | None = None
     destination_kind: ArkadeOutgoingDestinationKind = "arkade_address"
