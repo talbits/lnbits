@@ -21,7 +21,7 @@ assert.equal(productionBundle.includes('__ARKADE_ENROLLMENT_TEST__'), false)
 assert.equal(productionBundle.includes('__setTestReady'), false)
 const testBundlePath = '/tmp/arkade-enrollment-test.js'
 buildSync({
-  entryPoints: ['lnbits/static/js/pages/arkade-enrollment.ts'],
+  entryPoints: ['lnbits/static/js/pages/arkade-enrollment.src.js'],
   bundle: true,
   minify: true,
   legalComments: 'none',

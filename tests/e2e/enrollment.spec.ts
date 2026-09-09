@@ -98,7 +98,7 @@ test('browser enrollment signs only the public proof and unlocks after reload', 
   page.on('pageerror', error => logs.push(error.message))
   const script = await readFile(modulePath, 'utf8')
   const source = await readFile(
-    resolve(__dirname, '../../lnbits/static/js/pages/arkade-enrollment.ts'),
+    resolve(__dirname, '../../lnbits/static/js/pages/arkade-enrollment.src.js'),
     'utf8'
   )
   expect(source).not.toContain('ServiceWorkerWallet')
