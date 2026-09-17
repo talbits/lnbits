@@ -57,6 +57,9 @@ async def connection(monkeypatch):
         await migrations.m053_create_arkade_receive_tables(connection)
         await migrations.m055_create_arkade_outgoing_tables(connection)
         await migrations.m057_add_arkade_outgoing_outputs(connection)
+        await migrations.m058_add_arkade_lightning_quote_fields(connection)
+        await migrations.m059_create_arkade_lightning_terminal_events(connection)
+        await migrations.m060_add_arkade_lightning_refund_binding(connection)
         now = datetime.now(timezone.utc)
         await connection.execute(
             "INSERT INTO arkade_account_bindings "

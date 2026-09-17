@@ -68,6 +68,8 @@ def anyio_backend():
 @pytest.fixture(scope="session")
 def settings():
     # override settings for tests
+    lnbits_settings.lnbits_installation_mode = "custodial"
+    lnbits_settings.lnbits_effective_installation_mode = "custodial"
     lnbits_settings.auth_https_only = False
     lnbits_settings.lnbits_admin_extensions = []
     test_data_folder = os.environ.get("LNBITS_DATA_FOLDER", "./tests/data")
@@ -362,6 +364,8 @@ def _restore_pure_settings(settings: Settings):
         setattr(
             settings, field_name, copy.deepcopy(getattr(_PURE_SETTINGS, field_name))
         )
+    settings.lnbits_installation_mode = "custodial"
+    settings.lnbits_effective_installation_mode = "custodial"
 
 
 def _settings_cleanup(settings: Settings):

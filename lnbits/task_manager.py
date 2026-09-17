@@ -37,6 +37,7 @@ class Task:
     created_at: datetime
     task: asyncio.Task
     invoice_queue: asyncio.Queue[Payment] | None = None
+    invoice_listener: Callable[[Payment], Coroutine] | None = None
     onchain_address_queue: asyncio.Queue[OnchainAddressEvent] | None = None
     onchain_tx_queue: asyncio.Queue[OnchainTxEvent] | None = None
     block_queue: asyncio.Queue[BlockInfo] | None = None
@@ -168,11 +169,20 @@ class TaskManager:
         """
         name = f"{name or uuid.uuid4()}_invoice_listener"
         queue: asyncio.Queue[Payment] = asyncio.Queue()
-        return self.create_permanent_task(
-            self._invoice_listener_worker(func, queue),
+        lock = asyncio.Lock()
+
+        async def deliver(payment: Payment) -> None:
+            # Serialize queued and awaited deliveries to the same callback.
+            async with lock:
+                await func(payment)
+
+        task = self.create_permanent_task(
+            self._invoice_listener_worker(deliver, queue),
             name=name,
             invoice_queue=queue,
         )
+        task.invoice_listener = deliver
+        return task
 
     def register_onchain_listener(
         self,

@@ -1,8 +1,11 @@
+from __future__ import annotations
+
 import base64
 import hashlib
 import re
 from datetime import datetime, timedelta, timezone
 from secrets import token_hex
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import httpx
@@ -38,6 +41,10 @@ from lnbits.core.crud.arkade import (
     update_arkade_receive_outpoint_attribution,
     update_arkade_reconciliation,
 )
+from lnbits.core.crud.arkade_lightning_events import (
+    TerminalState,
+    create_arkade_lightning_terminal_event,
+)
 from lnbits.core.crud.arkade_outgoing import (
     authorize_arkade_outgoing_intent,
     create_arkade_outgoing_intent,
@@ -46,7 +53,10 @@ from lnbits.core.crud.arkade_outgoing import (
     get_arkade_outgoing_intent_inputs,
     get_arkade_submitted_outgoing_intents,
     mark_arkade_outgoing_intent_quote_ready,
+    record_arkade_lightning_funding_input,
+    refund_arkade_lightning_intent,
     release_arkade_outgoing_intent,
+    settle_arkade_lightning_intent,
     settle_arkade_outgoing_intent_verified,
 )
 from lnbits.core.crud.arkade_outgoing import (
@@ -56,6 +66,8 @@ from lnbits.core.crud.payments import (
     compare_and_set_payment_success,
     create_payment,
     get_payment_by_native_id,
+    refund_arkade_lightning_payment,
+    settle_arkade_lightning_payment,
     settle_arkade_outgoing_payment,
     update_payment,
 )
@@ -88,6 +100,9 @@ from lnbits.settings import settings
 from lnbits.task_manager import task_manager
 
 from .notifications import send_payment_notification_in_background
+
+if TYPE_CHECKING:
+    from .arkade_evidence import ArkadeLightningEvidenceVerdict
 
 ENROLLMENT_ACTION = "lnbits-arkade-enrollment-v1"
 IDENTITY_KIND = "mnemonic_hd"
@@ -698,6 +713,8 @@ async def submit_arkade_lightning_intent(  # noqa: C901
     """Record browser funding and CAS a Lightning intent to submitted."""
     if settings.lnbits_effective_installation_mode != "arkade_noncustodial":
         raise ArkadeOutgoingError("ARKADE_OUTGOING_UNAVAILABLE")
+    if not funding.sender_pubkey or not funding.refund_pk_script:
+        raise ArkadeOutgoingError("ARKADE_OUTGOING_REFUND_BINDING_REQUIRED")
 
     try:
         intent = await get_arkade_outgoing_intent(intent_id, conn=conn)
@@ -714,6 +731,8 @@ async def submit_arkade_lightning_intent(  # noqa: C901
                 or intent.lockup_address != funding.lockup_address
                 or intent.swap_rfq_id != funding.swap_rfq_id
                 or intent.solver_pubkey != funding.solver_pubkey
+                or intent.sender_pubkey != funding.sender_pubkey
+                or intent.refund_pk_script != funding.refund_pk_script
             ):
                 raise ArkadeOutgoingError("ARKADE_OUTGOING_IDEMPOTENCY_CONFLICT")
             return _outgoing_response(
@@ -753,13 +772,15 @@ async def submit_arkade_lightning_intent(  # noqa: C901
             )
         except ArkadeReceiveError as exc:
             raise _authorize_indexer_error(exc) from None
-        if not any(
-            vtxo.script.lower() == lockup_script
-            and vtxo.amount_sat == intent.quote_from_amount_sat
-            and vtxo.arkade_txid == funding.ark_txid
-            and (_is_spendable_vtxo(vtxo) or vtxo.settled_by is not None)
+        matching_lockups = [
+            vtxo
             for vtxo in lockup_evidence
-        ):
+            if vtxo.txid == funding.ark_txid
+            and vtxo.script.lower() == lockup_script
+            and vtxo.amount_sat == intent.quote_from_amount_sat
+            and (_is_spendable_vtxo(vtxo) or vtxo.settled_by is not None)
+        ]
+        if len(matching_lockups) != 1:
             raise ArkadeOutgoingError("ARKADE_OUTGOING_INDEXER_UNAVAILABLE")
 
         async with db.reuse_conn(conn) if conn else db.connect() as database:
@@ -778,6 +799,8 @@ async def submit_arkade_lightning_intent(  # noqa: C901
                         or intent.lockup_address != funding.lockup_address
                         or intent.swap_rfq_id != funding.swap_rfq_id
                         or intent.solver_pubkey != funding.solver_pubkey
+                        or intent.sender_pubkey != funding.sender_pubkey
+                        or intent.refund_pk_script != funding.refund_pk_script
                     ):
                         raise ArkadeOutgoingError(
                             "ARKADE_OUTGOING_IDEMPOTENCY_CONFLICT"
@@ -805,6 +828,8 @@ async def submit_arkade_lightning_intent(  # noqa: C901
                         lockup_address=funding.lockup_address,
                         swap_rfq_id=funding.swap_rfq_id,
                         solver_pubkey=funding.solver_pubkey,
+                        sender_pubkey=funding.sender_pubkey,
+                        refund_pk_script=funding.refund_pk_script,
                         conn=database,
                     )
                 except ValueError as exc:
@@ -818,6 +843,19 @@ async def submit_arkade_lightning_intent(  # noqa: C901
                     raise ArkadeOutgoingError("ARKADE_OUTGOING_CORRUPT") from None
                 if not submitted:
                     raise ArkadeOutgoingError("ARKADE_INTENT_INVALID_TRANSITION")
+                try:
+                    await record_arkade_lightning_funding_input(
+                        intent_id,
+                        ArkadeOutgoingIntentInput(
+                            intent_id=intent_id,
+                            txid=matching_lockups[0].txid,
+                            vout=matching_lockups[0].vout,
+                            amount_sat=matching_lockups[0].amount_sat,
+                        ),
+                        database,
+                    )
+                except ValueError as exc:
+                    raise ArkadeOutgoingError(str(exc)) from None
                 intent = await get_arkade_outgoing_intent(intent_id, conn=database)
                 if not intent or intent.status != "submitted":
                     raise ArkadeOutgoingError("ARKADE_OUTGOING_CORRUPT")
@@ -2182,12 +2220,14 @@ async def fetch_arkade_indexer_vtxos(  # noqa: C901
         requests = await get_arkade_receive_requests(account_id, conn=conn)
         scripts = sorted({request.script for request in requests if request.script})
         changes = await (conn or db).fetchall(
-            "SELECT change_script FROM arkade_outgoing_intents "
+            "SELECT change_script AS script FROM arkade_outgoing_intents "
             "WHERE account_id = :account_id AND status = 'settled' "
-            "AND change_script IS NOT NULL",
+            "AND change_script IS NOT NULL UNION "
+            "SELECT refund_pk_script AS script FROM arkade_outgoing_intents "
+            "WHERE account_id = :account_id AND refund_pk_script IS NOT NULL",
             {"account_id": account_id},
         )
-        scripts = sorted(set(scripts) | {row["change_script"] for row in changes})
+        scripts = sorted(set(scripts) | {row["script"] for row in changes})
     else:
         scripts = sorted(set(scripts))
     if not scripts:
@@ -2595,6 +2635,261 @@ def _same_outgoing_reconciliation_fields(
     )
 
 
+async def fetch_arkade_operator_pubkey(server_url: str) -> str:
+    """Read the current public operator signer used by the lockup address."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.get(f"{server_url}/v1/info")
+            response.raise_for_status()
+            body = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise ArkadeReceiveError("ARKADE_INDEXER_UNAVAILABLE") from exc
+    signer = body.get("signerPubkey") if isinstance(body, dict) else None
+    if not isinstance(signer, str) or not re.fullmatch(r"[0-9a-fA-F]{64,66}", signer):
+        raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
+    try:
+        raw = bytes.fromhex(signer)
+        if len(raw) == 33:
+            if raw[0] not in (2, 3):
+                raise ValueError("operator key is not compressed")
+            raw = raw[1:]
+        signer = PublicKeyXOnly(raw).format().hex()
+    except (TypeError, ValueError) as exc:
+        raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE") from exc
+    return signer
+
+
+async def reconcile_arkade_lightning_intent(  # noqa: C901
+    intent_id: str, account_id: str, *, now: int | None = None
+) -> ArkadeLightningEvidenceVerdict | None:
+    """Reconcile one submitted Lightning intent from public terminal evidence."""
+    from lnbits.core.services.arkade_evidence import (
+        ArkadeLightningEvidenceIntent,
+        ArkadeLightningEvidenceStatus,
+        verify_arkade_lightning_terminal_evidence,
+    )
+
+    if settings.lnbits_effective_installation_mode != "arkade_noncustodial":
+        raise ArkadeOutgoingError("ARKADE_OUTGOING_UNAVAILABLE")
+    intent = await get_arkade_outgoing_intent(intent_id)
+    if (
+        not intent
+        or intent.account_id != account_id
+        or intent.destination_kind != "lightning"
+        or intent.status != "submitted"
+    ):
+        return None
+    binding = await get_arkade_binding(account_id)
+    if not binding or binding.state != "ready":
+        raise ArkadeReceiveError("ARKADE_ENROLLMENT_REQUIRED")
+    if (
+        not intent.lockup_address
+        or not intent.payment_hash
+        or not intent.solver_pubkey
+        or not intent.refund_locktime
+        or not intent.sender_pubkey
+        or not intent.refund_pk_script
+    ):
+        raise ArkadeReceiveError("ARKADE_OUTGOING_REFUND_BINDING_REQUIRED")
+    funding_claims = await get_arkade_outgoing_intent_inputs(intent_id)
+    if (
+        len(funding_claims) != 1
+        or funding_claims[0].txid != intent.arkade_txid
+        or funding_claims[0].amount_sat != intent.quote_from_amount_sat
+    ):
+        raise ArkadeReceiveError("ARKADE_OUTGOING_CORRUPT")
+    server_pubkey = await fetch_arkade_operator_pubkey(binding.server_url)
+    try:
+        lockup_script = decode_arkade_address_script(
+            intent.lockup_address,
+            server_pubkey,
+            ARKADE_HRPS[binding.network],
+        )
+    except (ArkadeReceiveError, KeyError):
+        raise ArkadeReceiveError("ARKADE_OUTGOING_OUTPUT_INVALID") from None
+    evidence = await fetch_arkade_indexer_vtxos(
+        account_id,
+        spendable_only=False,
+        scripts=[lockup_script],
+    )
+    checkpoint_ids = sorted(
+        {vtxo.spent_by for vtxo in evidence if vtxo.spent_by is not None}
+    )
+    checkpoint_psbts: dict[str, str] = {}
+    for checkpoint_id in checkpoint_ids:
+        psbt = await fetch_arkade_indexer_virtual_tx(account_id, checkpoint_id)
+        if psbt is not None:
+            checkpoint_psbts[checkpoint_id] = psbt
+    terminal_ids = sorted(
+        {vtxo.arkade_txid for vtxo in evidence if vtxo.arkade_txid is not None}
+    )
+    terminal_psbts: dict[str, str] = {}
+    for terminal_id in terminal_ids:
+        psbt = await fetch_arkade_indexer_virtual_tx(account_id, terminal_id)
+        if psbt is not None:
+            terminal_psbts[terminal_id] = psbt
+    verdict = verify_arkade_lightning_terminal_evidence(
+        ArkadeLightningEvidenceIntent(
+            payment_hash=intent.payment_hash,
+            amount_msat=intent.amount_msat,
+            quote_from_amount_sat=intent.quote_from_amount_sat or 0,
+            quote_to_amount_sat=intent.quote_to_amount_sat or 0,
+            max_fee_msat=intent.max_fee_msat,
+            refund_locktime=intent.refund_locktime,
+            solver_pubkey=intent.solver_pubkey,
+            sender_pubkey=intent.sender_pubkey,
+            server_pubkey=server_pubkey,
+            lockup_script=lockup_script,
+            refund_pk_script=intent.refund_pk_script,
+            funding_outpoint=(funding_claims[0].txid, funding_claims[0].vout),
+        ),
+        evidence,
+        checkpoint_psbts,
+        terminal_psbts=terminal_psbts,
+        now=now or int(datetime.now(timezone.utc).timestamp()),
+    )
+    if verdict.status == ArkadeLightningEvidenceStatus.PENDING:
+        return verdict
+    if (
+        verdict.status
+        in {
+            ArkadeLightningEvidenceStatus.CLAIMED,
+            ArkadeLightningEvidenceStatus.REFUNDED,
+        }
+        and not verdict.ark_txid
+    ):
+        raise ArkadeReceiveError("ARKADE_OUTGOING_CORRUPT")
+
+    async with db.connect() as database:
+        async with database.transaction():
+            current = await get_arkade_outgoing_intent(intent_id, conn=database)
+            payment = await get_payment_by_native_id(intent_id, conn=database)
+            if (
+                not current
+                or current.account_id != account_id
+                or current.wallet_id != intent.wallet_id
+                or current.destination_kind != "lightning"
+                or not payment
+                or not _outgoing_payment_matches(payment, current)
+            ):
+                raise ArkadeReceiveError("ARKADE_OUTGOING_CORRUPT")
+            terminal_state: TerminalState
+            if verdict.status == ArkadeLightningEvidenceStatus.CLAIMED:
+                terminal_state = "settled"
+            elif verdict.status == ArkadeLightningEvidenceStatus.REFUNDED:
+                terminal_state = "refunded"
+            else:
+                terminal_state = "disputed"
+            if current.status == terminal_state:
+                await create_arkade_lightning_terminal_event(
+                    intent_id, terminal_state, payment, database
+                )
+                return verdict
+            if current.status != "submitted":
+                raise ArkadeReceiveError("ARKADE_LIGHTNING_TERMINAL_CONFLICT")
+            if verdict.status == ArkadeLightningEvidenceStatus.CLAIMED:
+                assert verdict.ark_txid is not None
+                if not await settle_arkade_lightning_intent(
+                    intent_id,
+                    verdict.ark_txid,
+                    account_id=account_id,
+                    wallet_id=current.wallet_id,
+                    conn=database,
+                ):
+                    raise ArkadeReceiveError("ARKADE_OUTGOING_CORRUPT")
+                if not await settle_arkade_lightning_payment(
+                    intent_id,
+                    account_id=account_id,
+                    wallet_id=current.wallet_id,
+                    amount_msat=current.amount_msat,
+                    arkade_address=current.destination,
+                    conn=database,
+                ):
+                    raise ArkadeReceiveError("ARKADE_OUTGOING_CORRUPT")
+                reconciliation = await get_arkade_reconciliation(
+                    account_id, conn=database
+                )
+                if (
+                    not reconciliation
+                    or reconciliation.state != "reconciliation_required"
+                ):
+                    await update_arkade_reconciliation(
+                        account_id, state="ok", conn=database
+                    )
+            elif verdict.status == ArkadeLightningEvidenceStatus.REFUNDED:
+                assert verdict.ark_txid is not None
+                if not await refund_arkade_lightning_intent(
+                    intent_id,
+                    verdict.ark_txid,
+                    account_id=account_id,
+                    wallet_id=current.wallet_id,
+                    conn=database,
+                ):
+                    raise ArkadeReceiveError("ARKADE_OUTGOING_CORRUPT")
+                if not await refund_arkade_lightning_payment(
+                    intent_id,
+                    account_id=account_id,
+                    wallet_id=current.wallet_id,
+                    amount_msat=current.amount_msat,
+                    arkade_address=current.destination,
+                    conn=database,
+                ):
+                    raise ArkadeReceiveError("ARKADE_OUTGOING_CORRUPT")
+                if verdict.refund_output:
+                    refund_vout, refund_amount_sat, refund_script = (
+                        verdict.refund_output
+                    )
+                    existing = await get_arkade_receive_outpoint(
+                        verdict.ark_txid, refund_vout, conn=database
+                    )
+                    if existing and (
+                        existing["account_id"] != account_id
+                        or existing["script"].lower() != refund_script
+                        or int(existing["amount_sat"]) != refund_amount_sat
+                    ):
+                        raise ArkadeReceiveError("ARKADE_OUTPOINT_CONFLICT")
+                    if not existing:
+                        await create_arkade_receive_outpoint(
+                            account_id=account_id,
+                            native_request_id=None,
+                            vtxo=ArkadeIndexerVtxo(
+                                txid=verdict.ark_txid,
+                                vout=refund_vout,
+                                amount_sat=refund_amount_sat,
+                                script=refund_script,
+                            ),
+                            status="valid",
+                            conn=database,
+                        )
+                reconciliation = await get_arkade_reconciliation(
+                    account_id, conn=database
+                )
+                if (
+                    not reconciliation
+                    or reconciliation.state != "reconciliation_required"
+                ):
+                    await update_arkade_reconciliation(
+                        account_id, state="ok", conn=database
+                    )
+            else:
+                if not await dispute_arkade_outgoing_intent(intent_id, conn=database):
+                    raise ArkadeReceiveError("ARKADE_OUTGOING_CORRUPT")
+                await update_arkade_reconciliation(
+                    account_id,
+                    state="reconciliation_required",
+                    last_error=verdict.reason
+                    or "ARKADE_LIGHTNING_EVIDENCE_CONTRADICTORY",
+                    conn=database,
+                )
+            payment = await get_payment_by_native_id(intent_id, conn=database)
+            if not payment:
+                raise ArkadeReceiveError("ARKADE_OUTGOING_CORRUPT")
+            await create_arkade_lightning_terminal_event(
+                intent_id, terminal_state, payment, database
+            )
+    return verdict
+
+
 async def reconcile_arkade_outgoing_intent(  # noqa: C901
     intent_id: str, account_id: str
 ) -> ArkadeOutgoingEvidenceResult | None:
@@ -2714,9 +3009,14 @@ def _arkade_backing_diverged(vtxo: ArkadeIndexerVtxo, claim: dict | None) -> boo
         return True
     if claim["status"] == "disputed":
         return True
-    return bool(
-        claim["status"] == "settled" and claim["arkade_txid"] != vtxo.arkade_txid
-    )
+    if claim["status"] != "settled":
+        return False
+    expected_txid = claim["arkade_txid"]
+    if claim["destination_kind"] == "lightning":
+        expected_txid = (
+            claim["settlement_ark_txid"] or claim["refund_ark_txid"] or expected_txid
+        )
+    return expected_txid != vtxo.arkade_txid
 
 
 async def reconcile_arkade_receive(  # noqa: C901
@@ -2746,7 +3046,8 @@ async def reconcile_arkade_receive(  # noqa: C901
         observed[key] = vtxo
     database = conn or db
     claims = await database.fetchall(
-        "SELECT i.txid, i.vout, i.amount_sat, o.status, o.arkade_txid "
+        "SELECT i.txid, i.vout, i.amount_sat, o.status, o.arkade_txid, "
+        "o.destination_kind, o.settlement_ark_txid, o.refund_ark_txid "
         "FROM arkade_outgoing_intent_inputs i "
         "JOIN arkade_outgoing_intents o ON o.intent_id = i.intent_id "
         "WHERE o.account_id = :account_id "

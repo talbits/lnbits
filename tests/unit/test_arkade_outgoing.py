@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 
 import httpx
 import pytest
+from coincurve import PrivateKey, PublicKeyXOnly
 from pydantic import ValidationError
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
@@ -20,11 +21,18 @@ from lnbits.core.crud.arkade_outgoing import (
     get_arkade_outgoing_intent,
     get_arkade_outgoing_intent_inputs,
     get_arkade_submitted_outgoing_intents,
+    refund_arkade_lightning_intent,
     release_arkade_outgoing_intent,
+    settle_arkade_lightning_intent,
     settle_arkade_outgoing_intent,
+    submit_arkade_lightning_intent,
     submit_arkade_outgoing_intent,
 )
-from lnbits.core.crud.payments import get_payment_by_native_id
+from lnbits.core.crud.payments import (
+    get_payment_by_native_id,
+    refund_arkade_lightning_payment,
+    settle_arkade_lightning_payment,
+)
 from lnbits.core.models.arkade import (
     ArkadeLightningFundingEvidence,
     ArkadeLightningQuoteInput,
@@ -36,6 +44,10 @@ from lnbits.core.models.arkade import (
 )
 from lnbits.core.models.payments import PaymentState
 from lnbits.core.services import arkade
+from lnbits.core.services.arkade_evidence import (
+    ArkadeLightningEvidenceStatus,
+    ArkadeLightningEvidenceVerdict,
+)
 from lnbits.db import SQLITE, Connection
 from lnbits.settings import settings
 
@@ -151,6 +163,8 @@ async def connection(monkeypatch):
         await migrations.m055_create_arkade_outgoing_tables(connection)
         await migrations.m057_add_arkade_outgoing_outputs(connection)
         await migrations.m058_add_arkade_lightning_quote_fields(connection)
+        await migrations.m059_create_arkade_lightning_terminal_events(connection)
+        await migrations.m060_add_arkade_lightning_refund_binding(connection)
         yield connection
     await engine.dispose()
 
@@ -289,6 +303,44 @@ def _observed(
 
 
 LIGHTNING_HASH = "ab" * 32
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("compressed", [True, False])
+async def test_fetch_operator_pubkey_normalizes_both_key_encodings(
+    monkeypatch, compressed
+):
+    public = PrivateKey.from_int(1).public_key
+    encoded = (
+        public.format(compressed=True).hex()
+        if compressed
+        else public.format()[1:].hex()
+    )
+
+    class Response:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"signerPubkey": encoded}
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            pass
+
+        async def get(self, _url):
+            return Response()
+
+    monkeypatch.setattr(arkade.httpx, "AsyncClient", Client)
+    assert await arkade.fetch_arkade_operator_pubkey("http://indexer") == (
+        PublicKeyXOnly(public.format()[1:]).format().hex()
+    )
 
 
 class _LightningInvoice:
@@ -1822,6 +1874,8 @@ async def test_lightning_submit_records_public_funding_and_is_idempotent(
         lockup_address=quote.lockup_address,
         swap_rfq_id=quote.swap_rfq_id,
         solver_pubkey=quote.solver_pubkey,
+        sender_pubkey=IDENTITY_XONLY,
+        refund_pk_script="5120" + IDENTITY_XONLY,
     )
 
     submitted = await arkade.submit_arkade_lightning_intent(
@@ -1838,6 +1892,12 @@ async def test_lightning_submit_records_public_funding_and_is_idempotent(
     assert submitted.solver_pubkey == quote.solver_pubkey
     assert submitted.swap_rfq_id == quote.swap_rfq_id
     assert submitted.lockup_address == quote.lockup_address
+    inputs = await get_arkade_outgoing_intent_inputs(
+        accepted.intent_id, conn=connection
+    )
+    assert [(item.txid, item.vout, item.amount_sat) for item in inputs] == [
+        (funding.ark_txid, 0, quote.quote_from_amount_sat)
+    ]
 
     replay = await arkade.submit_arkade_lightning_intent(
         ACCOUNT_ID, accepted.intent_id, funding, conn=connection
@@ -1853,6 +1913,277 @@ async def test_lightning_submit_records_public_funding_and_is_idempotent(
     with pytest.raises(arkade.ArkadeOutgoingError, match="INVALID_TRANSITION"):
         await arkade.release_arkade_outgoing_payment(
             ACCOUNT_ID, accepted.intent_id, conn=connection
+        )
+
+
+@pytest.mark.anyio
+async def test_lightning_terminal_intent_and_payment_cas_are_atomic_and_isolated(
+    connection, monkeypatch
+):
+    monkeypatch.setattr(
+        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
+    )
+    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", _lightning_backing)
+
+    def decode_invoice(bolt11):
+        invoice = _LightningInvoice()
+        if bolt11 == "lnbc-lightning-refund":
+            invoice.payment_hash = "ef" * 32
+        return invoice
+
+    monkeypatch.setattr(arkade.bolt11, "decode", decode_invoice)
+    await _credit(connection, WALLET_ID, 10_000_000)
+
+    quote = _lightning_quote()
+    intent, _payment = await arkade.reserve_arkade_lightning_intent(
+        ACCOUNT_ID,
+        WALLET_ID,
+        quote,
+        connection,
+        idempotency_key="05" * 16,
+    )
+    await _credit(connection, SECOND_WALLET_ID, 7_000_000)
+    async with connection.transaction():
+        assert await submit_arkade_lightning_intent(
+            intent.intent_id,
+            "55" * 32,
+            lockup_address=quote.lockup_address,
+            swap_rfq_id=quote.swap_rfq_id,
+            solver_pubkey=quote.solver_pubkey,
+            sender_pubkey=IDENTITY_XONLY,
+            refund_pk_script="5120" + IDENTITY_XONLY,
+            conn=connection,
+        )
+        await connection.execute(
+            "INSERT INTO arkade_outgoing_intent_inputs "
+            "(intent_id, txid, vout, amount_sat) "
+            "VALUES (:intent_id, :txid, 0, :amount_sat)",
+            {
+                "intent_id": intent.intent_id,
+                "txid": "55" * 32,
+                "amount_sat": intent.quote_from_amount_sat,
+            },
+        )
+
+    with pytest.raises(ValueError, match="BINDING_MISMATCH"):
+        async with connection.transaction():
+            await settle_arkade_lightning_intent(
+                intent.intent_id,
+                "66" * 32,
+                account_id="aa" * 16,
+                wallet_id=WALLET_ID,
+                conn=connection,
+            )
+    with pytest.raises(ValueError, match="BINDING_MISMATCH"):
+        async with connection.transaction():
+            await settle_arkade_lightning_payment(
+                intent.intent_id,
+                account_id=ACCOUNT_ID,
+                wallet_id=SECOND_WALLET_ID,
+                amount_msat=intent.amount_msat,
+                arkade_address=quote.bolt11,
+                conn=connection,
+            )
+
+    with pytest.raises(ValueError, match="BINDING_MISMATCH"):
+        async with connection.transaction():
+            assert await settle_arkade_lightning_intent(
+                intent.intent_id,
+                "66" * 32,
+                account_id=ACCOUNT_ID,
+                wallet_id=WALLET_ID,
+                conn=connection,
+            )
+            await settle_arkade_lightning_payment(
+                intent.intent_id,
+                account_id=ACCOUNT_ID,
+                wallet_id=WALLET_ID,
+                amount_msat=intent.amount_msat,
+                arkade_address="wrong-destination",
+                conn=connection,
+            )
+    rolled_back = await get_arkade_outgoing_intent(intent.intent_id, conn=connection)
+    rolled_back_payment = await get_payment_by_native_id(
+        intent.intent_id, conn=connection
+    )
+    assert rolled_back and rolled_back.status == "submitted"
+    assert rolled_back.arkade_txid == "55" * 32
+    assert rolled_back.settlement_ark_txid is None
+    assert rolled_back_payment and rolled_back_payment.status == PaymentState.PENDING
+
+    async with connection.transaction():
+        await connection.execute(
+            "UPDATE arkade_outgoing_intents SET max_fee_msat = 500 "
+            "WHERE intent_id = :intent_id",
+            {"intent_id": intent.intent_id},
+        )
+    with pytest.raises(ValueError, match="FEE_EXCEEDED"):
+        async with connection.transaction():
+            await settle_arkade_lightning_intent(
+                intent.intent_id,
+                "66" * 32,
+                account_id=ACCOUNT_ID,
+                wallet_id=WALLET_ID,
+                conn=connection,
+            )
+    async with connection.transaction():
+        await connection.execute(
+            "UPDATE arkade_outgoing_intents SET max_fee_msat = 15000 "
+            "WHERE intent_id = :intent_id",
+            {"intent_id": intent.intent_id},
+        )
+
+    async with connection.transaction():
+        assert await settle_arkade_lightning_intent(
+            intent.intent_id,
+            "66" * 32,
+            account_id=ACCOUNT_ID,
+            wallet_id=WALLET_ID,
+            conn=connection,
+        )
+        assert await settle_arkade_lightning_payment(
+            intent.intent_id,
+            account_id=ACCOUNT_ID,
+            wallet_id=WALLET_ID,
+            amount_msat=intent.amount_msat,
+            arkade_address=quote.bolt11,
+            conn=connection,
+        )
+    settled = await get_arkade_outgoing_intent(intent.intent_id, conn=connection)
+    settled_payment = await get_payment_by_native_id(intent.intent_id, conn=connection)
+    assert settled and settled.status == "settled"
+    assert settled.arkade_txid == "55" * 32
+    assert settled.settlement_ark_txid == "66" * 32
+    assert settled.refund_ark_txid is None
+    assert settled.actual_fee_msat == 1_000
+    assert settled_payment and settled_payment.status == PaymentState.SUCCESS
+    assert settled_payment.fee == -1_000
+    claim = await connection.fetchone(
+        "SELECT i.txid, i.vout, i.amount_sat, o.status, o.arkade_txid, "
+        "o.destination_kind, o.settlement_ark_txid, o.refund_ark_txid "
+        "FROM arkade_outgoing_intent_inputs i "
+        "JOIN arkade_outgoing_intents o ON o.intent_id = i.intent_id "
+        "WHERE i.intent_id = :intent_id",
+        {"intent_id": intent.intent_id},
+    )
+    assert claim and not arkade._arkade_backing_diverged(
+        arkade.ArkadeIndexerVtxo(
+            txid=claim["txid"],
+            vout=claim["vout"],
+            amount_sat=claim["amount_sat"],
+            script=CHANGE_SCRIPT,
+            is_spent=True,
+            spent_by="bb" * 32,
+            arkade_txid="66" * 32,
+        ),
+        claim,
+    )
+    balance = await connection.fetchone(
+        "SELECT balance FROM balances WHERE wallet_id = :wallet_id",
+        {"wallet_id": WALLET_ID},
+    )
+    other_balance = await connection.fetchone(
+        "SELECT balance FROM balances WHERE wallet_id = :wallet_id",
+        {"wallet_id": SECOND_WALLET_ID},
+    )
+    assert balance["balance"] == 4_999_000
+    assert other_balance["balance"] == 7_000_000
+
+    async with connection.transaction():
+        assert not await settle_arkade_lightning_intent(
+            intent.intent_id,
+            "66" * 32,
+            account_id=ACCOUNT_ID,
+            wallet_id=WALLET_ID,
+            conn=connection,
+        )
+        assert not await settle_arkade_lightning_payment(
+            intent.intent_id,
+            account_id=ACCOUNT_ID,
+            wallet_id=WALLET_ID,
+            amount_msat=intent.amount_msat,
+            arkade_address=quote.bolt11,
+            conn=connection,
+        )
+
+    await _credit(connection, WALLET_ID, 20_000)
+    refund_quote = _lightning_quote(
+        bolt11="lnbc-lightning-refund",
+        payment_hash="ef" * 32,
+        lockup_address="refund-lockup",
+        swap_rfq_id="rfq-refund",
+    )
+    refund_intent, _ = await arkade.reserve_arkade_lightning_intent(
+        ACCOUNT_ID,
+        WALLET_ID,
+        refund_quote,
+        connection,
+        idempotency_key="07" * 16,
+    )
+    async with connection.transaction():
+        assert await submit_arkade_lightning_intent(
+            refund_intent.intent_id,
+            "77" * 32,
+            lockup_address=refund_quote.lockup_address,
+            swap_rfq_id=refund_quote.swap_rfq_id,
+            solver_pubkey=refund_quote.solver_pubkey,
+            sender_pubkey=IDENTITY_XONLY,
+            refund_pk_script="5120" + IDENTITY_XONLY,
+            conn=connection,
+        )
+    async with connection.transaction():
+        assert await refund_arkade_lightning_intent(
+            refund_intent.intent_id,
+            "88" * 32,
+            account_id=ACCOUNT_ID,
+            wallet_id=WALLET_ID,
+            conn=connection,
+        )
+        assert await refund_arkade_lightning_payment(
+            refund_intent.intent_id,
+            account_id=ACCOUNT_ID,
+            wallet_id=WALLET_ID,
+            amount_msat=refund_intent.amount_msat,
+            arkade_address=refund_quote.bolt11,
+            conn=connection,
+        )
+    refunded = await get_arkade_outgoing_intent(
+        refund_intent.intent_id, conn=connection
+    )
+    refunded_payment = await get_payment_by_native_id(
+        refund_intent.intent_id, conn=connection
+    )
+    assert refunded and refunded.status == "refunded"
+    assert refunded.arkade_txid == "77" * 32
+    assert refunded.refund_ark_txid == "88" * 32
+    assert refunded.settlement_ark_txid is None
+    assert refunded.actual_fee_msat == 0
+    assert refunded_payment and refunded_payment.status == PaymentState.FAILED
+    assert refunded_payment.fee == 0
+    with pytest.raises(ValueError, match="INVALID_TRANSITION|CONFLICT"):
+        async with connection.transaction():
+            await settle_arkade_lightning_intent(
+                refund_intent.intent_id,
+                "99" * 32,
+                account_id=ACCOUNT_ID,
+                wallet_id=WALLET_ID,
+                conn=connection,
+            )
+    async with connection.transaction():
+        assert not await refund_arkade_lightning_intent(
+            refund_intent.intent_id,
+            "88" * 32,
+            account_id=ACCOUNT_ID,
+            wallet_id=WALLET_ID,
+            conn=connection,
+        )
+        assert not await refund_arkade_lightning_payment(
+            refund_intent.intent_id,
+            account_id=ACCOUNT_ID,
+            wallet_id=WALLET_ID,
+            amount_msat=refund_intent.amount_msat,
+            arkade_address=refund_quote.bolt11,
+            conn=connection,
         )
 
 
@@ -1885,6 +2216,8 @@ async def test_lightning_submit_requires_public_funding_observation(
         lockup_address=quote.lockup_address,
         swap_rfq_id=quote.swap_rfq_id,
         solver_pubkey=quote.solver_pubkey,
+        sender_pubkey=IDENTITY_XONLY,
+        refund_pk_script="5120" + IDENTITY_XONLY,
     )
     with pytest.raises(
         arkade.ArkadeOutgoingError,
@@ -1896,3 +2229,275 @@ async def test_lightning_submit_requires_public_funding_observation(
     current = await get_arkade_outgoing_intent(accepted.intent_id, conn=connection)
     assert current and current.status == "quote_ready"
     assert current.arkade_txid is None
+
+
+def _connection_db_proxy(connection):
+    class _Proxy:
+        @asynccontextmanager
+        async def connect(self):
+            yield connection
+
+        @asynccontextmanager
+        async def reuse_conn(self, conn):
+            yield conn
+
+    return _Proxy()
+
+
+async def _submitted_lightning_intent(connection, monkeypatch, idempotency_key):
+    payment_hash = idempotency_key * 2
+    funding_txid = idempotency_key * 2
+
+    async def funding_backing(_account_id, **kwargs):
+        if kwargs.get("scripts"):
+            return [
+                arkade.ArkadeIndexerVtxo(
+                    txid=funding_txid,
+                    vout=0,
+                    amount_sat=5_001,
+                    script=CHANGE_SCRIPT,
+                    arkade_txid=funding_txid,
+                )
+            ]
+        return await _lightning_backing(_account_id, **kwargs)
+
+    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", funding_backing)
+    monkeypatch.setattr(
+        arkade, "decode_arkade_address_script", lambda *args: CHANGE_SCRIPT
+    )
+
+    def decode_invoice(_bolt11):
+        invoice = _LightningInvoice()
+        invoice.payment_hash = payment_hash
+        return invoice
+
+    monkeypatch.setattr(arkade.bolt11, "decode", decode_invoice)
+    await _credit(connection, WALLET_ID, 6_000_000)
+    quote = _lightning_quote(
+        payment_hash=payment_hash,
+        lockup_address=f"lockup-{idempotency_key}",
+        swap_rfq_id=f"rfq-{idempotency_key}",
+    )
+    intent, _ = await arkade.reserve_arkade_lightning_intent(
+        ACCOUNT_ID,
+        WALLET_ID,
+        quote,
+        connection,
+        idempotency_key=idempotency_key,
+    )
+    funding = ArkadeLightningFundingEvidence(
+        ark_txid=funding_txid,
+        lockup_address=quote.lockup_address,
+        swap_rfq_id=quote.swap_rfq_id,
+        solver_pubkey=quote.solver_pubkey,
+        sender_pubkey=IDENTITY_XONLY,
+        refund_pk_script="5120" + IDENTITY_XONLY,
+    )
+    await arkade.submit_arkade_lightning_intent(
+        ACCOUNT_ID, intent.intent_id, funding, conn=connection
+    )
+    return intent
+
+
+def _patch_lightning_reconcile_io(connection, monkeypatch, verdict):
+    original_intent = arkade.get_arkade_outgoing_intent
+    original_inputs = arkade.get_arkade_outgoing_intent_inputs
+    original_payment = arkade.get_payment_by_native_id
+    original_binding = arkade.get_arkade_binding
+
+    async def get_intent(intent_id, conn=None):
+        return await original_intent(intent_id, conn=conn or connection)
+
+    async def get_payment(native_id, conn=None):
+        return await original_payment(native_id, conn=conn or connection)
+
+    async def get_inputs(intent_id, conn=None):
+        return await original_inputs(intent_id, conn=conn or connection)
+
+    async def get_binding(account_id, conn=None):
+        return await original_binding(account_id, conn=conn or connection)
+
+    monkeypatch.setattr(arkade, "db", _connection_db_proxy(connection))
+    monkeypatch.setattr(arkade, "get_arkade_outgoing_intent", get_intent)
+    monkeypatch.setattr(arkade, "get_arkade_outgoing_intent_inputs", get_inputs)
+    monkeypatch.setattr(arkade, "get_payment_by_native_id", get_payment)
+    monkeypatch.setattr(arkade, "get_arkade_binding", get_binding)
+    monkeypatch.setattr(
+        arkade, "fetch_arkade_operator_pubkey", AsyncMock(return_value="44" * 32)
+    )
+    monkeypatch.setattr(
+        arkade, "decode_arkade_address_script", lambda *args: CHANGE_SCRIPT
+    )
+    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", _lightning_backing)
+    monkeypatch.setattr(
+        arkade,
+        "fetch_arkade_indexer_virtual_tx",
+        AsyncMock(return_value=None),
+    )
+    from lnbits.core.services import arkade_evidence
+
+    monkeypatch.setattr(
+        arkade_evidence,
+        "verify_arkade_lightning_terminal_evidence",
+        lambda *args, **kwargs: verdict,
+    )
+
+
+@pytest.mark.anyio
+async def test_lightning_reconcile_claim_is_atomic_and_idempotent(
+    connection, monkeypatch
+):
+    monkeypatch.setattr(
+        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
+    )
+    intent = await _submitted_lightning_intent(connection, monkeypatch, "10" * 16)
+    _patch_lightning_reconcile_io(
+        connection,
+        monkeypatch,
+        ArkadeLightningEvidenceVerdict(
+            ArkadeLightningEvidenceStatus.CLAIMED, ark_txid="66" * 32
+        ),
+    )
+
+    verdict = await arkade.reconcile_arkade_lightning_intent(
+        intent.intent_id, ACCOUNT_ID
+    )
+    assert verdict and verdict.status == ArkadeLightningEvidenceStatus.CLAIMED
+    settled = await get_arkade_outgoing_intent(intent.intent_id, conn=connection)
+    payment = await get_payment_by_native_id(intent.intent_id, conn=connection)
+    assert settled and settled.status == "settled"
+    assert payment and payment.status == PaymentState.SUCCESS
+    claim = await connection.fetchone(
+        "SELECT i.txid, i.vout, i.amount_sat, o.status, o.arkade_txid, "
+        "o.destination_kind, o.settlement_ark_txid, o.refund_ark_txid "
+        "FROM arkade_outgoing_intent_inputs i "
+        "JOIN arkade_outgoing_intents o ON o.intent_id = i.intent_id "
+        "WHERE i.intent_id = :intent_id",
+        {"intent_id": intent.intent_id},
+    )
+    assert claim and not arkade._arkade_backing_diverged(
+        arkade.ArkadeIndexerVtxo(
+            txid=claim["txid"],
+            vout=claim["vout"],
+            amount_sat=claim["amount_sat"],
+            script=CHANGE_SCRIPT,
+            is_spent=True,
+            spent_by="bb" * 32,
+            arkade_txid="66" * 32,
+        ),
+        claim,
+    )
+    reconciliation = await connection.fetchone(
+        "SELECT state FROM arkade_reconciliation_state WHERE account_id = :account_id",
+        {"account_id": ACCOUNT_ID},
+    )
+    assert reconciliation and reconciliation["state"] == "ok"
+    assert (
+        await connection.fetchone(
+            "SELECT COUNT(*) AS count FROM arkade_lightning_terminal_events"
+        )
+    )["count"] == 1
+
+    assert (
+        await arkade.reconcile_arkade_lightning_intent(intent.intent_id, ACCOUNT_ID)
+        is None
+    )
+    assert (
+        await connection.fetchone(
+            "SELECT COUNT(*) AS count FROM arkade_lightning_terminal_events"
+        )
+    )["count"] == 1
+
+
+@pytest.mark.anyio
+async def test_lightning_reconcile_refund_and_contradiction(connection, monkeypatch):
+    monkeypatch.setattr(
+        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
+    )
+    intent = await _submitted_lightning_intent(connection, monkeypatch, "11" * 16)
+    _patch_lightning_reconcile_io(
+        connection,
+        monkeypatch,
+        ArkadeLightningEvidenceVerdict(
+            ArkadeLightningEvidenceStatus.REFUNDED, ark_txid="77" * 32
+        ),
+    )
+    await arkade.reconcile_arkade_lightning_intent(intent.intent_id, ACCOUNT_ID)
+    refunded = await get_arkade_outgoing_intent(intent.intent_id, conn=connection)
+    payment = await get_payment_by_native_id(intent.intent_id, conn=connection)
+    assert refunded and refunded.status == "refunded"
+    assert payment and payment.status == PaymentState.FAILED and payment.fee == 0
+
+    intent = await _submitted_lightning_intent(connection, monkeypatch, "12" * 16)
+    _patch_lightning_reconcile_io(
+        connection,
+        monkeypatch,
+        ArkadeLightningEvidenceVerdict(
+            ArkadeLightningEvidenceStatus.CONTRADICTORY,
+            reason="conflicting public spend",
+        ),
+    )
+    await arkade.reconcile_arkade_lightning_intent(intent.intent_id, ACCOUNT_ID)
+    disputed = await get_arkade_outgoing_intent(intent.intent_id, conn=connection)
+    payment = await get_payment_by_native_id(intent.intent_id, conn=connection)
+    state = await connection.fetchone(
+        "SELECT state FROM arkade_reconciliation_state WHERE account_id = :account_id",
+        {"account_id": ACCOUNT_ID},
+    )
+    assert disputed and disputed.status == "disputed"
+    assert payment and payment.status == PaymentState.PENDING
+    assert state and state["state"] == "reconciliation_required"
+
+
+@pytest.mark.anyio
+async def test_lightning_reconcile_retries_public_failure_without_double_apply(
+    connection, monkeypatch
+):
+    monkeypatch.setattr(
+        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
+    )
+    intent = await _submitted_lightning_intent(connection, monkeypatch, "13" * 16)
+    verdict = ArkadeLightningEvidenceVerdict(
+        ArkadeLightningEvidenceStatus.CLAIMED, ark_txid="99" * 32
+    )
+    _patch_lightning_reconcile_io(connection, monkeypatch, verdict)
+    failure = AsyncMock(side_effect=arkade.ArkadeReceiveError("temporary"))
+    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", failure)
+    with pytest.raises(arkade.ArkadeReceiveError):
+        await arkade.reconcile_arkade_lightning_intent(intent.intent_id, ACCOUNT_ID)
+    pending = await get_arkade_outgoing_intent(intent.intent_id, conn=connection)
+    assert pending and pending.status == "submitted"
+    assert (
+        await connection.fetchone(
+            "SELECT COUNT(*) AS count FROM arkade_lightning_terminal_events"
+        )
+    )["count"] == 0
+
+    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", _lightning_backing)
+    await arkade.reconcile_arkade_lightning_intent(intent.intent_id, ACCOUNT_ID)
+    assert (
+        await connection.fetchone(
+            "SELECT COUNT(*) AS count FROM arkade_lightning_terminal_events"
+        )
+    )["count"] == 1
+
+
+@pytest.mark.anyio
+async def test_lightning_reconcile_rejects_cross_account_without_transition(
+    connection, monkeypatch
+):
+    monkeypatch.setattr(
+        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
+    )
+    intent = await _submitted_lightning_intent(connection, monkeypatch, "14" * 16)
+    _patch_lightning_reconcile_io(
+        connection,
+        monkeypatch,
+        ArkadeLightningEvidenceVerdict(ArkadeLightningEvidenceStatus.PENDING),
+    )
+    assert (
+        await arkade.reconcile_arkade_lightning_intent(intent.intent_id, "aa" * 16)
+        is None
+    )
+    current = await get_arkade_outgoing_intent(intent.intent_id, conn=connection)
+    assert current and current.status == "submitted"

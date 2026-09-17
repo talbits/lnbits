@@ -61,6 +61,7 @@ from .arkade import (
     ArkadeReceiveError,
     create_arkade_receive_request_for_account,
     fetch_arkade_indexer_vtxos,
+    reconcile_arkade_lightning_intent,
     reconcile_arkade_outgoing_intent,
     reconcile_arkade_receive,
     require_arkade_payments_unavailable,
@@ -575,6 +576,11 @@ async def check_pending_payments():  # noqa: C901
             submitted_intents = await get_arkade_submitted_outgoing_intents()
         for intent in submitted_intents:
             try:
+                if getattr(intent, "destination_kind", None) == "lightning":
+                    await reconcile_arkade_lightning_intent(
+                        intent.intent_id, intent.account_id
+                    )
+                    continue
                 result = await reconcile_arkade_outgoing_intent(
                     intent.intent_id, intent.account_id
                 )

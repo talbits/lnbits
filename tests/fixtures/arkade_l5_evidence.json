@@ -1,0 +1,27 @@
+{
+  "claim": {
+    "paymentHash": "8d6074f09691c1f4f282fc3a680eff1a6f1c6952214e7f5a95099a900ee2b75a",
+    "lockupScriptHex": "51205a40bd2cd6cbdd1b75da6e8717c816f3fb84f60e07eacf8523f9df201aa0bf55",
+    "indexer": {
+      "vtxo": {
+        "outpoint": "36391b090143abe259a8e5fe8eb361f0c209c977701a898ced9c1cc2e662a021:vout0",
+        "valueSats": 1000,
+        "spentByCheckpointTxid": "68f6479c852be3ea4568164e84cc1fe6fcb27ddadc22f0ab35b9d6f5b4e13afc",
+        "arkTxid": "12ad9d736b67bc89dcbfe718fac19758937e8c407125339a8ac4f268c0f15638"
+      }
+    }
+  },
+  "refund": {
+    "paymentHash": "2c5608c9291f7b7c8573042c9886b454a20d7a6ad31f5a6d8a422fd7d28ea660",
+    "lockupScriptHex": "5120eb2b31fd1e864aecbaaba16756f3f6477315aee75eceef73735bc0f48bc0e6dc",
+    "readLockupFate": {"fate": "open"},
+    "indexer": {
+      "vtxo": {
+        "outpoint": "93cd5becbcc7b55b6ac74c721d772a30e2e73d0513399ee3ee1ebac92dc8f98b:vout0",
+        "valueSats": 1000,
+        "spentByCheckpointTxid": null,
+        "arkTxid": null
+      }
+    }
+  }
+}

@@ -413,6 +413,182 @@ async def settle_arkade_outgoing_payment(
     return bool(result.rowcount)
 
 
+def _require_payment_transaction(conn: Connection | None) -> Connection:
+    if conn is None or conn._autocommit:
+        raise RuntimeError("ARKADE_MUTATION_REQUIRES_TRANSACTION")
+    return conn
+
+
+async def _get_lightning_terminal_binding(
+    native_id: str,
+    *,
+    account_id: str,
+    wallet_id: str,
+    status: str,
+    conn: Connection,
+) -> dict:
+    database = _require_payment_transaction(conn)
+    binding: dict | None = await database.fetchone(
+        "SELECT i.account_id, i.wallet_id, i.amount_msat, i.destination, "
+        "i.destination_kind, i.status, i.settlement_ark_txid, "
+        'i.refund_ark_txid, i.actual_fee_msat, w."user" AS wallet_account_id '
+        "FROM arkade_outgoing_intents i JOIN wallets w ON w.id = i.wallet_id "
+        "WHERE i.intent_id = :native_id",
+        {"native_id": native_id},
+    )
+    if (
+        not binding
+        or binding["account_id"] != account_id
+        or binding["wallet_id"] != wallet_id
+        or binding["wallet_account_id"] != account_id
+        or binding["destination_kind"] != "lightning"
+        or binding["status"] != status
+    ):
+        raise ValueError("ARKADE_LIGHTNING_PAYMENT_BINDING_MISMATCH")
+    if status == "settled":
+        if (
+            not binding["settlement_ark_txid"]
+            or binding["refund_ark_txid"] is not None
+            or binding["actual_fee_msat"] is None
+        ):
+            raise ValueError("ARKADE_LIGHTNING_PAYMENT_CONFLICT")
+    elif (
+        not binding["refund_ark_txid"]
+        or binding["settlement_ark_txid"] is not None
+        or binding["actual_fee_msat"] != 0
+    ):
+        raise ValueError("ARKADE_LIGHTNING_PAYMENT_CONFLICT")
+    return binding
+
+
+async def settle_arkade_lightning_payment(
+    native_id: str,
+    *,
+    account_id: str,
+    wallet_id: str,
+    amount_msat: int,
+    arkade_address: str,
+    conn: Connection,
+) -> bool:
+    """CAS the linked Lightning payment to success in the caller's transaction."""
+    database = _require_payment_transaction(conn)
+    if amount_msat <= 0:
+        raise ValueError("ARKADE_LIGHTNING_PAYMENT_INVALID")
+    binding = await _get_lightning_terminal_binding(
+        native_id,
+        account_id=account_id,
+        wallet_id=wallet_id,
+        status="settled",
+        conn=database,
+    )
+    expected_fee_msat = int(binding["actual_fee_msat"])
+    if (
+        binding["amount_msat"] != amount_msat
+        or binding["destination"] != arkade_address
+    ):
+        raise ValueError("ARKADE_LIGHTNING_PAYMENT_BINDING_MISMATCH")
+    payment = await get_payment_by_native_id(native_id, conn=database)
+    if not payment:
+        raise ValueError("ARKADE_PAYMENT_NOT_FOUND")
+    if (
+        payment.protocol != "arkade"
+        or payment.native_id != native_id
+        or payment.wallet_id != wallet_id
+        or payment.amount != -amount_msat
+        or payment.arkade_address != arkade_address
+    ):
+        raise ValueError("ARKADE_LIGHTNING_PAYMENT_BINDING_MISMATCH")
+    if payment.status == "success":
+        if payment.fee == -expected_fee_msat:
+            return False
+        raise ValueError("ARKADE_LIGHTNING_PAYMENT_CONFLICT")
+    if payment.status != "pending" or payment.fee != 0:
+        raise ValueError("ARKADE_LIGHTNING_PAYMENT_INVALID_TRANSITION")
+    result = await database.execute(
+        f"""
+        UPDATE apipayments
+        SET status = 'success', fee = :fee,
+            updated_at = {database.timestamp_placeholder('updated_at')}
+        WHERE protocol = 'arkade' AND native_id = :native_id
+          AND wallet_id = :wallet_id AND amount = :amount
+          AND arkade_address = :arkade_address AND fee = 0
+          AND status = 'pending'
+        """,  # noqa: S608
+        {
+            "native_id": native_id,
+            "wallet_id": wallet_id,
+            "amount": -amount_msat,
+            "arkade_address": arkade_address,
+            "fee": -expected_fee_msat,
+            "updated_at": datetime.now(timezone.utc),
+        },
+    )
+    return bool(result.rowcount)
+
+
+async def refund_arkade_lightning_payment(
+    native_id: str,
+    *,
+    account_id: str,
+    wallet_id: str,
+    amount_msat: int,
+    arkade_address: str,
+    conn: Connection,
+) -> bool:
+    """CAS the linked Lightning payment to failed in the caller's transaction."""
+    database = _require_payment_transaction(conn)
+    if amount_msat <= 0:
+        raise ValueError("ARKADE_LIGHTNING_PAYMENT_INVALID")
+    binding = await _get_lightning_terminal_binding(
+        native_id,
+        account_id=account_id,
+        wallet_id=wallet_id,
+        status="refunded",
+        conn=database,
+    )
+    if (
+        binding["amount_msat"] != amount_msat
+        or binding["destination"] != arkade_address
+    ):
+        raise ValueError("ARKADE_LIGHTNING_PAYMENT_BINDING_MISMATCH")
+    payment = await get_payment_by_native_id(native_id, conn=database)
+    if not payment:
+        raise ValueError("ARKADE_PAYMENT_NOT_FOUND")
+    if (
+        payment.protocol != "arkade"
+        or payment.native_id != native_id
+        or payment.wallet_id != wallet_id
+        or payment.amount != -amount_msat
+        or payment.arkade_address != arkade_address
+    ):
+        raise ValueError("ARKADE_LIGHTNING_PAYMENT_BINDING_MISMATCH")
+    if payment.status == "failed":
+        if payment.fee == 0:
+            return False
+        raise ValueError("ARKADE_LIGHTNING_PAYMENT_CONFLICT")
+    if payment.status != "pending" or payment.fee != 0:
+        raise ValueError("ARKADE_LIGHTNING_PAYMENT_INVALID_TRANSITION")
+    result = await database.execute(
+        f"""
+        UPDATE apipayments
+        SET status = 'failed', fee = 0,
+            updated_at = {database.timestamp_placeholder('updated_at')}
+        WHERE protocol = 'arkade' AND native_id = :native_id
+          AND wallet_id = :wallet_id AND amount = :amount
+          AND arkade_address = :arkade_address AND fee = 0
+          AND status = 'pending'
+        """,  # noqa: S608
+        {
+            "native_id": native_id,
+            "wallet_id": wallet_id,
+            "amount": -amount_msat,
+            "arkade_address": arkade_address,
+            "updated_at": datetime.now(timezone.utc),
+        },
+    )
+    return bool(result.rowcount)
+
+
 async def compare_and_set_arkade_payment_failed(
     payment: Payment, conn: Connection | None = None
 ) -> bool:

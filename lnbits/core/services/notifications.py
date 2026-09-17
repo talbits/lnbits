@@ -249,7 +249,7 @@ async def dispatch_payment_notification(payment: Payment) -> None:
         await send_payment_notification(wallet, payment)
 
 
-async def dispatch_webhook(payment: Payment):
+async def dispatch_webhook(payment: Payment, *, strict: bool = False):
     """
     Dispatches the webhook to the webhook url.
     """
@@ -257,10 +257,22 @@ async def dispatch_webhook(payment: Payment):
     payment_identity = payment.payment_hash or payment.native_id
     if not payment_identity:
         logger.warning("Cannot notify payment without a stable identity.")
+        if strict:
+            raise ValueError("Payment has no stable identity.")
         return
 
     if not payment.webhook:
+        if strict:
+            return
         return await mark_webhook_sent(payment_identity, "-1")
+
+    if strict:
+        check_callback_url(payment.webhook)
+        status_code = await _post_webhook(payment)
+        if not 200 <= status_code < 300:
+            raise RuntimeError(f"Webhook returned status {status_code}.")
+        await mark_webhook_sent(payment_identity, str(status_code))
+        return
 
     try:
         check_callback_url(payment.webhook)
@@ -280,7 +292,29 @@ async def dispatch_webhook(payment: Payment):
         logger.warning("Could not send webhook.")
 
 
-async def send_payment_notification(wallet: Wallet, payment: Payment):
+async def send_payment_notification(  # noqa: C901
+    wallet: Wallet,
+    payment: Payment,
+    *,
+    strict: bool = False,
+    include_webhook: bool = True,
+    include_payment_alerts: bool = True,
+):
+    if strict:
+        await send_ws_payment_notification(wallet, payment)
+        for shared in wallet.extra.shared_with:
+            if not shared.shared_with_wallet_id:
+                continue
+            shared_wallet = await get_wallet(shared.shared_with_wallet_id)
+            if shared_wallet and shared_wallet.can_view_payments:
+                await send_ws_payment_notification(shared_wallet, payment)
+        if include_payment_alerts:
+            await send_chat_payment_notification(wallet, payment)
+            await send_payment_push_notification(wallet, payment)
+        if include_webhook:
+            await dispatch_webhook(payment, strict=True)
+        return
+
     try:
         await send_ws_payment_notification(wallet, payment)
         for shared in wallet.extra.shared_with:
@@ -301,17 +335,33 @@ async def send_payment_notification(wallet: Wallet, payment: Payment):
         logger.error(f"Error sending push payment notification {e!s}")
 
     try:
-        if payment.webhook and not payment.webhook_status:
+        if include_webhook and payment.webhook and not payment.webhook_status:
             await dispatch_webhook(payment)
     except Exception as e:
         logger.error(f"Error dispatching webhook: {e!s}")
 
 
-def send_payment_notification_in_background(wallet: Wallet, payment: Payment):
+def send_payment_notification_in_background(
+    wallet: Wallet,
+    payment: Payment,
+    *,
+    strict: bool = False,
+    include_webhook: bool = True,
+    include_payment_alerts: bool = True,
+):
     try:
-        create_task(send_payment_notification(wallet, payment))
+        return create_task(
+            send_payment_notification(
+                wallet,
+                payment,
+                strict=strict,
+                include_webhook=include_webhook,
+                include_payment_alerts=include_payment_alerts,
+            )
+        )
     except Exception as e:
         logger.warning(f"Error sending payment notification: {e}")
+        return None
 
 
 async def send_notification_in_background(

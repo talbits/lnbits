@@ -107,6 +107,9 @@ async def connection(monkeypatch):
         await migrations.m054_add_payment_protocol_identity(connection)
         await migrations.m055_create_arkade_outgoing_tables(connection)
         await migrations.m057_add_arkade_outgoing_outputs(connection)
+        await migrations.m058_add_arkade_lightning_quote_fields(connection)
+        await migrations.m059_create_arkade_lightning_terminal_events(connection)
+        await migrations.m060_add_arkade_lightning_refund_binding(connection)
         yield connection
     await engine.dispose()
 
@@ -760,7 +763,7 @@ async def test_cross_account_reservation_keeps_receiver_pending_and_replays(
             ArkadeIndexerVtxo(
                 txid="cc" * 32,
                 vout=0,
-                amount_sat=100,
+                amount_sat=150,
                 script=script,
             )
         ]

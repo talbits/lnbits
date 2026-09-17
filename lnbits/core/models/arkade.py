@@ -144,6 +144,19 @@ ArkadeOutgoingEvidenceStatus = Literal["verified", "pending", "contradictory"]
 ArkadeOutgoingDestinationKind = Literal["arkade_address", "lightning"]
 
 
+class ArkadeLightningTerminalEvent(BaseModel):
+    event_id: str = Field(regex=r"^[0-9a-f]{32}$")
+    terminal_state: Literal["settled", "refunded", "disputed"]
+    payment_payload: str
+    attempts: int = Field(ge=0)
+    next_attempt_at: datetime
+    lease_token: str | None = None
+    lease_until: datetime | None = None
+    listeners_delivered_at: datetime | None = None
+    webhook_delivered_at: datetime | None = None
+    created_at: datetime
+
+
 class ArkadeLightningQuoteInput(BaseModel):
     """Unfunded browser quote and public lockup binding."""
 
@@ -171,6 +184,10 @@ class ArkadeLightningFundingEvidence(BaseModel):
     lockup_address: str = Field(regex=r"^\S+$", min_length=1, max_length=1023)
     swap_rfq_id: str = Field(min_length=1, max_length=512)
     solver_pubkey: str = Field(regex=r"^[0-9a-f]{64}$")
+    sender_pubkey: str | None = Field(default=None, regex=r"^[0-9a-f]{64}$")
+    refund_pk_script: str | None = Field(
+        default=None, regex=r"^[0-9a-fA-F]+$", min_length=2, max_length=4096
+    )
 
     class Config:
         extra = "forbid"
@@ -198,6 +215,10 @@ class ArkadeOutgoingIntent(BaseModel):
     swap_rfq_id: str | None = Field(default=None, min_length=1, max_length=512)
     lockup_address: str | None = Field(
         default=None, regex=r"^\S+$", min_length=1, max_length=1023
+    )
+    sender_pubkey: str | None = Field(default=None, regex=r"^[0-9a-f]{64}$")
+    refund_pk_script: str | None = Field(
+        default=None, regex=r"^[0-9a-fA-F]+$", min_length=2, max_length=4096
     )
     settlement_ark_txid: str | None = Field(default=None, regex=r"^[0-9a-f]{64}$")
     refund_ark_txid: str | None = Field(default=None, regex=r"^[0-9a-f]{64}$")

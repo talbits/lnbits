@@ -1413,3 +1413,38 @@ async def m058_add_arkade_lightning_quote_fields(db: Connection):
         "WHERE change_script IS NOT NULL",
     ):
         await db.execute(index)
+
+
+async def m059_create_arkade_lightning_terminal_events(db: Connection):
+    """Persist Lightning terminal notifications for restart-safe delivery."""
+    await db.execute(f"""
+        CREATE TABLE IF NOT EXISTS arkade_lightning_terminal_events (
+            event_id TEXT PRIMARY KEY
+                REFERENCES arkade_outgoing_intents (intent_id),
+            terminal_state TEXT NOT NULL CHECK (
+                terminal_state IN ('settled', 'refunded', 'disputed')
+            ),
+            payment_payload TEXT NOT NULL,
+            attempts {db.big_int} NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+            next_attempt_at TIMESTAMP NOT NULL DEFAULT {db.timestamp_now},
+            lease_token TEXT,
+            lease_until TIMESTAMP,
+            listeners_delivered_at TIMESTAMP,
+            webhook_delivered_at TIMESTAMP,
+            created_at TIMESTAMP NOT NULL DEFAULT {db.timestamp_now}
+        )
+    """)
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_arkade_lightning_terminal_events_due "
+        "ON arkade_lightning_terminal_events (next_attempt_at)"
+    )
+
+
+async def m060_add_arkade_lightning_refund_binding(db: Connection):
+    """Persist the public browser refund binding used by terminal evidence."""
+    await db.execute(
+        "ALTER TABLE arkade_outgoing_intents ADD COLUMN sender_pubkey TEXT"
+    )
+    await db.execute(
+        "ALTER TABLE arkade_outgoing_intents ADD COLUMN refund_pk_script TEXT"
+    )

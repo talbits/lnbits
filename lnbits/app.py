@@ -43,6 +43,7 @@ from lnbits.core.services.payments import (
 from lnbits.core.tasks import (
     audit_queue,
     collect_exchange_rates_data,
+    dispatch_arkade_lightning_terminal_events,
     notify_server_status,
     process_next_audit_entry,
     refresh_extension_cache,
@@ -580,6 +581,10 @@ def register_async_tasks() -> None:
     task_manager.create_permanent_task(delete_expired_audit_entries, interval=60 * 60)
     task_manager.create_permanent_task(
         check_pending_payments,
+        interval=settings.lnbits_funding_source_pending_interval_seconds,
+    )
+    task_manager.create_permanent_task(
+        dispatch_arkade_lightning_terminal_events,
         interval=settings.lnbits_funding_source_pending_interval_seconds,
     )
     task_manager.create_permanent_task(

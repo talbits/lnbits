@@ -450,11 +450,17 @@ async def submit_arkade_lightning_intent(
     lockup_address: str,
     swap_rfq_id: str,
     solver_pubkey: str,
+    sender_pubkey: str,
+    refund_pk_script: str,
     conn: Connection,
 ) -> bool:
     """CAS a funded Lightning lockup from quote-ready to submitted."""
     if not re.fullmatch(r"[0-9a-f]{64}", arkade_txid):
         raise ValueError("ARKADE_TRANSACTION_ID_INVALID")
+    if not re.fullmatch(r"[0-9a-f]{64}", sender_pubkey) or not re.fullmatch(
+        r"[0-9a-fA-F]+", refund_pk_script
+    ):
+        raise ValueError("ARKADE_OUTGOING_REFUND_BINDING_INVALID")
     database = _require_active_transaction(conn)
     intent = await get_arkade_outgoing_intent(intent_id, conn=database)
     if not intent:
@@ -467,6 +473,22 @@ async def submit_arkade_lightning_intent(
         or intent.solver_pubkey != solver_pubkey
     ):
         raise ValueError("ARKADE_OUTGOING_OUTPUT_CONFLICT")
+    if intent.sender_pubkey and intent.sender_pubkey != sender_pubkey:
+        raise ValueError("ARKADE_OUTGOING_REFUND_BINDING_CONFLICT")
+    if intent.refund_pk_script and intent.refund_pk_script != refund_pk_script:
+        raise ValueError("ARKADE_OUTGOING_REFUND_BINDING_CONFLICT")
+    await database.execute(
+        """
+        UPDATE arkade_outgoing_intents
+        SET sender_pubkey = :sender_pubkey, refund_pk_script = :refund_pk_script
+        WHERE intent_id = :intent_id AND status = 'quote_ready'
+        """,
+        {
+            "intent_id": intent_id,
+            "sender_pubkey": sender_pubkey,
+            "refund_pk_script": refund_pk_script,
+        },
+    )
     return await _transition_arkade_outgoing_intent(
         intent_id,
         "quote_ready",
@@ -474,6 +496,43 @@ async def submit_arkade_lightning_intent(
         arkade_txid=arkade_txid,
         conn=database,
     )
+
+
+async def record_arkade_lightning_funding_input(
+    intent_id: str, funding_input: ArkadeOutgoingIntentInput, conn: Connection
+) -> None:
+    """Persist the exact lockup outpoint funded by a Lightning intent."""
+    database = _require_active_transaction(conn)
+    intent = await get_arkade_outgoing_intent(intent_id, conn=database)
+    if (
+        not intent
+        or intent.intent_id != funding_input.intent_id
+        or intent.destination_kind != "lightning"
+        or intent.status not in {"quote_ready", "submitted"}
+        or intent.arkade_txid != funding_input.txid
+    ):
+        raise ValueError("ARKADE_LIGHTNING_FUNDING_OUTPOINT_INVALID")
+    await database.execute(
+        f"""
+        INSERT INTO arkade_outgoing_intent_inputs
+            (intent_id, txid, vout, amount_sat, claimed_at)
+        VALUES (:intent_id, :txid, :vout, :amount_sat,
+            {database.timestamp_placeholder('claimed_at')})
+        ON CONFLICT DO NOTHING
+        """,  # noqa: S608
+        funding_input.dict(),
+    )
+    recorded: dict | None = await database.fetchone(
+        "SELECT intent_id, amount_sat FROM arkade_outgoing_intent_inputs "
+        "WHERE txid = :txid AND vout = :vout",
+        {"txid": funding_input.txid, "vout": funding_input.vout},
+    )
+    if (
+        not recorded
+        or recorded["intent_id"] != intent_id
+        or int(recorded["amount_sat"]) != funding_input.amount_sat
+    ):
+        raise ValueError("ARKADE_LIGHTNING_FUNDING_OUTPOINT_CONFLICT")
 
 
 async def release_arkade_outgoing_intent(intent_id: str, conn: Connection) -> bool:
@@ -499,6 +558,141 @@ async def settle_arkade_outgoing_intent(
         actual_fee_msat=actual_fee_msat,
         conn=conn,
     )
+
+
+async def _get_lightning_terminal_intent(
+    intent_id: str, account_id: str, wallet_id: str, conn: Connection
+) -> ArkadeOutgoingIntent:
+    database = _require_active_transaction(conn)
+    intent = await get_arkade_outgoing_intent(intent_id, conn=database)
+    if not intent:
+        raise ValueError("ARKADE_INTENT_NOT_FOUND")
+    if (
+        intent.destination_kind != "lightning"
+        or intent.account_id != account_id
+        or intent.wallet_id != wallet_id
+    ):
+        raise ValueError("ARKADE_OUTGOING_BINDING_MISMATCH")
+    await _check_wallet_account(database, intent)
+    if not intent.arkade_txid:
+        raise ValueError("ARKADE_LIGHTNING_FUNDING_REQUIRED")
+    if intent.settlement_ark_txid and intent.refund_ark_txid:
+        raise ValueError("ARKADE_LIGHTNING_TERMINAL_CONFLICT")
+    return intent
+
+
+def _lightning_quote_fee_msat(intent: ArkadeOutgoingIntent) -> int:
+    if (
+        intent.quote_from_amount_sat is None
+        or intent.quote_to_amount_sat is None
+        or intent.quote_from_amount_sat < intent.quote_to_amount_sat
+        or intent.quote_to_amount_sat * 1000 != intent.amount_msat
+    ):
+        raise ValueError("ARKADE_LIGHTNING_QUOTE_INVALID")
+    fee_msat = (intent.quote_from_amount_sat - intent.quote_to_amount_sat) * 1000
+    if fee_msat > intent.max_fee_msat:
+        raise ValueError("ARKADE_LIGHTNING_FEE_EXCEEDED")
+    return fee_msat
+
+
+async def settle_arkade_lightning_intent(
+    intent_id: str,
+    settlement_ark_txid: str,
+    *,
+    account_id: str,
+    wallet_id: str,
+    conn: Connection,
+) -> bool:
+    """CAS a submitted Lightning intent to settled inside its caller's transaction."""
+    if not re.fullmatch(r"[0-9a-f]{64}", settlement_ark_txid):
+        raise ValueError("ARKADE_TRANSACTION_ID_INVALID")
+    database = _require_active_transaction(conn)
+    intent = await _get_lightning_terminal_intent(
+        intent_id, account_id, wallet_id, database
+    )
+    fee_msat = _lightning_quote_fee_msat(intent)
+    if intent.status == "settled":
+        if (
+            intent.settlement_ark_txid == settlement_ark_txid
+            and intent.actual_fee_msat == fee_msat
+            and intent.refund_ark_txid is None
+        ):
+            return False
+        raise ValueError("ARKADE_LIGHTNING_TERMINAL_CONFLICT")
+    if intent.status != "submitted" or intent.refund_ark_txid:
+        raise ValueError("ARKADE_INTENT_INVALID_TRANSITION")
+    now = datetime.now(timezone.utc)
+    result = await database.execute(
+        f"""
+        UPDATE arkade_outgoing_intents
+        SET status = 'settled', settlement_ark_txid = :settlement_ark_txid,
+            actual_fee_msat = :actual_fee_msat,
+            settled_at = {database.timestamp_placeholder('settled_at')},
+            updated_at = {database.timestamp_placeholder('updated_at')}
+        WHERE intent_id = :intent_id AND account_id = :account_id
+          AND wallet_id = :wallet_id AND destination_kind = 'lightning'
+          AND status = 'submitted' AND settlement_ark_txid IS NULL
+          AND refund_ark_txid IS NULL
+        """,  # noqa: S608
+        {
+            "intent_id": intent_id,
+            "account_id": account_id,
+            "wallet_id": wallet_id,
+            "settlement_ark_txid": settlement_ark_txid,
+            "actual_fee_msat": fee_msat,
+            "settled_at": now,
+            "updated_at": now,
+        },
+    )
+    return bool(result.rowcount)
+
+
+async def refund_arkade_lightning_intent(
+    intent_id: str,
+    refund_ark_txid: str,
+    *,
+    account_id: str,
+    wallet_id: str,
+    conn: Connection,
+) -> bool:
+    """CAS a submitted Lightning intent to refunded inside its caller's transaction."""
+    if not re.fullmatch(r"[0-9a-f]{64}", refund_ark_txid):
+        raise ValueError("ARKADE_TRANSACTION_ID_INVALID")
+    database = _require_active_transaction(conn)
+    intent = await _get_lightning_terminal_intent(
+        intent_id, account_id, wallet_id, database
+    )
+    if intent.status == "refunded":
+        if (
+            intent.refund_ark_txid == refund_ark_txid
+            and intent.actual_fee_msat == 0
+            and intent.settlement_ark_txid is None
+        ):
+            return False
+        raise ValueError("ARKADE_LIGHTNING_TERMINAL_CONFLICT")
+    if intent.status != "submitted" or intent.settlement_ark_txid:
+        raise ValueError("ARKADE_INTENT_INVALID_TRANSITION")
+    now = datetime.now(timezone.utc)
+    result = await database.execute(
+        f"""
+        UPDATE arkade_outgoing_intents
+        SET status = 'refunded', refund_ark_txid = :refund_ark_txid,
+            actual_fee_msat = 0,
+            updated_at = {database.timestamp_placeholder('updated_at')}
+        WHERE intent_id = :intent_id AND account_id = :account_id
+          AND wallet_id = :wallet_id AND destination_kind = 'lightning'
+          AND status = 'submitted' AND settlement_ark_txid IS NULL
+          AND refund_ark_txid IS NULL
+        """,  # noqa: S608
+        {
+            "intent_id": intent_id,
+            "account_id": account_id,
+            "wallet_id": wallet_id,
+            "refund_ark_txid": refund_ark_txid,
+            "updated_at": now,
+        },
+    )
+    return bool(result.rowcount)
 
 
 async def settle_arkade_outgoing_intent_verified(
