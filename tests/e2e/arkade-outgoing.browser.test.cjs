@@ -397,15 +397,20 @@ const makeLightningFixture = () => {
     solver_pubkey: solverPubkey,
     valid_until: now + 600,
     refund_locktime: now + 20_000,
-    profile: {receiver_pk_script: '51' + '00'.repeat(32)}
+    profile: {
+      receiver_pk_script: '51' + '00'.repeat(32),
+      refund_without_receiver_delay: 20_480
+    }
   }
   const swap = {
     rfqId: quote.rfq_id,
     quote,
     address: fixture.destination.encode(),
     fundAmount: quote.from_amount,
+    senderPubkey: Buffer.from('12'.repeat(32), 'hex'),
     secrets: {
-      descriptor: 'private claim material must remain in-browser'
+      descriptor: 'private claim material must remain in-browser',
+      pkScript: Buffer.from('51', 'hex')
     }
   }
   const state = {

@@ -320,6 +320,8 @@ const lightningJournalStateFields = [
   'intentId',
   'paymentHash',
   'publicQuote',
+  'refundPkScript',
+  'senderPubkey',
   'version',
   'walletId'
 ]
@@ -347,6 +349,9 @@ const strictLightningJournalRecord = value => {
     HEX64.test(record.paymentHash) &&
     typeof record.walletId === 'string' &&
     record.walletId.length > 0 &&
+    HEX64.test(record.senderPubkey) &&
+    typeof record.refundPkScript === 'string' &&
+    /^[0-9a-f]+$/i.test(record.refundPkScript) &&
     HEX32.test(record.intentId) &&
     Number.isSafeInteger(record.intentExpiresAt) &&
     record.intentExpiresAt >= 0 &&
@@ -1021,6 +1026,8 @@ const lightningJournalFromPlan = plan => ({
   intentId: plan.intent.intent_id,
   intentExpiresAt: expirySeconds(plan.intent.expires_at),
   publicQuote: plan.publicQuote,
+  senderPubkey: bytesToHex(plan.swap.senderPubkey),
+  refundPkScript: bytesToHex(plan.swap.secrets.pkScript),
   fundingState: plan.fundingState,
   fundingArkTxid: plan.fundingArkTxid
 })
@@ -1031,7 +1038,11 @@ const persistLightningPlanState = async (plan, state, arkTxid = null) => {
 }
 const lightningPlanFromRecord = async (record, wallet, current) => {
   const facts = lightningInvoiceFacts(record.bolt11)
-  const swap = await restoreLightningSwap(wallet, record)
+  const swap = {
+    ...(await restoreLightningSwap(wallet, record)),
+    senderPubkey: fromHex(record.senderPubkey),
+    secrets: {pkScript: fromHex(record.refundPkScript)}
+  }
   const intent = current || lightningIntentFromJournal(record)
   if (
     !sameLightningBinding(intent, facts, swap.quote, swap, record.publicQuote, {
@@ -1253,7 +1264,9 @@ const submitLightningSend = async (intentId, approval) => {
       ark_txid: arkTxid,
       lockup_address: plan.swap.address,
       swap_rfq_id: plan.swap.rfqId,
-      solver_pubkey: plan.swap.quote.solver_pubkey
+      solver_pubkey: plan.swap.quote.solver_pubkey,
+      sender_pubkey: bytesToHex(plan.swap.senderPubkey),
+      refund_pk_script: bytesToHex(plan.swap.secrets.pkScript)
     })
   ).data
   if (submitted.status !== 'submitted' || submitted.arkade_txid !== arkTxid)
