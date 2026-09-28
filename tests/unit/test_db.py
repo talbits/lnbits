@@ -19,8 +19,8 @@ from lnbits.db import POSTGRES, SQLITE, Filter, Filters
     [
         (
             POSTGRES,
-            "(time >= to_timestamp(:time__0_0))",
-            "(time <= to_timestamp(:time__1_0))",
+            "(time >= to_timestamp(:time__0_0) AT TIME ZONE 'UTC')",
+            "(time <= to_timestamp(:time__1_0) AT TIME ZONE 'UTC')",
         ),
         (SQLITE, "(time >= :time__0_0)", "(time <= :time__1_0)"),
     ],

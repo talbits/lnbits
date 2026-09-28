@@ -49,7 +49,12 @@ else:
 def compat_timestamp_placeholder(key: str, db_type: str | None = None):
     db_type = db_type or DB_TYPE
     if db_type == POSTGRES:
-        return f"to_timestamp(:{key})"
+        # `to_timestamp` returns a timestamptz, and casting it into the
+        # `timestamp without time zone` columns applies the session timezone,
+        # so on a non-UTC server the stored value drifts by the UTC offset
+        # while the models read naive values back as UTC. Pin the conversion;
+        # on a UTC session this is identical to the plain cast.
+        return f"to_timestamp(:{key}) AT TIME ZONE 'UTC'"
     elif db_type == COCKROACH:
         return f"cast(:{key} AS timestamp)"
     else:
