@@ -74,6 +74,7 @@ from ..crud import (
     get_payments_history,
     get_payments_paginated,
     get_standalone_payment,
+    get_wallet,
     get_wallet_for_key,
 )
 from ..models import ArkadeOutgoingIntent
@@ -184,7 +185,9 @@ async def _create_arkade_lightning_payment(
         raise _public_outgoing_error(exc) from exc
     response = jsonable_encoder(payment)
     response.update(
-        browser_required=True,
+        # Only a prepared intent still needs the browser to fund its lockup. A
+        # replay of a submitted or terminal intent returns the recorded pair.
+        browser_required=intent.status in {"reserved", "quote_ready"},
         intent_id=intent.intent_id,
         intent=jsonable_encoder(intent),
     )
@@ -568,6 +571,17 @@ async def api_update_payment_labels(
     key_type: BaseWalletTypeInfo = Depends(require_base_admin_key),
 ) -> SimpleStatus:
     payment = await get_standalone_payment(payment_hash, wallet_id=key_type.wallet.id)
+    if payment is None:
+        # Arkade payments have no checking_id or payment_hash; the id in the
+        # path is their native_id.
+        wallet = await get_wallet(key_type.wallet.id)
+        native_payment = await get_payment_by_native_id(payment_hash)
+        if (
+            wallet
+            and native_payment
+            and native_payment.wallet_id == wallet.source_wallet_id
+        ):
+            payment = native_payment
     if payment is None:
         raise HTTPException(HTTPStatus.NOT_FOUND, "Payment does not exist.")
     account = await get_account(key_type.wallet.user)

@@ -4,6 +4,7 @@ from .arkade import (
     ArkadeEnrollmentChallenge,
     ArkadeEnrollmentCompletion,
     ArkadeIndexerVtxo,
+    ArkadeLightningFailureReport,
     ArkadeLightningFundingEvidence,
     ArkadeOutgoingAuthorizeRequest,
     ArkadeOutgoingChangeCommitment,
@@ -16,6 +17,8 @@ from .arkade import (
     ArkadeReceiveAcknowledgement,
     ArkadeReceiveRequest,
     ArkadeReconciliation,
+    ArkadeReconciliationResolveRequest,
+    ArkadeReconciliationResolveResponse,
 )
 from .audit import AuditEntry, AuditFilters
 from .lnurl import CreateLnurlPayment, CreateLnurlWithdraw
@@ -80,6 +83,7 @@ __all__ = [
     "ArkadeEnrollmentChallenge",
     "ArkadeEnrollmentCompletion",
     "ArkadeIndexerVtxo",
+    "ArkadeLightningFailureReport",
     "ArkadeLightningFundingEvidence",
     "ArkadeOutgoingAuthorizeRequest",
     "ArkadeOutgoingChangeCommitment",
@@ -92,6 +96,8 @@ __all__ = [
     "ArkadeReceiveAcknowledgement",
     "ArkadeReceiveRequest",
     "ArkadeReconciliation",
+    "ArkadeReconciliationResolveRequest",
+    "ArkadeReconciliationResolveResponse",
     "AuditEntry",
     "AuditFilters",
     "BalanceDelta",

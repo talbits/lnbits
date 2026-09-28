@@ -1448,3 +1448,282 @@ async def m060_add_arkade_lightning_refund_binding(db: Connection):
     await db.execute(
         "ALTER TABLE arkade_outgoing_intents ADD COLUMN refund_pk_script TEXT"
     )
+
+
+async def m061_add_arkade_lightning_failed_state(db: Connection):
+    """Allow failed(reason) as a terminal Lightning swap state.
+
+    A swap whose claim was attempted and kept failing is only observable in the
+    user's wallet, so the state and its reason arrive as a client report; the
+    server keeps `disputed` for contradictory public evidence.
+    """
+    # Rebuild the terminal-event table first: it references the intents table,
+    # which cannot be dropped while a referencing table exists.
+    await db.execute(f"""
+        CREATE TABLE arkade_lightning_terminal_events_backup (
+            event_id TEXT PRIMARY KEY,
+            terminal_state TEXT NOT NULL,
+            payment_payload TEXT NOT NULL,
+            attempts {db.big_int} NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+            next_attempt_at TIMESTAMP NOT NULL,
+            lease_token TEXT,
+            lease_until TIMESTAMP,
+            listeners_delivered_at TIMESTAMP,
+            webhook_delivered_at TIMESTAMP,
+            created_at TIMESTAMP NOT NULL
+        )
+    """)
+    await db.execute("""
+        INSERT INTO arkade_lightning_terminal_events_backup
+            (event_id, terminal_state, payment_payload, attempts, next_attempt_at,
+             lease_token, lease_until, listeners_delivered_at,
+             webhook_delivered_at, created_at)
+        SELECT event_id, terminal_state, payment_payload, attempts,
+               next_attempt_at, lease_token, lease_until,
+               listeners_delivered_at, webhook_delivered_at, created_at
+        FROM arkade_lightning_terminal_events
+    """)
+    await db.execute("DROP TABLE arkade_lightning_terminal_events")
+
+    # Rebuild the intents table with the extended status CHECK and the reason.
+    await db.execute(f"""
+        CREATE TABLE arkade_outgoing_intents_new (
+            intent_id TEXT PRIMARY KEY,
+            account_id TEXT NOT NULL REFERENCES accounts (id),
+            wallet_id TEXT NOT NULL REFERENCES wallets (id),
+            amount_msat {db.big_int} NOT NULL CHECK (
+                amount_msat > 0 AND amount_msat / 1000 * 1000 = amount_msat
+            ),
+            max_fee_msat {db.big_int} NOT NULL CHECK (
+                (destination_kind = 'arkade_address' AND max_fee_msat = 0)
+                OR (destination_kind = 'lightning' AND max_fee_msat > 0)
+            ),
+            destination TEXT NOT NULL,
+            destination_kind TEXT NOT NULL CHECK (
+                destination_kind IN ('arkade_address', 'lightning')
+            ),
+            status TEXT NOT NULL DEFAULT 'reserved' CHECK (
+                status IN (
+                    'reserved', 'quote_ready', 'submitted', 'settled',
+                    'refunded', 'failed', 'released', 'disputed'
+                )
+            ),
+            bolt11 TEXT,
+            payment_hash TEXT,
+            quote_pair TEXT,
+            quote_from_amount_sat {db.big_int},
+            quote_to_amount_sat {db.big_int},
+            quote_valid_until TIMESTAMP,
+            refund_locktime {db.big_int},
+            solver_pubkey TEXT,
+            swap_rfq_id TEXT,
+            lockup_address TEXT,
+            arkade_txid TEXT,
+            settlement_ark_txid TEXT,
+            refund_ark_txid TEXT,
+            actual_fee_msat {db.big_int},
+            expires_at TIMESTAMP NOT NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT {db.timestamp_now},
+            updated_at TIMESTAMP NOT NULL DEFAULT {db.timestamp_now},
+            reserved_at TIMESTAMP NOT NULL DEFAULT {db.timestamp_now},
+            submitted_at TIMESTAMP,
+            settled_at TIMESTAMP,
+            failed_at TIMESTAMP,
+            failure_reason TEXT,
+            released_at TIMESTAMP,
+            disputed_at TIMESTAMP,
+            destination_script TEXT,
+            change_index {db.big_int},
+            change_script TEXT,
+            change_amount_sat {db.big_int},
+            sender_pubkey TEXT,
+            refund_pk_script TEXT,
+            CHECK (actual_fee_msat IS NULL OR actual_fee_msat >= 0),
+            CHECK (actual_fee_msat IS NULL OR actual_fee_msat <= max_fee_msat),
+            CHECK (expires_at > reserved_at),
+            CHECK (
+                status <> 'failed'
+                OR (failed_at IS NOT NULL AND failure_reason IS NOT NULL)
+            )
+        )
+    """)
+    await db.execute(f"""
+        CREATE TABLE arkade_outgoing_intent_inputs_backup (
+            intent_id TEXT NOT NULL,
+            txid TEXT NOT NULL,
+            vout {db.big_int} NOT NULL,
+            amount_sat {db.big_int} NOT NULL,
+            claimed_at TIMESTAMP NOT NULL,
+            PRIMARY KEY (intent_id, txid, vout),
+            UNIQUE (txid, vout)
+        )
+    """)
+    await db.execute("""
+        INSERT INTO arkade_outgoing_intent_inputs_backup
+            (intent_id, txid, vout, amount_sat, claimed_at)
+        SELECT intent_id, txid, vout, amount_sat, claimed_at
+        FROM arkade_outgoing_intent_inputs
+    """)
+    await db.execute("""
+        INSERT INTO arkade_outgoing_intents_new (
+            intent_id, account_id, wallet_id, amount_msat, max_fee_msat,
+            destination, destination_kind, status, bolt11, payment_hash,
+            quote_pair, quote_from_amount_sat, quote_to_amount_sat,
+            quote_valid_until, refund_locktime, solver_pubkey, swap_rfq_id,
+            lockup_address, arkade_txid, settlement_ark_txid,
+            refund_ark_txid, actual_fee_msat, expires_at, created_at,
+            updated_at, reserved_at, submitted_at, settled_at, failed_at,
+            failure_reason, released_at, disputed_at, destination_script,
+            change_index, change_script, change_amount_sat, sender_pubkey,
+            refund_pk_script
+        )
+        SELECT intent_id, account_id, wallet_id, amount_msat, max_fee_msat,
+               destination, destination_kind, status, bolt11, payment_hash,
+               quote_pair, quote_from_amount_sat, quote_to_amount_sat,
+               quote_valid_until, refund_locktime, solver_pubkey, swap_rfq_id,
+               lockup_address, arkade_txid, settlement_ark_txid,
+               refund_ark_txid, actual_fee_msat, expires_at, created_at,
+               updated_at, reserved_at, submitted_at, settled_at, NULL,
+               NULL, released_at, disputed_at, destination_script,
+               change_index, change_script, change_amount_sat, sender_pubkey,
+               refund_pk_script
+        FROM arkade_outgoing_intents
+    """)
+    await db.execute("DROP TABLE arkade_outgoing_intent_inputs")
+    await db.execute("DROP TABLE arkade_outgoing_intents")
+    await db.execute(
+        "ALTER TABLE arkade_outgoing_intents_new RENAME TO arkade_outgoing_intents"
+    )
+    await db.execute(f"""
+        CREATE TABLE arkade_outgoing_intent_inputs (
+            intent_id TEXT NOT NULL REFERENCES arkade_outgoing_intents (intent_id),
+            txid TEXT NOT NULL,
+            vout {db.big_int} NOT NULL CHECK (vout >= 0 AND vout <= 4294967295),
+            amount_sat {db.big_int} NOT NULL
+                CHECK (amount_sat > 0 AND amount_sat <= 2100000000000000),
+            claimed_at TIMESTAMP NOT NULL DEFAULT {db.timestamp_now},
+            PRIMARY KEY (intent_id, txid, vout),
+            UNIQUE (txid, vout)
+        )
+    """)
+    await db.execute("""
+        INSERT INTO arkade_outgoing_intent_inputs
+            (intent_id, txid, vout, amount_sat, claimed_at)
+        SELECT intent_id, txid, vout, amount_sat, claimed_at
+        FROM arkade_outgoing_intent_inputs_backup
+    """)
+    await db.execute("DROP TABLE arkade_outgoing_intent_inputs_backup")
+
+    for index in (
+        "CREATE INDEX IF NOT EXISTS idx_arkade_outgoing_intents_account_status "
+        "ON arkade_outgoing_intents (account_id, status)",
+        "CREATE INDEX IF NOT EXISTS idx_arkade_outgoing_intents_wallet_status "
+        "ON arkade_outgoing_intents (wallet_id, status)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_arkade_outgoing_payment_hash "
+        "ON arkade_outgoing_intents (payment_hash) "
+        "WHERE destination_kind = 'lightning' AND payment_hash IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS idx_arkade_outgoing_solver_pubkey "
+        "ON arkade_outgoing_intents (solver_pubkey)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_arkade_outgoing_swap_rfq_id "
+        "ON arkade_outgoing_intents (swap_rfq_id) "
+        "WHERE swap_rfq_id IS NOT NULL",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_arkade_outgoing_lockup_address "
+        "ON arkade_outgoing_intents (lockup_address) "
+        "WHERE lockup_address IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS idx_arkade_outgoing_status_refund_locktime "
+        "ON arkade_outgoing_intents (status, refund_locktime)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS "
+        "idx_arkade_outgoing_change_account_index "
+        "ON arkade_outgoing_intents (account_id, change_index) "
+        "WHERE change_index IS NOT NULL",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_arkade_outgoing_change_script "
+        "ON arkade_outgoing_intents (change_script) "
+        "WHERE change_script IS NOT NULL",
+    ):
+        await db.execute(index)
+
+    await db.execute(f"""
+        CREATE TABLE arkade_lightning_terminal_events (
+            event_id TEXT PRIMARY KEY
+                REFERENCES arkade_outgoing_intents (intent_id),
+            terminal_state TEXT NOT NULL CHECK (
+                terminal_state IN ('settled', 'refunded', 'failed', 'disputed')
+            ),
+            payment_payload TEXT NOT NULL,
+            attempts {db.big_int} NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+            next_attempt_at TIMESTAMP NOT NULL DEFAULT {db.timestamp_now},
+            lease_token TEXT,
+            lease_until TIMESTAMP,
+            listeners_delivered_at TIMESTAMP,
+            webhook_delivered_at TIMESTAMP,
+            created_at TIMESTAMP NOT NULL DEFAULT {db.timestamp_now}
+        )
+    """)
+    await db.execute("""
+        INSERT INTO arkade_lightning_terminal_events
+            (event_id, terminal_state, payment_payload, attempts, next_attempt_at,
+             lease_token, lease_until, listeners_delivered_at,
+             webhook_delivered_at, created_at)
+        SELECT event_id, terminal_state, payment_payload, attempts,
+               next_attempt_at, lease_token, lease_until,
+               listeners_delivered_at, webhook_delivered_at, created_at
+        FROM arkade_lightning_terminal_events_backup
+    """)
+    await db.execute("DROP TABLE arkade_lightning_terminal_events_backup")
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_arkade_lightning_terminal_events_due "
+        "ON arkade_lightning_terminal_events (next_attempt_at)"
+    )
+
+
+async def m062_extend_arkade_reconciliation_errors(db: Connection):
+    """Admit the Lightning terminal codes into the reconciliation error set.
+
+    `last_error` is a fixed code enum, so the client-reported swap reason stays
+    on the intent (`failure_reason`) and the account flag carries a code.
+    """
+    await db.execute(f"""
+        CREATE TABLE arkade_reconciliation_state_new (
+            account_id TEXT PRIMARY KEY REFERENCES accounts (id),
+            state TEXT NOT NULL CHECK (state IN ('ok', 'reconciliation_required')),
+            last_error TEXT CHECK (last_error IS NULL OR last_error IN (
+                'ARKADE_OUTPOINT_CONFLICT',
+                'ARKADE_UNATTRIBUTED_VALUE',
+                'ARKADE_RECEIVE_AMOUNT_CONFLICT',
+                'ARKADE_INDEXER_INVALID_RESPONSE',
+                'ARKADE_OUTPOINT_TERMINAL_CONFLICT',
+                'ARKADE_RECONCILIATION_REQUIRED',
+                'ARKADE_LIGHTNING_SWAP_FAILED',
+                'ARKADE_LIGHTNING_EVIDENCE_CONTRADICTORY'
+            )),
+            observed_at TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT {db.timestamp_now}
+        )
+    """)
+    await db.execute("""
+        INSERT INTO arkade_reconciliation_state_new
+            (account_id, state, last_error, observed_at, updated_at)
+        SELECT account_id, state, last_error, observed_at, updated_at
+        FROM arkade_reconciliation_state
+    """)
+    await db.execute("DROP TABLE arkade_reconciliation_state")
+    await db.execute(
+        "ALTER TABLE arkade_reconciliation_state_new "
+        "RENAME TO arkade_reconciliation_state"
+    )
+
+
+async def m063_arkade_outgoing_retryable_invoice(db: Connection):
+    """Only a live intent holds an invoice's payment_hash.
+
+    The unique index used to cover every intent, so a released, refunded or
+    failed attempt kept the invoice unusable forever.
+    """
+    await db.execute("DROP INDEX IF EXISTS idx_arkade_outgoing_payment_hash")
+    await db.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_arkade_outgoing_payment_hash "
+        "ON arkade_outgoing_intents (payment_hash) "
+        "WHERE destination_kind = 'lightning' AND payment_hash IS NOT NULL "
+        "AND status IN ('reserved', 'quote_ready', 'submitted', 'disputed', "
+        "'settled')"
+    )

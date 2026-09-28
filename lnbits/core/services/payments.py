@@ -60,6 +60,7 @@ from ..models import (
 from .arkade import (
     ArkadeReceiveError,
     create_arkade_receive_request_for_account,
+    expire_arkade_outgoing_reservations,
     fetch_arkade_indexer_vtxos,
     reconcile_arkade_lightning_intent,
     reconcile_arkade_outgoing_intent,
@@ -567,6 +568,9 @@ async def check_pending_payments():  # noqa: C901
                 for payment in await get_arkade_pending_payments(conn=conn):
                     if payment.is_expired:
                         await compare_and_set_arkade_payment_failed(payment, conn=conn)
+                # Unfunded reservations hold back principal and the invoice's
+                # payment_hash; nothing else ever releases them.
+                await expire_arkade_outgoing_reservations(conn)
         global arkade_outgoing_cursor
         submitted_intents = await get_arkade_submitted_outgoing_intents(
             after_intent_id=arkade_outgoing_cursor

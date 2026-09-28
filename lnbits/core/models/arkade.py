@@ -137,6 +137,7 @@ ArkadeOutgoingStatus = Literal[
     "submitted",
     "settled",
     "refunded",
+    "failed",
     "released",
     "disputed",
 ]
@@ -146,7 +147,7 @@ ArkadeOutgoingDestinationKind = Literal["arkade_address", "lightning"]
 
 class ArkadeLightningTerminalEvent(BaseModel):
     event_id: str = Field(regex=r"^[0-9a-f]{32}$")
-    terminal_state: Literal["settled", "refunded", "disputed"]
+    terminal_state: Literal["settled", "refunded", "failed", "disputed"]
     payment_payload: str
     attempts: int = Field(ge=0)
     next_attempt_at: datetime
@@ -193,6 +194,32 @@ class ArkadeLightningFundingEvidence(BaseModel):
         extra = "forbid"
 
 
+class ArkadeLightningFailureReport(BaseModel):
+    """Browser-observed terminal claim failure for a funded Lightning swap."""
+
+    reason: str = Field(min_length=1, max_length=200, regex=r"^[A-Za-z0-9_.:\- ]+$")
+
+    class Config:
+        extra = "forbid"
+
+
+class ArkadeReconciliationResolveRequest(BaseModel):
+    """Operator request to clear a sticky account reconciliation flag."""
+
+    account_id: str = Field(min_length=1, max_length=64)
+    reason: str = Field(min_length=3, max_length=200, regex=r"^[A-Za-z0-9_.:\- ]+$")
+
+    class Config:
+        extra = "forbid"
+
+
+class ArkadeReconciliationResolveResponse(BaseModel):
+    account_id: str
+    previous_state: ArkadeReconciliationState
+    state: ArkadeReconciliationState
+    last_error: str | None = None
+
+
 class ArkadeOutgoingIntent(BaseModel):
     intent_id: str = Field(regex=r"^[0-9a-f]{32}$")
     account_id: str
@@ -236,6 +263,8 @@ class ArkadeOutgoingIntent(BaseModel):
     reserved_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     submitted_at: datetime | None = None
     settled_at: datetime | None = None
+    failed_at: datetime | None = None
+    failure_reason: str | None = Field(default=None, min_length=1, max_length=200)
     released_at: datetime | None = None
     disputed_at: datetime | None = None
 
@@ -348,3 +377,5 @@ class ArkadeOutgoingIntentResponse(BaseModel):
     change_index: int | None = None
     change_script: str | None = None
     change_amount_sat: int | None = None
+    failed_at: datetime | None = None
+    failure_reason: str | None = Field(default=None, min_length=1, max_length=200)

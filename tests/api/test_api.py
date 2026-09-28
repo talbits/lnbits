@@ -12,9 +12,15 @@ import shortuuid
 from pytest_mock.plugin import MockerFixture
 
 from lnbits import bolt11
+from lnbits.core.crud.payments import create_payment, get_payment_by_native_id
 from lnbits.core.models import ArkadeOutgoingIntent, CreateInvoice, Payment
+from lnbits.core.models.payments import CreatePayment, PaymentState
 from lnbits.core.models.users import Account, UserExtra, UserLabel
-from lnbits.core.services.arkade import ArkadeOutgoingError, arkade_internal_transfer_id
+from lnbits.core.services.arkade import (
+    ArkadeOutgoingError,
+    ArkadeReconciliationError,
+    arkade_internal_transfer_id,
+)
 from lnbits.core.services.users import create_user_account
 from lnbits.core.views.payment_api import api_payment
 from lnbits.fiat.base import FiatInvoiceResponse
@@ -329,6 +335,206 @@ async def test_create_arkade_outgoing_is_retry_safe_and_requires_whole_sats(
     )
     assert sanitized.status_code == 400
     assert sanitized.json()["detail"] == "ARKADE_OUTGOING_ERROR"
+
+
+@pytest.mark.anyio
+async def test_create_arkade_lightning_payment_tracks_intent_and_replay(
+    client,
+    adminkey_headers_to,
+    inkey_headers_to,
+    to_wallet,
+    settings: Settings,
+    mocker: MockerFixture,
+):
+    """The documented API path: create from a quote, replay the recorded pair."""
+    settings.lnbits_effective_installation_mode = "arkade_noncustodial"
+    mocker.patch("lnbits.decorators.require_arkade_ready", mocker.AsyncMock())
+    quote_valid_until = datetime.now(timezone.utc) + timedelta(seconds=30)
+    intent = ArkadeOutgoingIntent(
+        intent_id="01" * 16,
+        account_id=to_wallet.user,
+        wallet_id=to_wallet.id,
+        amount_msat=42_000,
+        max_fee_msat=15_000,
+        destination="lnbc-lightning",
+        destination_kind="lightning",
+        bolt11="lnbc-lightning",
+        payment_hash="ab" * 32,
+        quote_pair="arkade:BTC->lightning:BTC",
+        quote_from_amount_sat=43,
+        quote_to_amount_sat=42,
+        quote_valid_until=quote_valid_until,
+        refund_locktime=int(
+            (datetime.now(timezone.utc) + timedelta(days=3)).timestamp()
+        ),
+        solver_pubkey="cd" * 32,
+        swap_rfq_id="rfq-lightning",
+        lockup_address="tark1lockup",
+        status="quote_ready",
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+    )
+    pending = Payment(
+        checking_id=None,
+        payment_hash=None,
+        wallet_id=to_wallet.id,
+        amount=-42_000,
+        fee=0,
+        bolt11=None,
+        protocol="arkade",
+        native_id=intent.intent_id,
+        arkade_address=intent.destination,
+    )
+    reserve = mocker.patch(
+        "lnbits.core.views.payment_api.reserve_arkade_lightning_intent",
+        mocker.AsyncMock(return_value=(intent, pending)),
+    )
+    headers = {**adminkey_headers_to, "Idempotency-Key": "ab" * 16}
+    body = {
+        "out": True,
+        "unit": "sat",
+        "amount": 42,
+        "bolt11": intent.bolt11,
+        "arkade_quote": {
+            "payment_hash": intent.payment_hash,
+            "amount_msat": 42_000,
+            "max_fee_msat": 15_000,
+            "quote_pair": intent.quote_pair,
+            "quote_from_amount_sat": 43,
+            "quote_to_amount_sat": 42,
+            "quote_valid_until": quote_valid_until.isoformat(),
+            "refund_locktime": intent.refund_locktime,
+            "solver_pubkey": intent.solver_pubkey,
+            "swap_rfq_id": intent.swap_rfq_id,
+            "lockup_address": intent.lockup_address,
+        },
+    }
+
+    created = await client.post("/api/v1/payments", json=body, headers=headers)
+    assert created.status_code == 202
+    created_body = created.json()
+    assert created_body["intent_id"] == intent.intent_id
+    assert created_body["native_id"] == intent.intent_id
+    assert created_body["status"] == "pending"
+    assert created_body["protocol"] == "arkade"
+    assert created_body["amount"] == -42_000
+    assert created_body["browser_required"] is True
+    assert created_body["intent"]["destination_kind"] == "lightning"
+    parsed_quote = reserve.await_args.args[2]
+    assert parsed_quote.lockup_address == intent.lockup_address
+    assert parsed_quote.payment_hash == intent.payment_hash
+    assert parsed_quote.max_fee_msat == 15_000
+
+    settled = intent.copy(
+        update={"status": "settled", "actual_fee_msat": 1_000, "arkade_txid": "ef" * 32}
+    )
+    reserve.return_value = (
+        settled,
+        pending.copy(update={"status": PaymentState.SUCCESS.value, "fee": -1_000}),
+    )
+    replayed = await client.post("/api/v1/payments", json=body, headers=headers)
+    assert replayed.status_code == 202
+    replayed_body = replayed.json()
+    assert replayed_body["intent_id"] == intent.intent_id
+    assert replayed_body["status"] == PaymentState.SUCCESS.value
+    assert replayed_body["fee"] == -1_000
+    assert replayed_body["browser_required"] is False
+    assert reserve.await_count == 2
+
+    missing_key = await client.post(
+        "/api/v1/payments", json=body, headers=adminkey_headers_to
+    )
+    assert missing_key.status_code == 400
+    assert missing_key.json()["detail"] == "ARKADE_IDEMPOTENCY_REQUIRED"
+    invoice_key = await client.post(
+        "/api/v1/payments",
+        json=body,
+        headers={**inkey_headers_to, "Idempotency-Key": "ab" * 16},
+    )
+    assert invoice_key.status_code == 403
+
+
+@pytest.mark.anyio
+async def test_update_arkade_payment_labels_uses_native_id(
+    client, adminkey_headers_to, to_wallet
+):
+    """Arkade payments have no payment_hash; labels must work by native id."""
+    native_id = "3e" * 16
+    await create_payment(
+        None,
+        CreatePayment(
+            wallet_id=to_wallet.id,
+            amount_msat=-42_000,
+            memo="Arkade outgoing payment",
+            protocol="arkade",
+            native_id=native_id,
+            arkade_address="tark1destination",
+        ),
+        status=PaymentState.PENDING,
+    )
+
+    response = await client.put(
+        f"/api/v1/payments/{native_id}/labels",
+        json={"labels": ["l6-test"]},
+        headers=adminkey_headers_to,
+    )
+
+    assert response.status_code == 200
+    payment = await get_payment_by_native_id(native_id)
+    assert payment is not None
+    assert payment.labels == ["l6-test"]
+
+
+@pytest.mark.anyio
+async def test_resolve_arkade_reconciliation_is_admin_only(
+    client, user_headers_from, superuser_token, mocker: MockerFixture
+):
+    """Clearing the sticky flag is a deliberate admin action with a reason."""
+    previous = SimpleNamespace(
+        state="reconciliation_required", last_error="ARKADE_LIGHTNING_SWAP_FAILED"
+    )
+    resolved = SimpleNamespace(state="ok", last_error=None)
+    resolve = mocker.patch(
+        "lnbits.core.views.arkade_api.resolve_arkade_reconciliation",
+        AsyncMock(return_value=(previous, resolved)),
+    )
+    body = {"account_id": "00" * 16, "reason": "manual review complete"}
+
+    denied = await client.post(
+        "/api/v1/arkade/reconciliation/resolve",
+        json=body,
+        headers=user_headers_from,
+    )
+    assert denied.status_code == 403
+    resolve.assert_not_awaited()
+
+    admin_headers = {"Authorization": f"Bearer {superuser_token}"}
+    response = await client.post(
+        "/api/v1/arkade/reconciliation/resolve", json=body, headers=admin_headers
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "account_id": "00" * 16,
+        "previous_state": "reconciliation_required",
+        "state": "ok",
+        "last_error": None,
+    }
+    resolve.assert_awaited_once_with(
+        "00" * 16, "manual review complete", actor_id=mocker.ANY
+    )
+
+    empty_reason = await client.post(
+        "/api/v1/arkade/reconciliation/resolve",
+        json={"account_id": "00" * 16, "reason": ""},
+        headers=admin_headers,
+    )
+    assert empty_reason.status_code == 400
+
+    resolve.side_effect = ArkadeReconciliationError("ARKADE_RECONCILIATION_NOT_FOUND")
+    unknown = await client.post(
+        "/api/v1/arkade/reconciliation/resolve", json=body, headers=admin_headers
+    )
+    assert unknown.status_code == 404
+    assert unknown.json()["detail"] == "ARKADE_RECONCILIATION_NOT_FOUND"
 
 
 @pytest.mark.anyio

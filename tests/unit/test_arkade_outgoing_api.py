@@ -175,6 +175,59 @@ async def test_outgoing_api_isolation_and_canonical_response(monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_outgoing_api_failed_report_contract(monkeypatch):
+    app = _app(Account(id=ACCOUNT_ID))
+    failed = AsyncMock(
+        return_value=_response().copy(
+            update={"status": "failed", "failure_reason": "claim_attempt_failed"}
+        )
+    )
+    monkeypatch.setattr(
+        "lnbits.core.views.arkade_api.fail_arkade_lightning_intent", failed
+    )
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        reported = await client.post(
+            f"/api/v1/arkade/outgoing/{INTENT_ID}/fail",
+            json={"reason": "claim_attempt_failed"},
+        )
+        refused = await client.post(
+            f"/api/v1/arkade/outgoing/{INTENT_ID}/fail",
+            json={"reason": "claim_attempt_failed $bad"},
+        )
+        empty = await client.post(
+            f"/api/v1/arkade/outgoing/{INTENT_ID}/fail", json={"reason": ""}
+        )
+
+    assert reported.status_code == 200
+    assert reported.json()["status"] == "failed"
+    assert reported.json()["failure_reason"] == "claim_attempt_failed"
+    failed.assert_awaited_once_with(ACCOUNT_ID, INTENT_ID, "claim_attempt_failed")
+    assert refused.status_code == 422
+    assert empty.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_outgoing_api_failed_report_maps_service_errors(monkeypatch):
+    app = _app(Account(id=ACCOUNT_ID))
+    monkeypatch.setattr(
+        "lnbits.core.views.arkade_api.fail_arkade_lightning_intent",
+        AsyncMock(
+            side_effect=ArkadeOutgoingError("ARKADE_LIGHTNING_FAILURE_REASON_INVALID")
+        ),
+    )
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            f"/api/v1/arkade/outgoing/{INTENT_ID}/fail", json={"reason": "   "}
+        )
+    assert response.status_code == 400
+    assert response.json()["detail"] == "ARKADE_LIGHTNING_FAILURE_REASON_INVALID"
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize(
     "payload",
     [

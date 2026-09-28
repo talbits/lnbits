@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 
 import httpx
 import pytest
+from bech32 import CHARSET, bech32_hrp_expand, bech32_polymod, convertbits
 from coincurve import PrivateKey, PublicKeyXOnly
 from pydantic import ValidationError
 from sqlalchemy.exc import OperationalError
@@ -32,6 +33,7 @@ from lnbits.core.crud.payments import (
     get_payment_by_native_id,
     refund_arkade_lightning_payment,
     settle_arkade_lightning_payment,
+    update_payment,
 )
 from lnbits.core.models.arkade import (
     ArkadeLightningFundingEvidence,
@@ -43,7 +45,7 @@ from lnbits.core.models.arkade import (
     ArkadeOutgoingSelectedInput,
 )
 from lnbits.core.models.payments import PaymentState
-from lnbits.core.services import arkade
+from lnbits.core.services import arkade, payments
 from lnbits.core.services.arkade_evidence import (
     ArkadeLightningEvidenceStatus,
     ArkadeLightningEvidenceVerdict,
@@ -160,11 +162,21 @@ async def connection(monkeypatch):
             "account_id TEXT PRIMARY KEY, state TEXT NOT NULL, last_error TEXT, "
             "observed_at TIMESTAMP, updated_at TIMESTAMP)"
         )
+        await connection.execute(
+            "CREATE TABLE audit ("
+            "component TEXT, ip_address TEXT, user_id TEXT, path TEXT, "
+            "request_type TEXT, request_method TEXT, request_details TEXT, "
+            "response_code TEXT, duration REAL NOT NULL, delete_at TIMESTAMP, "
+            "created_at TIMESTAMP)"
+        )
         await migrations.m055_create_arkade_outgoing_tables(connection)
         await migrations.m057_add_arkade_outgoing_outputs(connection)
         await migrations.m058_add_arkade_lightning_quote_fields(connection)
         await migrations.m059_create_arkade_lightning_terminal_events(connection)
         await migrations.m060_add_arkade_lightning_refund_binding(connection)
+        await migrations.m061_add_arkade_lightning_failed_state(connection)
+        await migrations.m062_extend_arkade_reconciliation_errors(connection)
+        await migrations.m063_arkade_outgoing_retryable_invoice(connection)
         yield connection
     await engine.dispose()
 
@@ -371,6 +383,42 @@ def _lightning_quote(**updates):
     return ArkadeLightningQuoteInput(**data)
 
 
+def _arkade_address(fill: int) -> str:
+    """Encode a valid regtest tark address whose payload repeats one byte."""
+    payload = bytes([0]) + bytes([fill]) * 64
+    data = convertbits(payload, 8, 5, True)
+    assert data is not None
+    values = [*data, 0, 0, 0, 0, 0, 0]
+    polymod = bech32_polymod(bech32_hrp_expand("tark") + values) ^ 0x2BC830A3
+    checksum = [(polymod >> 5 * (5 - index)) & 31 for index in range(6)]
+    return "tark1" + "".join(CHARSET[value] for value in data + checksum)
+
+
+def _distinct_lightning_quote(seq: str, **updates):
+    """Build another Lightning quote for the same test account.
+
+    The payment hash, swap rfq id and lockup address are unique per swap, so a
+    fresh intent needs its own triple. Pair it with ``_lightning_decoder``.
+    """
+    return _lightning_quote(
+        bolt11=f"lnbc-lightning-test-{seq}",
+        payment_hash=(seq * 32)[:64],
+        swap_rfq_id=f"rfq-lightning-test-{seq}",
+        lockup_address=_arkade_address(int(seq, 16)),
+        **updates,
+    )
+
+
+def _lightning_decoder(*sequences: str, amount_msat: int = 5_000_000):
+    """Decode the shared test invoice and each ``_distinct_lightning_quote``."""
+    invoices = {"lnbc-lightning-test": _LightningInvoice(amount_msat=amount_msat)}
+    for seq in sequences:
+        invoice = _LightningInvoice(amount_msat=amount_msat)
+        invoice.payment_hash = (seq * 32)[:64]
+        invoices[f"lnbc-lightning-test-{seq}"] = invoice
+    return lambda value: invoices[value]
+
+
 @pytest.mark.anyio
 async def test_reservation_debits_and_replays_atomically(connection, monkeypatch):
     monkeypatch.setattr(
@@ -435,9 +483,10 @@ async def test_reservation_rejects_logical_and_backing_shortfalls(
 
 
 @pytest.mark.anyio
-async def test_lightning_reservation_includes_fee_cap_in_obligation(
+async def test_lightning_reservation_rejects_account_over_commitment(
     connection, monkeypatch
 ):
+    """The fee cap is part of the obligation and cannot exceed the wallet."""
     monkeypatch.setattr(
         settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
     )
@@ -448,17 +497,698 @@ async def test_lightning_reservation_includes_fee_cap_in_obligation(
 
     monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", backing)
     monkeypatch.setattr(arkade.bolt11, "decode", lambda _bolt11: _LightningInvoice())
-    await _credit(connection, WALLET_ID, 5_020_000)
-    with pytest.raises(
-        arkade.ArkadeOutgoingError,
-        match="^ARKADE_BACKING_DEFICIT$",
-    ):
+    # Exactly the 5,000 sat invoice without room for its 20 sat fee cap.
+    await _credit(connection, WALLET_ID, 5_000_000)
+    with pytest.raises(arkade.ArkadeOutgoingError, match="^ARKADE_INSUFFICIENT_FUNDS$"):
         await arkade.reserve_arkade_lightning_intent(
             ACCOUNT_ID,
             WALLET_ID,
             _lightning_quote(),
             connection,
             idempotency_key="07" * 16,
+        )
+    # A second wallet cannot make the first one solvent either, but the
+    # account-wide guard still refuses to promise more than the VTXOs back.
+    await _credit(connection, WALLET_ID, 20_000)
+    await _credit(connection, SECOND_WALLET_ID, 1_000_000)
+
+    async def tight_backing(_account_id, **kwargs):
+        assert kwargs.get("spendable_only") is True
+        return [_observed(amount_sat=5_000)]
+
+    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", tight_backing)
+    with pytest.raises(arkade.ArkadeOutgoingError, match="^ARKADE_BACKING_DEFICIT$"):
+        await arkade.reserve_arkade_lightning_intent(
+            ACCOUNT_ID,
+            WALLET_ID,
+            _lightning_quote(),
+            connection,
+            idempotency_key="07" * 16,
+        )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("amount_sat", "fee_sat"), [(500, 2), (1_000, 4), (9_970, 30), (50_000, 151)]
+)
+async def test_lightning_reservation_enforces_solver_spread(
+    connection, monkeypatch, amount_sat, fee_sat
+):
+    monkeypatch.setattr(
+        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
+    )
+
+    async def backing(_account_id, **kwargs):
+        assert kwargs.get("spendable_only") is True
+        return [_observed(amount_sat=amount_sat + 2 * fee_sat + 1)]
+
+    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", backing)
+    monkeypatch.setattr(
+        arkade.bolt11,
+        "decode",
+        lambda _bolt11: _LightningInvoice(amount_msat=amount_sat * 1000),
+    )
+    # Credit funds the invoice, its fee and one spare satoshi; the observed
+    # backing adds a second fee reserve beyond that, so only the amounts
+    # rejected below can consume it.
+    await _credit(connection, WALLET_ID, (amount_sat + fee_sat + 1) * 1000)
+    quote = _lightning_quote(
+        amount_msat=amount_sat * 1000,
+        max_fee_msat=fee_sat * 1000,
+        quote_from_amount_sat=amount_sat + fee_sat,
+        quote_to_amount_sat=amount_sat,
+    )
+
+    for updates in (
+        {"max_fee_msat": (fee_sat + 1) * 1000},
+        {"quote_from_amount_sat": amount_sat + fee_sat + 1},
+    ):
+        with pytest.raises(
+            arkade.ArkadeOutgoingError, match="^ARKADE_OUTGOING_INVALID_REQUEST$"
+        ):
+            await arkade.reserve_arkade_lightning_intent(
+                ACCOUNT_ID,
+                WALLET_ID,
+                quote.copy(update=updates),
+                connection,
+                idempotency_key="08" * 16,
+            )
+
+    reserved, payment = await arkade.reserve_arkade_lightning_intent(
+        ACCOUNT_ID,
+        WALLET_ID,
+        quote,
+        connection,
+        idempotency_key="08" * 16,
+    )
+
+    assert reserved.quote_from_amount_sat == amount_sat + fee_sat
+    assert reserved.max_fee_msat == fee_sat * 1000
+    assert payment.status == PaymentState.PENDING.value
+
+
+@pytest.mark.anyio
+async def test_reservation_accepts_exactly_backed_native_account(
+    connection, monkeypatch
+):
+    """The live L5 blocker: pending debits must not be counted twice."""
+    monkeypatch.setattr(
+        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
+    )
+    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", _exact_backing)
+    await _credit(connection, WALLET_ID, 70_000)
+    balance = await connection.fetchone(
+        "SELECT balance FROM balances WHERE wallet_id = :wallet_id",
+        {"wallet_id": WALLET_ID},
+    )
+    assert balance["balance"] == 70_000
+
+    reserved, payment = await arkade.reserve_arkade_outgoing_intent(
+        ACCOUNT_ID, _intent(amount_msat=10_000), conn=connection
+    )
+
+    assert reserved.status == "reserved"
+    assert payment.amount == -10_000
+    reserved_balance = await connection.fetchone(
+        "SELECT balance FROM balances WHERE wallet_id = :wallet_id",
+        {"wallet_id": WALLET_ID},
+    )
+    assert reserved_balance["balance"] == 60_000
+
+    replay, replay_payment = await arkade.reserve_arkade_outgoing_intent(
+        ACCOUNT_ID, _intent(amount_msat=10_000), conn=connection
+    )
+    assert replay == reserved
+    assert replay_payment == payment
+    replay_balance = await connection.fetchone(
+        "SELECT balance FROM balances WHERE wallet_id = :wallet_id",
+        {"wallet_id": WALLET_ID},
+    )
+    assert replay_balance["balance"] == 60_000
+
+
+@pytest.mark.anyio
+async def test_reservation_accepts_exactly_backed_lightning_send(
+    connection, monkeypatch
+):
+    """The live L5 blocker, on the Lightning path: exact backing must reserve."""
+    monkeypatch.setattr(
+        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
+    )
+
+    async def backing(_account_id, **kwargs):
+        assert kwargs.get("spendable_only") is True
+        return [_observed(amount_sat=5_015)]
+
+    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", backing)
+    monkeypatch.setattr(arkade.bolt11, "decode", _lightning_decoder("31"))
+    # Exact backing: the wallet holds precisely the invoice plus its fee cap.
+    await _credit(connection, WALLET_ID, 5_015_000)
+
+    reserved, payment = await arkade.reserve_arkade_lightning_intent(
+        ACCOUNT_ID,
+        WALLET_ID,
+        _lightning_quote(),
+        connection,
+        idempotency_key="09" * 16,
+    )
+    assert reserved.status == "quote_ready"
+    assert reserved.max_fee_msat == 15_000
+    assert payment.amount == -5_000_000
+    balance = await connection.fetchone(
+        "SELECT balance FROM balances WHERE wallet_id = :wallet_id",
+        {"wallet_id": WALLET_ID},
+    )
+    assert balance["balance"] == 15_000
+
+    replay, replay_payment = await arkade.reserve_arkade_lightning_intent(
+        ACCOUNT_ID,
+        WALLET_ID,
+        _lightning_quote(),
+        connection,
+        idempotency_key="09" * 16,
+    )
+    assert replay == reserved
+    assert replay_payment == payment
+
+    # The funded amount is committed, so the same wallet cannot fund another
+    # send from the same exact backing.
+    with pytest.raises(arkade.ArkadeOutgoingError, match="^ARKADE_INSUFFICIENT_FUNDS$"):
+        await arkade.reserve_arkade_lightning_intent(
+            ACCOUNT_ID,
+            WALLET_ID,
+            _distinct_lightning_quote("31"),
+            connection,
+            idempotency_key="31" * 16,
+        )
+
+
+@pytest.mark.anyio
+async def test_lightning_replay_after_settlement_returns_recorded_pair(
+    connection, monkeypatch
+):
+    """A settled send replays as its recorded pair, never as corrupt.
+
+    The payment row carries the settlement fee once the send settles, so the
+    replay path must expect that fee instead of the pending zero.
+    """
+    monkeypatch.setattr(
+        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
+    )
+
+    async def backing(_account_id, **kwargs):
+        assert kwargs.get("spendable_only") is True
+        return [_observed(amount_sat=5_015)]
+
+    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", backing)
+    monkeypatch.setattr(arkade.bolt11, "decode", _lightning_decoder("32"))
+    await _credit(connection, WALLET_ID, 5_015_000)
+    quote = _distinct_lightning_quote("32")
+
+    reserved, payment = await arkade.reserve_arkade_lightning_intent(
+        ACCOUNT_ID, WALLET_ID, quote, connection, idempotency_key="32" * 16
+    )
+    async with connection.transaction():
+        assert await submit_arkade_lightning_intent(
+            reserved.intent_id,
+            "ab" * 32,
+            lockup_address=quote.lockup_address,
+            swap_rfq_id=quote.swap_rfq_id,
+            solver_pubkey=quote.solver_pubkey,
+            sender_pubkey="cd" * 32,
+            refund_pk_script="51",
+            conn=connection,
+        )
+        assert await settle_arkade_lightning_intent(
+            reserved.intent_id,
+            "ef" * 32,
+            account_id=ACCOUNT_ID,
+            wallet_id=WALLET_ID,
+            conn=connection,
+        )
+    payment.status = PaymentState.SUCCESS.value
+    payment.fee = -1_000
+    await update_payment(payment, conn=connection)
+
+    replay, replayed_payment = await arkade.reserve_arkade_lightning_intent(
+        ACCOUNT_ID, WALLET_ID, quote, connection, idempotency_key="32" * 16
+    )
+    assert replay.status == "settled"
+    assert replay == await get_arkade_outgoing_intent(
+        reserved.intent_id, conn=connection
+    )
+    assert replayed_payment.status == PaymentState.SUCCESS.value
+    assert replayed_payment.fee == -1_000
+
+
+@pytest.mark.anyio
+async def test_lightning_replay_after_quote_window_returns_recorded_pair(
+    connection, monkeypatch
+):
+    """Quote and invoice expiry gate new reservations, not recorded replays."""
+    monkeypatch.setattr(
+        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
+    )
+
+    async def backing(_account_id, **kwargs):
+        assert kwargs.get("spendable_only") is True
+        return [_observed(amount_sat=5_015)]
+
+    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", backing)
+    monkeypatch.setattr(arkade.bolt11, "decode", _lightning_decoder("33"))
+    await _credit(connection, WALLET_ID, 5_015_000)
+    quote = _distinct_lightning_quote("33")
+
+    reserved, payment = await arkade.reserve_arkade_lightning_intent(
+        ACCOUNT_ID, WALLET_ID, quote, connection, idempotency_key="33" * 16
+    )
+
+    class FrozenClock(datetime):
+        current = datetime.now(timezone.utc) + timedelta(hours=2)
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.current if tz is not None else cls.current.replace(tzinfo=None)
+
+    monkeypatch.setattr(arkade, "datetime", FrozenClock)
+
+    replay, replayed_payment = await arkade.reserve_arkade_lightning_intent(
+        ACCOUNT_ID, WALLET_ID, quote, connection, idempotency_key="33" * 16
+    )
+    assert replay == reserved
+    assert replayed_payment == payment
+
+
+@pytest.mark.anyio
+async def test_failed_report_terminates_submitted_intent_once(connection, monkeypatch):
+    """A browser-reported claim failure is terminal, flagged and delivered once."""
+    monkeypatch.setattr(
+        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
+    )
+
+    async def backing(_account_id, **kwargs):
+        assert kwargs.get("spendable_only") is True
+        return [_observed(amount_sat=5_015)]
+
+    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", backing)
+    monkeypatch.setattr(arkade.bolt11, "decode", _lightning_decoder("34"))
+    await _credit(connection, WALLET_ID, 5_015_000)
+    quote = _distinct_lightning_quote("34")
+    reserved, _payment = await arkade.reserve_arkade_lightning_intent(
+        ACCOUNT_ID, WALLET_ID, quote, connection, idempotency_key="34" * 16
+    )
+    async with connection.transaction():
+        assert await submit_arkade_lightning_intent(
+            reserved.intent_id,
+            "ab" * 32,
+            lockup_address=quote.lockup_address,
+            swap_rfq_id=quote.swap_rfq_id,
+            solver_pubkey=quote.solver_pubkey,
+            sender_pubkey="cd" * 32,
+            refund_pk_script="51",
+            conn=connection,
+        )
+
+    result = await arkade.fail_arkade_lightning_intent(
+        ACCOUNT_ID, reserved.intent_id, "claim_attempt_failed", conn=connection
+    )
+
+    assert result.status == "failed"
+    assert result.failure_reason == "claim_attempt_failed"
+    assert result.failed_at is not None
+    stored = await get_arkade_outgoing_intent(reserved.intent_id, conn=connection)
+    assert stored and stored.status == "failed"
+    assert stored.failure_reason == "claim_attempt_failed"
+    failed_payment = await get_payment_by_native_id(reserved.intent_id, conn=connection)
+    assert failed_payment is not None
+    assert failed_payment.status == PaymentState.FAILED.value
+    assert failed_payment.fee == 0
+    reconciliation = await connection.fetchone(
+        "SELECT state, last_error FROM arkade_reconciliation_state "
+        "WHERE account_id = :account_id",
+        {"account_id": ACCOUNT_ID},
+    )
+    assert reconciliation is not None
+    assert reconciliation["state"] == "reconciliation_required"
+    assert reconciliation["last_error"] == "ARKADE_LIGHTNING_SWAP_FAILED"
+    events = await connection.fetchall(
+        "SELECT event_id, terminal_state FROM arkade_lightning_terminal_events"
+    )
+    assert len(events) == 1
+    assert events[0]["event_id"] == reserved.intent_id
+    assert events[0]["terminal_state"] == "failed"
+
+    replay = await arkade.fail_arkade_lightning_intent(
+        ACCOUNT_ID, reserved.intent_id, "claim_attempt_failed", conn=connection
+    )
+    assert replay.status == "failed"
+    events = await connection.fetchall(
+        "SELECT event_id FROM arkade_lightning_terminal_events"
+    )
+    assert len(events) == 1
+    with pytest.raises(
+        arkade.ArkadeOutgoingError, match="^ARKADE_OUTGOING_IDEMPOTENCY_CONFLICT$"
+    ):
+        await arkade.fail_arkade_lightning_intent(
+            ACCOUNT_ID, reserved.intent_id, "different_reason", conn=connection
+        )
+
+
+@pytest.mark.anyio
+async def test_failed_report_requires_a_submitted_intent(connection, monkeypatch):
+    """Only a funded swap can fail, and the reason must be usable evidence."""
+    monkeypatch.setattr(
+        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
+    )
+
+    async def backing(_account_id, **kwargs):
+        return [_observed(amount_sat=5_015)]
+
+    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", backing)
+    monkeypatch.setattr(arkade.bolt11, "decode", _lightning_decoder("35"))
+    await _credit(connection, WALLET_ID, 5_015_000)
+    quote = _distinct_lightning_quote("35")
+    reserved, _payment = await arkade.reserve_arkade_lightning_intent(
+        ACCOUNT_ID, WALLET_ID, quote, connection, idempotency_key="35" * 16
+    )
+
+    with pytest.raises(
+        arkade.ArkadeOutgoingError, match="^ARKADE_LIGHTNING_FAILURE_REASON_INVALID$"
+    ):
+        await arkade.fail_arkade_lightning_intent(
+            ACCOUNT_ID, reserved.intent_id, "   ", conn=connection
+        )
+    with pytest.raises(
+        arkade.ArkadeOutgoingError, match="^ARKADE_INTENT_INVALID_TRANSITION$"
+    ):
+        await arkade.fail_arkade_lightning_intent(
+            ACCOUNT_ID, reserved.intent_id, "claim_attempt_failed", conn=connection
+        )
+
+
+@pytest.mark.anyio
+async def test_reservation_never_oversubscribes_one_coin_pool(connection, monkeypatch):
+    """A fee reserve left open must keep its coins out of reach."""
+    monkeypatch.setattr(
+        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
+    )
+
+    async def backing(_account_id, **kwargs):
+        assert kwargs.get("spendable_only") is True
+        return [_observed(amount_sat=1_000)]
+
+    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", backing)
+    monkeypatch.setattr(
+        arkade.bolt11, "decode", _lightning_decoder("51", amount_msat=997_000)
+    )
+    await _credit(connection, WALLET_ID, 1_000_000)
+
+    # The 997 sat invoice commits the whole pool: its 3 sat spread still has to
+    # come out of the same coins when the swap settles.
+    reserved, _payment = await arkade.reserve_arkade_lightning_intent(
+        ACCOUNT_ID,
+        WALLET_ID,
+        _distinct_lightning_quote(
+            "51",
+            amount_msat=997_000,
+            max_fee_msat=3_000,
+            quote_from_amount_sat=1_000,
+            quote_to_amount_sat=997,
+        ),
+        connection,
+        idempotency_key="51" * 16,
+    )
+    assert reserved.status == "quote_ready"
+
+    # The 3 sat remainder is not free: it is the open intent's fee reserve.
+    with pytest.raises(arkade.ArkadeOutgoingError, match="^ARKADE_INSUFFICIENT_FUNDS$"):
+        await arkade.reserve_arkade_outgoing_intent(
+            ACCOUNT_ID,
+            _intent(amount_msat=3_000).copy(update={"intent_id": "52" * 16}),
+            conn=connection,
+        )
+
+
+async def _quote_ready_intent(connection, monkeypatch, seq: str):
+    """Reserve one Lightning intent on an exactly backed wallet."""
+
+    async def backing(_account_id, **kwargs):
+        assert kwargs.get("spendable_only") is True
+        return [_observed(amount_sat=5_015)]
+
+    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", backing)
+    monkeypatch.setattr(arkade.bolt11, "decode", _lightning_decoder(seq))
+    await _credit(connection, WALLET_ID, 5_015_000)
+    intent, _payment = await arkade.reserve_arkade_lightning_intent(
+        ACCOUNT_ID,
+        WALLET_ID,
+        _distinct_lightning_quote(seq),
+        connection,
+        idempotency_key=seq * 16,
+    )
+    assert intent.status == "quote_ready"
+    return intent
+
+
+@pytest.mark.anyio
+async def test_quote_ready_intent_release_refunds_the_wallet(connection, monkeypatch):
+    """Cancelling at the approval dialog must return the reserved funds."""
+    monkeypatch.setattr(
+        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
+    )
+    intent = await _quote_ready_intent(connection, monkeypatch, "61")
+
+    assert await arkade.release_arkade_outgoing_payment(
+        ACCOUNT_ID, intent.intent_id, conn=connection
+    )
+    released = await get_arkade_outgoing_intent(intent.intent_id, conn=connection)
+    assert released and released.status == "released"
+    released_payment = await get_payment_by_native_id(intent.intent_id, conn=connection)
+    assert released_payment and released_payment.status == PaymentState.FAILED.value
+    balance = await connection.fetchone(
+        "SELECT balance FROM balances WHERE wallet_id = :wallet_id",
+        {"wallet_id": WALLET_ID},
+    )
+    assert balance["balance"] == 5_015_000
+    # Releasing again is an idempotent no-op.
+    assert not await arkade.release_arkade_outgoing_payment(
+        ACCOUNT_ID, intent.intent_id, conn=connection
+    )
+
+
+@pytest.mark.anyio
+async def test_funded_intent_cannot_be_released(connection, monkeypatch):
+    """A funded swap must be resolved by settlement, refund or dispute."""
+    monkeypatch.setattr(
+        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
+    )
+    intent = await _quote_ready_intent(connection, monkeypatch, "62")
+    await connection.execute(
+        "UPDATE arkade_outgoing_intents SET arkade_txid = :txid "
+        "WHERE intent_id = :intent_id",
+        {"txid": "ab" * 32, "intent_id": intent.intent_id},
+    )
+
+    with pytest.raises(
+        arkade.ArkadeOutgoingError, match="^ARKADE_INTENT_INVALID_TRANSITION$"
+    ):
+        await arkade.release_arkade_outgoing_payment(
+            ACCOUNT_ID, intent.intent_id, conn=connection
+        )
+
+
+@pytest.mark.anyio
+async def test_expired_unfunded_reservation_releases_once_and_frees_invoice(
+    connection, monkeypatch
+):
+    """A reservation nothing funded must expire and let the invoice retry."""
+    monkeypatch.setattr(
+        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
+    )
+
+    async def backing(_account_id, **kwargs):
+        assert kwargs.get("spendable_only") is True
+        return [
+            _observed(txid=f"{index:064x}", amount_sat=5_015)
+            for index in (61, 62, 63, 64, 65, 66)
+        ]
+
+    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", backing)
+    monkeypatch.setattr(
+        arkade.bolt11, "decode", _lightning_decoder("71", "72", "73", "74", "75")
+    )
+    await _credit(connection, WALLET_ID, 30_000_000)
+
+    async def reserve(quote, key: str):
+        intent, _payment = await arkade.reserve_arkade_lightning_intent(
+            ACCOUNT_ID, WALLET_ID, quote, connection, idempotency_key=key
+        )
+        assert intent.status == "quote_ready"
+        return intent
+
+    async def balance() -> int:
+        row = await connection.fetchone(
+            "SELECT balance FROM balances WHERE wallet_id = :wallet_id",
+            {"wallet_id": WALLET_ID},
+        )
+        return int(row["balance"])
+
+    def same_invoice_quote(seq: str):
+        return _distinct_lightning_quote(seq).copy(
+            update={
+                "bolt11": "lnbc-lightning-test-71",
+                "payment_hash": ("71" * 32)[:64],
+            }
+        )
+
+    expired = await reserve(_distinct_lightning_quote("71"), "71" * 16)
+    untouched = await reserve(_distinct_lightning_quote("73"), "73" * 16)
+    funded = await reserve(_distinct_lightning_quote("74"), "74" * 16)
+    # A second live intent for the same invoice stays impossible.
+    with pytest.raises(arkade.ArkadeOutgoingError, match="IDEMPOTENCY_CONFLICT"):
+        await reserve(same_invoice_quote("72"), "72" * 16)
+
+    await connection.execute(
+        "UPDATE arkade_outgoing_intents SET expires_at = :expires_at, "
+        "reserved_at = :reserved_at WHERE intent_id = :intent_id",
+        {
+            "expires_at": datetime.now(timezone.utc) - timedelta(minutes=1),
+            "reserved_at": datetime.now(timezone.utc) - timedelta(minutes=11),
+            "intent_id": expired.intent_id,
+        },
+    )
+    await connection.execute(
+        "UPDATE arkade_outgoing_intents SET status = 'submitted', "
+        "arkade_txid = :txid WHERE intent_id = :intent_id",
+        {"txid": "ab" * 32, "intent_id": funded.intent_id},
+    )
+    before = await balance()
+
+    async with connection.transaction():
+        assert await arkade.expire_arkade_outgoing_reservations(connection) == 1
+
+    released = await get_arkade_outgoing_intent(expired.intent_id, conn=connection)
+    assert released and released.status == "released"
+    released_payment = await get_payment_by_native_id(
+        expired.intent_id, conn=connection
+    )
+    assert released_payment and released_payment.status == PaymentState.FAILED.value
+    assert "expired" in released_payment.labels
+    assert await balance() - before == 5_000_000
+    untouched_stored = await get_arkade_outgoing_intent(
+        untouched.intent_id, conn=connection
+    )
+    assert untouched_stored and untouched_stored.status == "quote_ready"
+    funded_stored = await get_arkade_outgoing_intent(funded.intent_id, conn=connection)
+    assert funded_stored and funded_stored.status == "submitted"
+
+    async with connection.transaction():
+        assert await arkade.expire_arkade_outgoing_reservations(connection) == 0
+    still_released = await get_arkade_outgoing_intent(
+        expired.intent_id, conn=connection
+    )
+    assert still_released and still_released.released_at == released.released_at
+
+    retry = await reserve(same_invoice_quote("72"), "72" * 16)
+    assert retry.intent_id != expired.intent_id
+    with pytest.raises(arkade.ArkadeOutgoingError, match="IDEMPOTENCY_CONFLICT"):
+        await reserve(same_invoice_quote("75"), "75" * 16)
+
+
+@pytest.mark.anyio
+async def test_pending_check_expires_unfunded_reservation(connection, monkeypatch):
+    """The periodic pending check is what actually expires the reservation."""
+    monkeypatch.setattr(
+        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
+    )
+
+    async def backing(_account_id, **_kwargs):
+        return [_observed(amount_sat=5_015)]
+
+    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", backing)
+    monkeypatch.setattr(arkade.bolt11, "decode", _lightning_decoder("76"))
+    await _credit(connection, WALLET_ID, 5_015_000)
+    intent, _payment = await arkade.reserve_arkade_lightning_intent(
+        ACCOUNT_ID,
+        WALLET_ID,
+        _distinct_lightning_quote("76"),
+        connection,
+        idempotency_key="76" * 16,
+    )
+    await connection.execute(
+        "UPDATE arkade_outgoing_intents SET expires_at = :expires_at, "
+        "reserved_at = :reserved_at WHERE intent_id = :intent_id",
+        {
+            "expires_at": datetime.now(timezone.utc) - timedelta(minutes=1),
+            "reserved_at": datetime.now(timezone.utc) - timedelta(minutes=11),
+            "intent_id": intent.intent_id,
+        },
+    )
+
+    @asynccontextmanager
+    async def use_connection():
+        yield connection
+
+    async def none(**_kwargs):
+        return []
+
+    monkeypatch.setattr(payments.db, "connect", use_connection)
+    monkeypatch.setattr(payments, "get_arkade_ready_account_ids", none)
+    monkeypatch.setattr(payments, "get_arkade_submitted_outgoing_intents", none)
+
+    await payments.check_pending_payments()
+
+    stored = await get_arkade_outgoing_intent(intent.intent_id, conn=connection)
+    assert stored and stored.status == "released"
+    stored_payment = await get_payment_by_native_id(intent.intent_id, conn=connection)
+    assert stored_payment and stored_payment.status == PaymentState.FAILED.value
+    assert "expired" in stored_payment.labels
+
+
+@pytest.mark.anyio
+async def test_reconciliation_resolve_clears_flag_once_and_audits(
+    connection, monkeypatch
+):
+    """Only a deliberate operator action clears a sticky flag."""
+    await arkade.update_arkade_reconciliation(
+        ACCOUNT_ID,
+        state="reconciliation_required",
+        last_error="ARKADE_LIGHTNING_SWAP_FAILED",
+        conn=connection,
+    )
+
+    @asynccontextmanager
+    async def use_connection():
+        yield connection
+
+    monkeypatch.setattr(arkade.db, "connect", use_connection)
+
+    previous, resolved = await arkade.resolve_arkade_reconciliation(
+        ACCOUNT_ID, "operator cleared after manual review", actor_id=ACCOUNT_ID
+    )
+
+    assert previous.state == "reconciliation_required"
+    assert previous.last_error == "ARKADE_LIGHTNING_SWAP_FAILED"
+    assert resolved.state == "ok"
+    assert resolved.last_error is None
+    stored = await arkade.get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
+    assert stored and stored.state == "ok" and stored.last_error is None
+    audits = await connection.fetchall("SELECT * FROM audit")
+    assert len(audits) == 1
+    assert audits[0]["component"] == "arkade"
+    assert audits[0]["user_id"] == ACCOUNT_ID
+    assert "manual review" in audits[0]["request_details"]
+    assert "ARKADE_LIGHTNING_SWAP_FAILED" in audits[0]["request_details"]
+
+    previous_ok, resolved_ok = await arkade.resolve_arkade_reconciliation(
+        ACCOUNT_ID, "already resolved", actor_id=ACCOUNT_ID
+    )
+    assert previous_ok.state == "ok" and resolved_ok.state == "ok"
+    assert len(await connection.fetchall("SELECT * FROM audit")) == 1
+
+    with pytest.raises(arkade.ArkadeReconciliationError, match="NOT_FOUND"):
+        await arkade.resolve_arkade_reconciliation(
+            "cc" * 16, "unknown account", actor_id=ACCOUNT_ID
         )
 
 
@@ -1849,12 +2579,68 @@ async def test_lightning_quote_ready_is_atomic_and_idempotent(connection, monkey
 
 
 @pytest.mark.anyio
+async def test_lightning_submit_accepts_a_lockup_claimed_before_submit(
+    connection, monkeypatch
+):
+    """A browser that dies between funding and submit must still be able to
+    report the funding when it comes back, even though the solver claimed the
+    lockup in the meantime: the spend is classified from evidence later, not
+    gated at recording time."""
+    monkeypatch.setattr(
+        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
+    )
+    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", _lightning_backing)
+    monkeypatch.setattr(arkade.bolt11, "decode", lambda _bolt11: _LightningInvoice())
+    await _credit(connection, WALLET_ID, 10_000_000)
+    quote = _lightning_quote()
+    accepted, _ = await arkade.reserve_arkade_lightning_intent(
+        ACCOUNT_ID,
+        WALLET_ID,
+        quote,
+        connection,
+        idempotency_key="0a" * 16,
+    )
+
+    async def claimed_lockup(_account_id, **kwargs):
+        assert kwargs["spendable_only"] is False
+        return [
+            arkade.ArkadeIndexerVtxo(
+                txid="55" * 32,
+                vout=0,
+                amount_sat=quote.quote_from_amount_sat,
+                script=CHANGE_SCRIPT,
+                is_spent=True,
+                spent_by="88" * 32,
+                arkade_txid="99" * 32,
+            )
+        ]
+
+    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", claimed_lockup)
+    submitted = await arkade.submit_arkade_lightning_intent(
+        ACCOUNT_ID,
+        accepted.intent_id,
+        ArkadeLightningFundingEvidence(
+            ark_txid="55" * 32,
+            lockup_address=quote.lockup_address,
+            swap_rfq_id=quote.swap_rfq_id,
+            solver_pubkey=quote.solver_pubkey,
+            sender_pubkey=IDENTITY_XONLY,
+            refund_pk_script="5120" + IDENTITY_XONLY,
+        ),
+        conn=connection,
+    )
+    assert submitted.status == "submitted"
+    assert submitted.arkade_txid == "55" * 32
+
+
+@pytest.mark.anyio
 async def test_lightning_submit_records_public_funding_and_is_idempotent(
     connection, monkeypatch
 ):
     monkeypatch.setattr(
         settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
     )
+
     monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", _lightning_backing)
     monkeypatch.setattr(arkade.bolt11, "decode", lambda _bolt11: _LightningInvoice())
     await _credit(connection, WALLET_ID, 10_000_000)

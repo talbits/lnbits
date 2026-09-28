@@ -60,6 +60,8 @@ async def connection(monkeypatch):
         await migrations.m058_add_arkade_lightning_quote_fields(connection)
         await migrations.m059_create_arkade_lightning_terminal_events(connection)
         await migrations.m060_add_arkade_lightning_refund_binding(connection)
+        await migrations.m061_add_arkade_lightning_failed_state(connection)
+        await migrations.m062_extend_arkade_reconciliation_errors(connection)
         now = datetime.now(timezone.utc)
         await connection.execute(
             "INSERT INTO arkade_account_bindings "
@@ -1030,6 +1032,76 @@ def test_indexer_parser_rejects_unpinned_shapes():
                 ]
             }
         )
+
+
+async def _browser_funded_lightning_intent(connection, *, funding_txid: str):
+    """A swap the client funded itself: no inputs or change journaled."""
+    intent_id = "ee" * 16
+    now = datetime.now(timezone.utc)
+    await connection.execute(
+        "INSERT INTO arkade_outgoing_intents ("
+        "intent_id, account_id, wallet_id, amount_msat, max_fee_msat, "
+        "destination, destination_kind, status, arkade_txid, "
+        "expires_at, reserved_at) VALUES ("
+        ":intent, :account, :wallet, 1000000, 4000, 'bolt11', "
+        "'lightning', 'submitted', :arkade_txid, :expires_at, :reserved_at)",
+        {
+            "intent": intent_id,
+            "account": ACCOUNT_ID,
+            "wallet": WALLET_ID,
+            "arkade_txid": funding_txid,
+            "expires_at": now + timedelta(hours=1),
+            "reserved_at": now,
+        },
+    )
+    return intent_id
+
+
+@pytest.mark.anyio
+async def test_browser_funded_swap_attributes_spend_and_change(connection, ready_mode):
+    """Funding our own input and returning change must not flag the account."""
+    request = await _ack(connection, await _create(connection))
+    assert request.script
+    received = ArkadeIndexerVtxo(
+        txid="b1" * 32, vout=0, amount_sat=100, script=request.script
+    )
+    await arkade.reconcile_arkade_receive(ACCOUNT_ID, [received], conn=connection)
+
+    funding_txid = "b2" * 32
+    intent_id = await _browser_funded_lightning_intent(
+        connection, funding_txid=funding_txid
+    )
+    spent = received.copy(
+        update={
+            "is_spent": True,
+            "spent_by": "b3" * 32,
+            "arkade_txid": funding_txid,
+        }
+    )
+    change = ArkadeIndexerVtxo(
+        txid=funding_txid,
+        vout=1,
+        amount_sat=60,
+        script=request.script,
+        is_preconfirmed=True,
+    )
+
+    await arkade.reconcile_arkade_receive(ACCOUNT_ID, [spent, change], conn=connection)
+
+    state = await arkade.get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
+    assert state and state.state == "ok"
+    stored = await connection.fetchone(
+        "SELECT change_index, change_script, change_amount_sat "
+        "FROM arkade_outgoing_intents WHERE intent_id = :intent_id",
+        {"intent_id": intent_id},
+    )
+    assert stored is not None
+    # The wallet's change index is the client's derivation index, so the
+    # reconciler skips the change output without inventing one.
+    assert stored["change_index"] is None
+    assert stored["change_script"] is None
+    assert stored["change_amount_sat"] is None
+
     with pytest.raises(arkade.ArkadeReceiveError, match="INVALID_RESPONSE"):
         arkade.parse_indexer_vtxos(
             {

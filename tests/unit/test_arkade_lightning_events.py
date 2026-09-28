@@ -53,7 +53,12 @@ async def connection(monkeypatch):
         connection = Connection(cast(AsyncConnection, raw), SQLITE, "test", None)
         await connection.execute("CREATE TABLE accounts (id TEXT PRIMARY KEY)")
         await connection.execute(
-            'CREATE TABLE wallets (id TEXT PRIMARY KEY, "user" TEXT NOT NULL)'
+            'CREATE TABLE wallets (id TEXT PRIMARY KEY, "user" TEXT NOT NULL, '
+            "name TEXT NOT NULL, adminkey TEXT NOT NULL, inkey TEXT NOT NULL, "
+            "wallet_type TEXT NOT NULL DEFAULT 'lightning', shared_wallet_id TEXT, "
+            "deleted BOOLEAN DEFAULT false, created_at TIMESTAMP, "
+            "updated_at TIMESTAMP, "
+            "currency TEXT, lightning_address TEXT, extra TEXT, stored_paylinks TEXT)"
         )
         await connection.execute(
             "INSERT INTO accounts (id) VALUES (:account), (:other), (:wallet)",
@@ -64,8 +69,9 @@ async def connection(monkeypatch):
             },
         )
         await connection.execute(
-            'INSERT INTO wallets (id, "user") VALUES (:wallet, :account), '
-            "(:other_wallet, :other)",
+            'INSERT INTO wallets (id, "user", name, adminkey, inkey) '
+            "VALUES (:wallet, :account, 'main', 'admin', 'inkey'), "
+            "(:other_wallet, :other, 'other', 'admin2', 'inkey2')",
             {
                 "wallet": WALLET_ID,
                 "account": ACCOUNT_ID,
@@ -84,11 +90,29 @@ async def connection(monkeypatch):
             "protocol TEXT NOT NULL, "
             "native_id TEXT UNIQUE, arkade_address TEXT)"
         )
+        # get_wallet reads this view, so the fixture must mirror production.
+        await connection.execute(
+            "CREATE VIEW balances AS SELECT apipayments.wallet_id, "
+            "SUM(apipayments.amount - ABS(apipayments.fee)) AS balance "
+            "FROM wallets LEFT JOIN apipayments "
+            "ON apipayments.wallet_id = wallets.id "
+            "WHERE (wallets.deleted = false OR wallets.deleted IS NULL) "
+            "AND ((apipayments.status = 'success' AND apipayments.amount > 0) "
+            "OR (apipayments.status IN ('success', 'pending') "
+            "AND apipayments.amount < 0)) GROUP BY apipayments.wallet_id"
+        )
+        await connection.execute(
+            "CREATE TABLE arkade_reconciliation_state ("
+            "account_id TEXT PRIMARY KEY, state TEXT NOT NULL, last_error TEXT, "
+            "observed_at TIMESTAMP, updated_at TIMESTAMP)"
+        )
         await migrations.m055_create_arkade_outgoing_tables(connection)
         await migrations.m057_add_arkade_outgoing_outputs(connection)
         await migrations.m058_add_arkade_lightning_quote_fields(connection)
         await migrations.m059_create_arkade_lightning_terminal_events(connection)
         await migrations.m060_add_arkade_lightning_refund_binding(connection)
+        await migrations.m061_add_arkade_lightning_failed_state(connection)
+        await migrations.m062_extend_arkade_reconciliation_errors(connection)
         yield connection
     await engine.dispose()
 

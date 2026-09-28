@@ -12,6 +12,7 @@ _TRANSITIONS = {
     ("reserved", "submitted"),
     ("reserved", "quote_ready"),
     ("reserved", "released"),
+    ("quote_ready", "released"),
     ("quote_ready", "submitted"),
     ("submitted", "settled"),
     ("submitted", "disputed"),
@@ -100,6 +101,23 @@ async def get_arkade_submitted_outgoing_intents(
         f"WHERE {where} ORDER BY intent_id "
         "LIMIT :limit",
         values,
+        ArkadeOutgoingIntent,
+    )
+
+
+async def get_expired_arkade_outgoing_reservations(
+    limit: int = 100,
+    conn: Connection | None = None,
+) -> list[ArkadeOutgoingIntent]:
+    """Reservations past their TTL that never reported funding."""
+    database = conn or db
+    return await database.fetchall(
+        "SELECT * FROM arkade_outgoing_intents "  # noqa: S608
+        "WHERE status IN ('reserved', 'quote_ready') "
+        "AND arkade_txid IS NULL "
+        f"AND expires_at <= {database.timestamp_placeholder('now')} "
+        "ORDER BY intent_id LIMIT :limit",
+        {"now": datetime.now(timezone.utc), "limit": limit},
         ArkadeOutgoingIntent,
     )
 
@@ -535,10 +553,17 @@ async def record_arkade_lightning_funding_input(
         raise ValueError("ARKADE_LIGHTNING_FUNDING_OUTPOINT_CONFLICT")
 
 
-async def release_arkade_outgoing_intent(intent_id: str, conn: Connection) -> bool:
+async def release_arkade_outgoing_intent(
+    intent_id: str, conn: Connection, *, from_status: str = "reserved"
+) -> bool:
+    """Release an unfunded intent.
+
+    Defaults to a plain reservation; the service caller passes the observed
+    status explicitly after proving the swap carries no funding evidence.
+    """
     database = _require_active_transaction(conn)
     released = await _transition_arkade_outgoing_intent(
-        intent_id, "reserved", "released", conn=conn
+        intent_id, from_status, "released", conn=conn
     )
     if released:
         await database.execute(
@@ -689,6 +714,58 @@ async def refund_arkade_lightning_intent(
             "account_id": account_id,
             "wallet_id": wallet_id,
             "refund_ark_txid": refund_ark_txid,
+            "updated_at": now,
+        },
+    )
+    return bool(result.rowcount)
+
+
+async def fail_arkade_lightning_intent(
+    intent_id: str,
+    reason: str,
+    *,
+    account_id: str,
+    wallet_id: str,
+    conn: Connection,
+) -> bool:
+    """CAS a submitted Lightning intent to failed(reason) in the caller's tx."""
+    database = _require_active_transaction(conn)
+    intent = await _get_lightning_terminal_intent(
+        intent_id, account_id, wallet_id, database
+    )
+    if intent.status == "failed":
+        if (
+            intent.failure_reason == reason
+            and intent.actual_fee_msat is None
+            and intent.settlement_ark_txid is None
+            and intent.refund_ark_txid is None
+        ):
+            return False
+        raise ValueError("ARKADE_LIGHTNING_TERMINAL_CONFLICT")
+    if (
+        intent.status != "submitted"
+        or intent.settlement_ark_txid
+        or intent.refund_ark_txid
+    ):
+        raise ValueError("ARKADE_INTENT_INVALID_TRANSITION")
+    now = datetime.now(timezone.utc)
+    result = await database.execute(
+        f"""
+        UPDATE arkade_outgoing_intents
+        SET status = 'failed', failure_reason = :reason,
+            failed_at = {database.timestamp_placeholder('failed_at')},
+            updated_at = {database.timestamp_placeholder('updated_at')}
+        WHERE intent_id = :intent_id AND account_id = :account_id
+          AND wallet_id = :wallet_id AND destination_kind = 'lightning'
+          AND status = 'submitted' AND settlement_ark_txid IS NULL
+          AND refund_ark_txid IS NULL
+        """,  # noqa: S608
+        {
+            "intent_id": intent_id,
+            "account_id": account_id,
+            "wallet_id": wallet_id,
+            "reason": reason,
+            "failed_at": now,
             "updated_at": now,
         },
     )

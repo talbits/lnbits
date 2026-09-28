@@ -11,7 +11,7 @@ from lnbits.core.models import Payment, PaymentState
 from lnbits.core.models.arkade import ArkadeLightningTerminalEvent
 from lnbits.db import Connection
 
-TerminalState = Literal["settled", "refunded", "disputed"]
+TerminalState = Literal["settled", "refunded", "failed", "disputed"]
 DeliveryChannel = Literal["listeners", "webhook"]
 MAX_RETRY_DELAY_SECONDS = 60 * 60
 
@@ -88,6 +88,7 @@ async def _validate_terminal_event(  # noqa: C901
     expected_status = {
         "settled": PaymentState.SUCCESS.value,
         "refunded": PaymentState.FAILED.value,
+        "failed": PaymentState.FAILED.value,
         "disputed": PaymentState.PENDING.value,
     }[terminal_state]
     if persisted_payment.status != expected_status:
