@@ -151,6 +151,34 @@ async def api_payments_pay_lnurl(
             detail="Missing LNURL or LnurlPayResponse data.",
         )
 
+    res, res2, extra = await _prepare_lnurl_payment(data, wallet)
+
+    payment = await pay_invoice(
+        wallet_id=wallet.wallet.id,
+        payment_request=str(res2.pr),
+        description=res.metadata.text,
+        extra=extra,
+    )
+
+    return payment
+
+
+@lnurl_router.post("/api/v1/payments/lnurl/prepare")
+async def api_payments_prepare_lnurl(
+    data: CreateLnurlPayment, wallet: WalletTypeInfo = Depends(require_admin_key)
+) -> dict[str, Any]:
+    """Resolve an LNURL-pay request without paying its returned invoice."""
+    res, res2, extra = await _prepare_lnurl_payment(data, wallet)
+    return {
+        "payment_request": str(res2.pr),
+        "description": res.metadata.text,
+        "extra": extra,
+    }
+
+
+async def _prepare_lnurl_payment(
+    data: CreateLnurlPayment, wallet: WalletTypeInfo
+) -> tuple[Any, Any, dict[str, Any]]:
     try:
         res, res2 = await fetch_lnurl_pay_request(data=data, wallet=wallet.wallet)
     except LnurlResponseException as exc:
@@ -169,15 +197,7 @@ async def api_payments_pay_lnurl(
     if data.unit and data.unit != "sat":
         extra["fiat_currency"] = data.unit
         extra["fiat_amount"] = data.amount / 1000
-
-    payment = await pay_invoice(
-        wallet_id=wallet.wallet.id,
-        payment_request=str(res2.pr),
-        description=res.metadata.text,
-        extra=extra,
-    )
-
-    return payment
+    return res, res2, extra
 
 
 async def _check_extension_well_known(

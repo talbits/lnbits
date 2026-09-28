@@ -30,6 +30,7 @@ from lnbits.core.views.lnurl_api import (
     api_lnurlscan,
     api_lnurlscan_post,
     api_payments_pay_lnurl,
+    api_payments_prepare_lnurl,
     api_perform_lnurlauth,
 )
 from tests.helpers import make_lnurl_pay_response
@@ -41,6 +42,20 @@ TEST_BOLT11 = (
     "73aym6ynrdl9nkzqnag49vt3sjjn8qdfq5cr6ha0vrdz5c5r3v4aghndly0hplmv"
     "6hjxepwp93cq398l3s"
 )
+
+
+def _created_invoice(bolt11: str = TEST_BOLT11) -> SimpleNamespace:
+    """Stand-in for the Payment returned by create_invoice.
+
+    lightning_address reads payment.lightning_identifiers, so the stub carries
+    the same identity triplet a Lightning payment would.
+    """
+    return SimpleNamespace(
+        bolt11=bolt11,
+        checking_id="aa" * 32,
+        payment_hash="bb" * 32,
+        lightning_identifiers=("aa" * 32, "bb" * 32, bolt11),
+    )
 
 
 @pytest.mark.anyio
@@ -76,7 +91,7 @@ async def test_wallet_lightning_address_lookup_and_callback(
 
     create_invoice_mock = mocker.patch(
         "lnbits.core.services.lightning_address.create_invoice",
-        mocker.AsyncMock(return_value=SimpleNamespace(bolt11=TEST_BOLT11)),
+        mocker.AsyncMock(return_value=_created_invoice()),
     )
     callback = tagged_data["callback"].split("testserver")[-1]
     callback_response = await client.get(f"{callback}?amount=21000&comment=hello")
@@ -230,3 +245,34 @@ async def test_lnurl_api_auth_and_pay_flow(mocker):
 
     with pytest.raises(HTTPException, match="Missing LNURL or LnurlPayResponse data."):
         await api_payments_pay_lnurl(CreateLnurlPayment(amount=1), wallet_info)
+
+
+@pytest.mark.anyio
+async def test_lnurl_prepare_returns_invoice_without_paying(mocker):
+    wallet_info = SimpleNamespace(
+        key_type=KeyType.admin, wallet=SimpleNamespace(id=uuid4().hex)
+    )
+    pay_response = make_lnurl_pay_response()
+    action_response = LnurlPayActionResponse(
+        pr=cast(LightningInvoice, LightningInvoice(TEST_BOLT11)),
+        disposable=False,
+        successAction=parse_obj_as(MessageAction, {"message": "paid"}),
+    )
+    fetch_mock = mocker.patch(
+        "lnbits.core.views.lnurl_api.fetch_lnurl_pay_request",
+        mocker.AsyncMock(return_value=(pay_response, action_response)),
+    )
+    pay_mock = mocker.patch("lnbits.core.views.lnurl_api.pay_invoice")
+
+    prepared = await api_payments_prepare_lnurl(
+        CreateLnurlPayment(res=pay_response, amount=2_000, unit="sat"),
+        wallet_info,
+    )
+
+    assert prepared["payment_request"] == TEST_BOLT11
+    assert prepared["extra"] == {
+        "stored": True,
+        "success_action": action_response.successAction.json(),
+    }
+    fetch_mock.assert_awaited_once()
+    pay_mock.assert_not_awaited()
