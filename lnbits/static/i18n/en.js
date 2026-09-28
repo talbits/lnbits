@@ -150,6 +150,7 @@ window.localisation.en = {
   payment_processing: 'Processing payment...',
   payment_successful: 'Payment successful!',
   payment_pending: 'Payment pending...',
+  payment_error_message: 'The payment could not be started',
   payment_check: 'Check payment',
   not_enough_funds: 'Not enough funds!',
   search_by_tag_memo_amount: 'Search by tag, memo, amount',

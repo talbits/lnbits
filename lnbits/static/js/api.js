@@ -196,6 +196,13 @@ window._lnbitsApi = {
       data: fundingEvidence
     })
   },
+  arkadeLightningFailed(intentId, reason) {
+    return axios({
+      method: 'POST',
+      url: `/api/v1/arkade/outgoing/${intentId}/fail`,
+      data: {reason}
+    })
+  },
   login(username, password) {
     return axios({
       method: 'POST',

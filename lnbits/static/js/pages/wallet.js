@@ -1,3 +1,22 @@
+const arkadeReceiveBip21 = (address, amountMsat) => {
+  if (
+    typeof address !== 'string' ||
+    !address ||
+    !Number.isSafeInteger(amountMsat) ||
+    amountMsat < 1000 ||
+    amountMsat % 1000 !== 0
+  )
+    return ''
+
+  const satoshis = BigInt(amountMsat) / 1000n
+  const whole = satoshis / 100_000_000n
+  const fraction = (satoshis % 100_000_000n)
+    .toString()
+    .padStart(8, '0')
+    .replace(/0+$/, '')
+  return `bitcoin:?ark=${address}&amount=${whole}${fraction ? `.${fraction}` : ''}`
+}
+
 window.PageWallet = {
   template: '#page-wallet',
   data() {
@@ -144,6 +163,12 @@ window.PageWallet = {
     },
     formattedSatAmount() {
       return LNbits.utils.formatMsat(this.receive.amountMsat) + ' sat'
+    },
+    arkadeReceivePayload() {
+      return arkadeReceiveBip21(
+        this.receive.paymentReq,
+        this.receive.amountMsat
+      )
     },
     totalBreakdownTags() {
       const tags = this.totalBreakdown.rows.map(row => row.tag || null)
@@ -744,8 +769,61 @@ window.PageWallet = {
         this.parse.sending = false
       }
     },
+    async payArkadeLightning(bolt11) {
+      let prepared
+      try {
+        prepared = await window.ArkadeEnrollment.prepareLightningSend(bolt11)
+      } catch (error) {
+        // The enrollment bundle only emits the generic message plus a code it
+        // recognised from the backend. Show the localized message and keep the
+        // stable code as the caption for diagnosis.
+        const recognized =
+          typeof error?.message === 'string' &&
+          /^payment_error_message \(ARKADE_[A-Z_]+\)$/.test(error.message)
+        this.$q.notify({
+          type: 'warning',
+          message: this.$t('payment_error_message'),
+          caption: recognized
+            ? error.message.replace(/^.*\((.*)\)$/, '$1')
+            : null,
+          closeBtn: true
+        })
+        return
+      }
+      // PAY pays, like the custodial flow: no separate confirmation dialog.
+      try {
+        await window.ArkadeEnrollment.submitLightningSend(prepared.intentId, {
+          approved: true
+        })
+      } catch (error) {
+        // Funding problems are client-side and carry no response, so surface
+        // them instead of failing silently with the send form still open.
+        this.$q.notify({
+          type: 'warning',
+          message: this.$t('payment_error_message'),
+          caption: null,
+          closeBtn: true
+        })
+        return
+      }
+      this.parse.show = false
+      this.g.updatePayments = !this.g.updatePayments
+      Quasar.Notify.create({type: 'info', message: this.$t('payment_pending')})
+    },
     payInvoice() {
       if (this.parse.sending) return
+
+      if (this.g.user?.installationMode === 'arkade_noncustodial') {
+        this.parse.sending = true
+        return this.payArkadeLightning(this.parse.data.request)
+          .catch(err => {
+            // Preparation failures already surfaced their own notice.
+            if (err?.response) LNbits.utils.notifyApiError(err)
+          })
+          .finally(() => {
+            this.parse.sending = false
+          })
+      }
 
       this.parse.sending = true
       const dismissPaymentMsg = Quasar.Notify.create({
@@ -788,6 +866,32 @@ window.PageWallet = {
       if (this.parse.sending) return
 
       this.parse.sending = true
+      if (this.g.user?.installationMode === 'arkade_noncustodial') {
+        return LNbits.api
+          .request(
+            'post',
+            '/api/v1/payments/lnurl/prepare',
+            this.g.wallet.adminkey,
+            {
+              res: this.parse.lnurlpay,
+              lnurl: this.parse.data.request,
+              unit: this.parse.data.unit,
+              amount: this.parse.data.amount * 1000,
+              comment: this.parse.data.comment,
+              internalMemo: this.parse.data.internalMemo
+            }
+          )
+          .then(response =>
+            this.payArkadeLightning(response.data.payment_request)
+          )
+          .catch(err => {
+            // Arkade preparation failures already surfaced their own notice.
+            if (err?.response) LNbits.utils.notifyApiError(err)
+          })
+          .finally(() => {
+            this.parse.sending = false
+          })
+      }
       LNbits.api
         .request('post', '/api/v1/payments/lnurl', this.g.wallet.adminkey, {
           res: this.parse.lnurlpay,

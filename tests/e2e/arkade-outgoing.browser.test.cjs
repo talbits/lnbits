@@ -191,6 +191,10 @@ const makeFixture = ({amountSat, inputValue, dust = 100, store} = {}) => {
   wallet.lockOnRefresh = false
   const manager = {
     annotateVtxos: async inputs => inputs,
+    createContract: async () => {},
+    getContracts: async () => [],
+    onContractEvent: () => () => {},
+    setContractWatchState: async () => {},
     refreshVtxos: async options => {
       wallet.refreshArgs.push(options)
       if (wallet.lockOnRefresh) {
@@ -332,6 +336,12 @@ const makeIndexedDb = store => {
                   objectStore.records.set(value[objectStore.keyPath], value)
                   Promise.resolve().then(() => operation.onsuccess?.())
                   return operation
+                },
+                delete: key => {
+                  const operation = {transaction}
+                  objectStore.records.delete(key)
+                  Promise.resolve().then(() => operation.onsuccess?.())
+                  return operation
                 }
               }),
               abort: () => {
@@ -381,7 +391,52 @@ const makeWindow = (store = new Map()) => {
 }
 
 const makeLightningFixture = () => {
-  const fixture = makeFixture({amountSat: 500, inputValue: 1_000})
+  // One plan record from an earlier bundle, in the store before this bundle
+  // opens the database: the plan schema version is its own, so a database
+  // version bump must not make an old record unreadable.
+  const store = new Map()
+  const databases = new Map()
+  const database = {stores: new Map()}
+  database.stores.set('plans', {
+    keyPath: 'intentId',
+    records: new Map([
+      [
+        'ef'.repeat(16),
+        {
+          version: 1,
+          accountId,
+          walletId,
+          idempotencyKey: 'ab'.repeat(16),
+          bolt11: 'lnbc-earlier-bundle-record',
+          paymentHash: 'cd'.repeat(32),
+          intentId: 'ef'.repeat(16),
+          intentExpiresAt: Math.floor(Date.now() / 1000) + 600,
+          publicQuote: {
+            payment_hash: 'cd'.repeat(32),
+            amount_msat: 500_000,
+            max_fee_msat: 2_000,
+            quote_pair: 'arkade:BTC->lightning:BTC',
+            quote_from_amount_sat: 501,
+            quote_to_amount_sat: 500,
+            quote_valid_until: Math.floor(Date.now() / 1000) + 600,
+            refund_locktime: Math.floor(Date.now() / 1000) + 20_000,
+            solver_pubkey:
+              '66422c952f8dcb96e4d0c3f049cd1e265b8461b916d9913c65c2494b64b4e3ce',
+            swap_rfq_id: 'earlier-bundle-rfq',
+            lockup_address: 'tark1qqearlierbundlerecord'
+          },
+          senderPubkey: '11'.repeat(32),
+          refundPkScript: '5120',
+          fundingState: 'submitted',
+          fundingArkTxid: 'ee'.repeat(32)
+        }
+      ]
+    ])
+  })
+  database.stores.set('rfqSwaps', {keyPath: 'rfqId', records: new Map()})
+  databases.set('lnbits-arkade-lightning-v1', database)
+  store.set('__indexeddb__', databases)
+  const fixture = makeFixture({amountSat: 500, inputValue: 1_000, store})
   const lightningBolt11 = 'lnbc-lightning-browser-test'
   const paymentHash = 'ab'.repeat(32)
   const solverPubkey =
@@ -406,6 +461,8 @@ const makeLightningFixture = () => {
     rfqId: quote.rfq_id,
     quote,
     address: fixture.destination.encode(),
+    swapPkScript: ArkAddress.decode(fixture.destination.encode()).pkScript,
+    script: fixture.destinationScript,
     fundAmount: quote.from_amount,
     senderPubkey: Buffer.from('12'.repeat(32), 'hex'),
     secrets: {
@@ -479,6 +536,16 @@ const makeLightningFixture = () => {
           data
         })
         state.status = 'submitted'
+        return {data: intent()}
+      },
+      arkadeLightningFailed: async (id, reason) => {
+        requests.push({
+          method: 'FAIL',
+          url: '/api/v1/arkade/outgoing/fail',
+          id,
+          reason
+        })
+        state.status = 'failed'
         return {data: intent()}
       }
     }
@@ -619,6 +686,11 @@ async function lightningBrowserChecks() {
     JSON.stringify(request)
   ))
     for (const value of forbidden) assert.equal(artifact.includes(value), false)
+  // The swap manager polls until the page locks, which the browser does on
+  // `pagehide`. Registration fails loudly in this fixture on purpose: its
+  // lockup script is a DefaultVtxo script, not the VHTLC the manager
+  // registers, and the test asserts nothing about registration.
+  duplicate.window.ArkadeEnrollment.lock()
 }
 
 async function main() {

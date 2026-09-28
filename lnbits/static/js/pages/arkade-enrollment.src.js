@@ -15,9 +15,15 @@ import {
 } from '@arkade-os/sdk'
 import {
   assertFundable,
+  arkadeRefunder,
+  createRfqSwapRecord,
   lockupContractParams,
   rebuildRfqSwap,
   requestLightningSend,
+  RfqSwapManager,
+  rfqSecretsProfile,
+  rfqSignerOf,
+  senderIdentityForSwapRecord,
   verifyLockupAddress
 } from '@arkade-os/swap'
 import {nostrRfqTransport} from '@arkade-os/swap/nostr'
@@ -28,12 +34,63 @@ const STORE_NAME = 'vaults'
 const VAULT_VERSION = 1
 const PBKDF2_ITERATIONS = 6e5
 const IDLE_TIMEOUT_MS = 15 * 60 * 1e3
+const MUTINYNET_CHECKPOINT_EXIT_DELAY_SECONDS = 512n
 const HEX32 = /^[0-9a-f]{32}$/
 const HEX64 = /^[0-9a-f]{64}$/
 const NETWORK = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/
 const IDENTITY_DESCRIPTOR =
   /^tr\(\[[0-9a-f]{8}\/86'\/[01]'\/0'\](?:xpub|tpub)[1-9A-HJ-NP-Za-km-z]+\/0\/\*\)$/
 const isValidPin = value => value === '' || /^\d{6}$/.test(value)
+// Public outgoing codes mirrored from lnbits/core/views/arkade_api.py. Only the
+// generic message and a recognised code may reach the UI; never the raw
+// response, request, keys, preimages or claim packets.
+const OUTGOING_ERROR_CODES = /* @__PURE__ */ new Set([
+  'ARKADE_ENROLLMENT_REQUIRED',
+  'ARKADE_INTENT_INVALID_TRANSITION',
+  'ARKADE_OUTGOING_ACCOUNT_MISMATCH',
+  'ARKADE_OUTGOING_AMOUNT_INVALID',
+  'ARKADE_OUTGOING_BUSY',
+  'ARKADE_OUTGOING_CORRUPT',
+  'ARKADE_OUTGOING_EXPIRED',
+  'ARKADE_OUTGOING_IDEMPOTENCY_CONFLICT',
+  'ARKADE_OUTGOING_INDEXER_INVALID',
+  'ARKADE_OUTGOING_INDEXER_UNAVAILABLE',
+  'ARKADE_OUTGOING_INPUT_CONFLICT',
+  'ARKADE_OUTGOING_INPUT_UNAVAILABLE',
+  'ARKADE_OUTGOING_INPUT_UNREGISTERED',
+  'ARKADE_OUTGOING_INPUT_VALUE_MISMATCH',
+  'ARKADE_OUTGOING_INPUTS_INVALID',
+  'ARKADE_OUTGOING_INPUTS_MISSING',
+  'ARKADE_OUTGOING_INVALID_REQUEST',
+  'ARKADE_OUTGOING_NOT_ALLOWED',
+  'ARKADE_OUTGOING_NOT_FOUND',
+  'ARKADE_OUTGOING_OUTPUT_CONFLICT',
+  'ARKADE_OUTGOING_OUTPUT_INVALID',
+  'ARKADE_OUTGOING_UNAVAILABLE',
+  'ARKADE_BACKING_DEFICIT',
+  'ARKADE_BACKING_RECONCILIATION_REQUIRED',
+  'ARKADE_DESCRIPTOR_REENROLLMENT_REQUIRED',
+  'ARKADE_INSUFFICIENT_FUNDS',
+  'ARKADE_TRANSACTION_ID_INVALID',
+  'ARKADE_TRANSFER_AMOUNT_CONFLICT',
+  'ARKADE_TRANSFER_CORRUPT',
+  'ARKADE_TRANSFER_CROSS_ACCOUNT_REQUIRED',
+  'ARKADE_TRANSFER_DESTINATION_NOT_FOUND',
+  'ARKADE_TRANSFER_EXPIRED',
+  'ARKADE_TRANSFER_MAPPING_NOT_READY',
+  'ARKADE_TRANSFER_RECEIVER_INVALID',
+  'ARKADE_TRANSFER_RECEIVER_NOT_ALLOWED',
+  'ARKADE_TRANSFER_REQUEST_CONSUMED',
+  'ARKADE_TRANSFER_SAME_WALLET',
+  'ARKADE_WALLET_NOT_OWNED'
+])
+const outgoingErrorCode = error =>
+  error?.response?.data?.detail &&
+  OUTGOING_ERROR_CODES.has(error.response.data.detail)
+    ? error.response.data.detail
+    : ''
+const outgoingErrorMessage = error =>
+  `payment_error_message (${outgoingErrorCode(error)})`
 const enrollmentErrorCode = error => {
   const value = error
   const detail = value?.response?.data?.detail
@@ -52,7 +109,14 @@ const MAX_OUTGOING_JOURNAL_RECORDS = 32
 const MAX_OUTGOING_JOURNAL_BYTES = 128 * 1024
 const LIGHTNING_JOURNAL_DB_NAME = 'lnbits-arkade-lightning-v1'
 const LIGHTNING_JOURNAL_STORE_NAME = 'plans'
-const LIGHTNING_JOURNAL_VERSION = 1
+// The swap manager's own records live in the same database, one store over.
+// Version 2 adds that store; the bump is one-way, like the swap package's own
+// repository: an older bundle cannot open a v2 database.
+const LIGHTNING_SWAP_STORE_NAME = 'rfqSwaps'
+const LIGHTNING_JOURNAL_VERSION = 2
+// The stored plan's own schema, which is independent of the database version
+// above: a bump there must not invalidate records an earlier bundle wrote.
+const LIGHTNING_JOURNAL_RECORD_VERSION = 1
 const LIGHTNING_JOURNAL_STATES = /* @__PURE__ */ new Set([
   'quote_ready',
   'funding',
@@ -61,12 +125,30 @@ const LIGHTNING_JOURNAL_STATES = /* @__PURE__ */ new Set([
   'failed'
 ])
 const LIGHTNING_RELAY = 'wss://nostr.arkade.sh'
-const LIGHTNING_SOLVER_PUBKEY =
-  '66422c952f8dcb96e4d0c3f049cd1e265b8461b916d9913c65c2494b64b4e3ce'
+const LIGHTNING_NETWORK_CONFIG = {
+  bitcoin: {
+    solverPubkey:
+      '66422c952f8dcb96e4d0c3f049cd1e265b8461b916d9913c65c2494b64b4e3ce',
+    minQuoteAmountSat: 500,
+    maxQuoteAmountSat: 50000
+  },
+  mutinynet: {
+    solverPubkey:
+      '3f831510a6d7678d0c90d7d6fbc4057720517e2e30681ef4c87cc57aaf57e8d5',
+    minQuoteAmountSat: 1000,
+    maxQuoteAmountSat: 25000
+  },
+  regtest: {
+    solverPubkey:
+      '66422c952f8dcb96e4d0c3f049cd1e265b8461b916d9913c65c2494b64b4e3ce',
+    minQuoteAmountSat: 500,
+    maxQuoteAmountSat: 50000
+  }
+}
+const lightningNetworkConfig = network =>
+  LIGHTNING_NETWORK_CONFIG[network] || LIGHTNING_NETWORK_CONFIG.bitcoin
 const LIGHTNING_QUOTE_PAIR = 'arkade:BTC->lightning:BTC'
 const LIGHTNING_FEE_BPS = 30
-const LIGHTNING_MIN_AMOUNT_SAT = 500
-const LIGHTNING_MAX_AMOUNT_SAT = 50_000
 const LIGHTNING_REFUND_HEADROOM_SECONDS = 10_800
 const OUTGOING_PHASES = /* @__PURE__ */ new Set([
   'prepared',
@@ -341,7 +423,7 @@ const strictLightningJournalRecord = value => {
   )
     return false
   return (
-    record.version === LIGHTNING_JOURNAL_VERSION &&
+    record.version === LIGHTNING_JOURNAL_RECORD_VERSION &&
     typeof record.accountId === 'string' &&
     HEX32.test(record.idempotencyKey) &&
     typeof record.bolt11 === 'string' &&
@@ -391,15 +473,23 @@ const openLightningJournal = () =>
         request.result.createObjectStore(LIGHTNING_JOURNAL_STORE_NAME, {
           keyPath: 'intentId'
         })
+      if (!request.result.objectStoreNames.contains(LIGHTNING_SWAP_STORE_NAME))
+        request.result.createObjectStore(LIGHTNING_SWAP_STORE_NAME, {
+          keyPath: 'rfqId'
+        })
     }
     request.onsuccess = () => resolve(request.result)
     request.onerror = () => reject(new Error('Lightning journal unavailable'))
   })
-const lightningJournalTransaction = async (mode, operation) => {
+const lightningJournalTransaction = async (
+  mode,
+  operation,
+  storeName = LIGHTNING_JOURNAL_STORE_NAME
+) => {
   const db = await openLightningJournal()
   return new Promise((resolve, reject) => {
-    const transaction = db.transaction(LIGHTNING_JOURNAL_STORE_NAME, mode)
-    const store = transaction.objectStore(LIGHTNING_JOURNAL_STORE_NAME)
+    const transaction = db.transaction(storeName, mode)
+    const store = transaction.objectStore(storeName)
     let result
     transaction.oncomplete = () => {
       db.close?.()
@@ -483,6 +573,222 @@ const findLightningJournalPlan = async (accountId, facts) => {
         record.fundingState !== 'failed'
     )
 }
+const removeLightningJournalRecord = intentId =>
+  lightningJournalTransaction('readwrite', (store, set) => {
+    store.delete(intentId)
+    set(true)
+  })
+// The four-method record store `RfqSwapManager` persists through. Records are
+// plain JSON; the covenant itself is not stored here - it lives in the
+// wallet's contract row, which `requestLightningSend` writes before the
+// address can be funded and `rebuildRfqSwap` reads back on restore.
+const lightningSwapRecords = {
+  saveRfqSwap: record =>
+    lightningJournalTransaction(
+      'readwrite',
+      (store, set) => {
+        store.put(record)
+        set(record)
+      },
+      LIGHTNING_SWAP_STORE_NAME
+    ),
+  getRfqSwap: rfqId =>
+    lightningJournalTransaction(
+      'readonly',
+      (store, set) => {
+        const request = store.get(rfqId)
+        request.onsuccess = () => set(request.result)
+        request.onerror = () => request.transaction?.abort?.()
+      },
+      LIGHTNING_SWAP_STORE_NAME
+    ),
+  getAllRfqSwaps: () =>
+    lightningJournalTransaction(
+      'readonly',
+      (store, set) => {
+        const request = store.getAll()
+        request.onsuccess = () => set(request.result || [])
+        request.onerror = () => request.transaction?.abort?.()
+      },
+      LIGHTNING_SWAP_STORE_NAME
+    ),
+  removeRfqSwap: rfqId =>
+    lightningJournalTransaction(
+      'readwrite',
+      (store, set) => {
+        store.delete(rfqId)
+        set(true)
+      },
+      LIGHTNING_SWAP_STORE_NAME
+    )
+}
+let lightningSwapManager = null
+let lightningSwapManagerKey = ''
+let lightningSwapManagerStarted = false
+const stopLightningSwapManager = () => {
+  const manager = lightningSwapManager
+  lightningSwapManager = null
+  lightningSwapManagerKey = ''
+  lightningSwapManagerStarted = false
+  if (manager) void manager.stop().catch(() => {})
+}
+// One manager per (account, network, server). The store is per browser, not
+// per account, so another LNbits account's records restore here too; they
+// rebuild only while their lockup contract row is in this wallet, and a
+// foreign descriptor makes the refund callback refuse rather than push.
+const lightningSwapManagerFor = async (accountId, wallet) => {
+  const key = JSON.stringify([
+    accountId,
+    activeBinding?.network,
+    activeBinding?.server_url
+  ])
+  if (lightningSwapManager && lightningSwapManagerKey === key)
+    return lightningSwapManager
+  stopLightningSwapManager()
+  const manager = new RfqSwapManager(
+    {
+      indexer: wallet.indexerProvider,
+      contracts: await wallet.getContractManager(),
+      repository: lightningSwapRecords
+    },
+    {
+      events: {
+        onSwapCompleted: swap => {
+          void dropLightningPlanForSwap(accountId, swap.rfqId).catch(() => {})
+        },
+        onSwapFailed: (swap, error) => {
+          // Every thrown action reports here, including ones the manager
+          // retries; only the terminal failed swap is a server-visible state.
+          if (swap.state !== 'failed') {
+            console.error(`Arkade Lightning swap ${swap.rfqId} error`, error)
+            return
+          }
+          void reportLightningSwapFailure(accountId, swap, error).catch(
+            reportError => {
+              console.error(
+                `Arkade Lightning swap ${swap.rfqId} failure report failed`,
+                reportError
+              )
+            }
+          )
+        }
+      }
+    }
+  )
+  manager.setCallbacks({
+    refundArkade: arkadeRefunder({
+      ark: wallet.arkProvider,
+      indexer: wallet.indexerProvider,
+      wallet,
+      repository: lightningSwapRecords
+    }),
+    // Readiness is only "can this wallet derive the signer". The deadline is
+    // the manager's business.
+    canRefundArkade: async swap => {
+      const record = await lightningSwapRecords.getRfqSwap(swap.rfqId)
+      // A swap admitted in this same pass has no record yet: answer yes and
+      // let the push's own signer resolution refuse if it really cannot.
+      if (!record) return {ok: true}
+      try {
+        await senderIdentityForSwapRecord(wallet, rfqSignerOf(record) || {})
+        return {ok: true}
+      } catch {
+        return {ok: false, reason: 'local refund key unavailable'}
+      }
+    }
+  })
+  lightningSwapManager = manager
+  lightningSwapManagerKey = key
+  return manager
+}
+const ensureLightningSwapManager = async (accountId, wallet) => {
+  const manager = await lightningSwapManagerFor(accountId, wallet)
+  if (!lightningSwapManagerStarted) {
+    // Restore before start, so a swap funded in an earlier session is
+    // monitored again - including its refund push, which only the manager
+    // makes.
+    const restored = await manager.restoreFromRepository()
+    await manager.start()
+    lightningSwapManagerStarted = true
+    for (const failure of restored.failed)
+      console.error(
+        `Arkade Lightning swap ${failure.rfqId} could not be restored`,
+        failure.error
+      )
+  }
+  return manager
+}
+// Watching the wallet page restores in-flight swaps - including the refund
+// push, which only the manager makes. Nothing stored means nothing to watch,
+// so the poll timer stays off for a wallet with no Lightning swaps.
+const restoreLightningSwaps = async (accountId, wallet) => {
+  const records = await lightningSwapRecords.getAllRfqSwaps()
+  if (records.length === 0) return null
+  return ensureLightningSwapManager(accountId, wallet)
+}
+const dropLightningPlanForSwap = async (accountId, rfqId) => {
+  const record = await lightningPlanForSwap(accountId, rfqId)
+  if (record) await removeLightningJournalRecord(record.intentId)
+}
+const lightningPlanForSwap = async (accountId, rfqId) => {
+  const records = await readLightningJournal(accountId)
+  return (
+    records.find(record => record.publicQuote.swap_rfq_id === rfqId) || null
+  )
+}
+// One report per intent per page, but a failed report is retried: the manager
+// re-emits while the swap keeps failing to claim.
+const reportedLightningFailures = new Set()
+const reportedFailureReason = error => {
+  const message = typeof error?.message === 'string' ? error.message : ''
+  const cleaned = message
+    .replace(/[^A-Za-z0-9_.:\- ]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 200)
+  return cleaned || 'ARKADE_SWAP_FAILED'
+}
+const reportLightningSwapFailure = async (accountId, swap, error) => {
+  const record = await lightningPlanForSwap(accountId, swap.rfqId)
+  if (!record || reportedLightningFailures.has(record.intentId)) return
+  reportedLightningFailures.add(record.intentId)
+  try {
+    await LNbits.api.arkadeLightningFailed(
+      record.intentId,
+      reportedFailureReason(error)
+    )
+  } catch (reportError) {
+    reportedLightningFailures.delete(record.intentId)
+    throw reportError
+  }
+  await removeLightningJournalRecord(record.intentId)
+}
+const lightningSwapFromPlan = (plan, now) => ({
+  kind: 'lightning_send',
+  rfqId: plan.swap.rfqId,
+  state: 'pending',
+  lockupPkScript: plan.swap.swapPkScript,
+  lockup: {script: plan.swap.script, address: plan.swap.address},
+  paymentHash: plan.facts.paymentHash,
+  refundLocktime: plan.swap.quote.refund_locktime,
+  createdAt: now,
+  updatedAt: now
+})
+// Hand a funded lockup to the manager, once. The origin carries what the live
+// swap cannot: the corridor, the funded address, the refund signer and the
+// funding txid, and it is what lets the manager write this swap's first record.
+const trackLightningSwap = async (plan, arkTxid) => {
+  const now = Math.floor(Date.now() / 1000)
+  const swap = lightningSwapFromPlan(plan, now)
+  const manager = await ensureLightningSwapManager(plan.accountId, plan.wallet)
+  await manager.addSwap(swap, {
+    kind: 'lightning_send',
+    lockupAddress: plan.swap.address,
+    profile: rfqSecretsProfile(plan.swap.secrets, plan.facts.paymentHash),
+    amount: plan.swap.fundAmount,
+    fundingArkTxid: arkTxid
+  })
+}
 const reconcileTerminalOutgoing = async (accountId, journal) => {
   for (const record of journal) {
     try {
@@ -500,8 +806,14 @@ const reconcileTerminalOutgoing = async (accountId, journal) => {
   return readOutgoingJournal(accountId)
 }
 const expirySeconds = value => {
-  const seconds =
-    typeof value === 'number' ? value : Date.parse(String(value)) / 1e3
+  // Backend timestamps are UTC. A bare ISO string would be parsed as local
+  // time, and they carry microseconds while `Date.parse` only keeps
+  // milliseconds, so round down to the whole second before comparing.
+  const text = String(value)
+  const utcText = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(text) ? text : `${text}Z`
+  const seconds = Math.floor(
+    typeof value === 'number' ? value : Date.parse(utcText) / 1e3
+  )
   if (!Number.isSafeInteger(seconds) || seconds < 0)
     throw new Error('invalid receive expiry')
   return seconds
@@ -774,6 +1086,10 @@ const getAllocationWallet = async (accountId, binding) => {
       contractRepository: new IndexedDBContractRepository(repositoryName)
     },
     walletMode: 'hd',
+    minCheckpointExitDelaySeconds:
+      binding.network === 'mutinynet'
+        ? MUTINYNET_CHECKPOINT_EXIT_DELAY_SECONDS
+        : void 0,
     settlementConfig: false
   })
   allocationWalletKey = key
@@ -823,8 +1139,9 @@ const lightningInvoiceFacts = bolt11 => {
     expiresAt
   }
 }
+// The card charges its spread on the funded amount, not the net invoice.
 const lightningMaxFeeSat = amountSats =>
-  Math.max(1, Math.ceil((amountSats * LIGHTNING_FEE_BPS) / 10_000))
+  Math.ceil((amountSats * LIGHTNING_FEE_BPS) / (10_000 - LIGHTNING_FEE_BPS))
 const lightningMaxFeeMsat = amountSats => lightningMaxFeeSat(amountSats) * 1000
 const lightningPublicQuote = (facts, swap) => {
   const quote = swap?.quote
@@ -843,7 +1160,10 @@ const lightningPublicQuote = (facts, swap) => {
     quote.rfq_id !== swap.rfqId
   )
     throw new Error('Arkade Lightning quote binding changed')
-  if (quote.solver_pubkey !== LIGHTNING_SOLVER_PUBKEY)
+  if (
+    quote.solver_pubkey !==
+    lightningNetworkConfig(activeBinding?.network).solverPubkey
+  )
     throw new Error('Arkade Lightning solver is not approved')
   if (
     quote.to_amount !== facts.amountSats ||
@@ -915,7 +1235,8 @@ const sameLightningBinding = (
       intent.quote_to_amount_sat === publicQuote.quote_to_amount_sat &&
       expirySeconds(intent.quote_valid_until) === sdkQuote.valid_until &&
       intent.refund_locktime === sdkQuote.refund_locktime &&
-      intent.solver_pubkey === LIGHTNING_SOLVER_PUBKEY &&
+      intent.solver_pubkey ===
+        lightningNetworkConfig(activeBinding?.network).solverPubkey &&
       intent.solver_pubkey === sdkQuote.solver_pubkey &&
       intent.swap_rfq_id === sdkQuote.rfq_id &&
       intent.swap_rfq_id === swap.rfqId &&
@@ -1017,7 +1338,7 @@ const restoreLightningSwap = async (wallet, record) => {
 const lightningJournalFromPlan = plan => ({
   // IndexedDB stores only public intent/quote and funding state. The live
   // swap's secrets are reconstructed from the wallet's registered contract.
-  version: LIGHTNING_JOURNAL_VERSION,
+  version: LIGHTNING_JOURNAL_RECORD_VERSION,
   accountId: plan.accountId,
   walletId: plan.intent.wallet_id,
   idempotencyKey: plan.idempotencyKey,
@@ -1073,9 +1394,10 @@ const prepareLightningSend = async bolt11 => {
   if (!identity || !activeBinding || activeBinding.state !== 'ready')
     throw new Error('wallet is locked')
   const facts = lightningInvoiceFacts(bolt11)
+  const networkConfig = lightningNetworkConfig(activeBinding.network)
   if (
-    facts.amountSats < LIGHTNING_MIN_AMOUNT_SAT ||
-    facts.amountSats > LIGHTNING_MAX_AMOUNT_SAT
+    facts.amountSats < networkConfig.minQuoteAmountSat ||
+    facts.amountSats > networkConfig.maxQuoteAmountSat
   )
     throw new Error(
       'Arkade Lightning invoice amount is outside the solver range'
@@ -1105,7 +1427,7 @@ const prepareLightningSend = async bolt11 => {
     } else {
       transport = nostrRfqTransport({
         relays: [LIGHTNING_RELAY],
-        solverPubkey: LIGHTNING_SOLVER_PUBKEY
+        solverPubkey: networkConfig.solverPubkey
       })
       swap = await requestLightningSend(
         wallet,
@@ -1114,7 +1436,8 @@ const prepareLightningSend = async bolt11 => {
         {invoice: facts}
       )
     }
-  } catch {
+  } catch (error) {
+    console.error('Arkade Lightning quote request failed', error)
     throw new Error('Arkade Lightning quote request failed')
   } finally {
     await transport?.close?.()
@@ -1133,8 +1456,8 @@ const prepareLightningSend = async bolt11 => {
         idempotencyKey
       )
     ).data
-  } catch {
-    throw new Error('Arkade Lightning reservation failed')
+  } catch (error) {
+    throw new Error(outgoingErrorMessage(error))
   }
   const intent = response?.intent
   if (
@@ -1205,13 +1528,31 @@ const submitLightningSend = async (intentId, approval) => {
     )
   )
     throw new Error('Arkade Lightning intent changed')
-  try {
-    lightningPublicQuote(plan.facts, plan.swap)
-  } catch {
-    throw new Error('Arkade Lightning quote is no longer fundable')
+  // The quote's window is a FUNDING gate. A swap that is already funded must
+  // still be submittable after it: the money is at the lockup, and refusing
+  // here strands the intent - funded, unreported and unresumable.
+  if (plan.fundingState === 'quote_ready') {
+    try {
+      lightningPublicQuote(plan.facts, plan.swap)
+    } catch {
+      throw new Error('Arkade Lightning quote is no longer fundable')
+    }
   }
   if (plan.fundingState === 'funding' && !plan.fundingPromise)
     throw new ArkadeLightningReconciliationError(intentId)
+  if (
+    !plan.fundingPromise &&
+    plan.fundingState === 'funded' &&
+    plan.fundingArkTxid
+  ) {
+    // A funded swap from an earlier session, or a hand-off that failed before
+    // the tab closed: re-admitting it is idempotent and restores monitoring.
+    try {
+      await trackLightningSwap(plan, plan.fundingArkTxid)
+    } catch (error) {
+      console.error('Arkade Lightning swap tracking failed', error)
+    }
+  }
   if (
     plan.fundingState !== 'quote_ready' &&
     plan.fundingState !== 'funded' &&
@@ -1241,6 +1582,14 @@ const submitLightningSend = async (intentId, approval) => {
         if (typeof arkTxid !== 'string' || !/^[0-9a-f]{64}$/.test(arkTxid))
           throw new Error('Arkade Lightning funding result invalid')
         await persistLightningPlanState(plan, 'funded', arkTxid)
+        // The manager owns the swap from here: contract registration, refund
+        // push and terminal classification. A store failure leaves the
+        // payment committed and unmonitored, so it is reported, not raised.
+        try {
+          await trackLightningSwap(plan, arkTxid)
+        } catch (error) {
+          console.error('Arkade Lightning swap tracking failed', error)
+        }
         return arkTxid
       } catch {
         try {
@@ -2065,6 +2414,11 @@ const listOutgoing = async () => {
   journal = await reconcileTerminalOutgoing(accountId, journal)
   if (!identity) return journal
   const wallet = await outgoingWallet(accountId, activeBinding)
+  try {
+    await restoreLightningSwaps(accountId, wallet)
+  } catch (error) {
+    console.error('Arkade Lightning swap manager unavailable', error)
+  }
   const manager = await wallet.getContractManager()
   const responses = (await LNbits.api.arkadeSubmittedOutgoingIntents()).data
   if (!Array.isArray(responses))
@@ -2394,6 +2748,8 @@ const unlock = async password => {
 const lock = () => {
   unlockGeneration += 1
   identity = null
+  // The manager polls through the wallet below; both go together.
+  stopLightningSwapManager()
   const wallet = allocationWallet
   allocationWallet = null
   allocationWalletKey = ''
@@ -2557,6 +2913,15 @@ window.PageArkadeEnrollment = {
     await this.inspect()
   },
   methods: {
+    async goToWallet() {
+      const {data} = await LNbits.api.request(
+        'GET',
+        '/api/v1/wallet/paginated',
+        null
+      )
+      const walletId = data.data?.[0]?.id
+      await this.$router.push(walletId ? `/wallet/${walletId}` : '/wallet')
+    },
     prepareChallenge() {
       const words = this.mnemonic.split(/\s+/).filter(Boolean)
       const count = Math.min(4, words.length)
@@ -2588,6 +2953,14 @@ window.PageArkadeEnrollment = {
       try {
         this.state = (await window.ArkadeEnrollment.inspect()).state
         this.g.arkadeEnrollmentState = this.state
+        if (this.state === 'wallet_locked') {
+          try {
+            const pending = await window.ArkadeEnrollment.unlock('')
+            this.state = pending ? 'pending_unlocked' : 'ready_unlocked'
+            this.g.arkadeEnrollmentState = this.state
+            if (!pending) await this.goToWallet()
+          } catch {}
+        }
       } catch (error) {
         this.state =
           enrollmentErrorCode(error) === 'ARKADE_ENROLLMENT_MIGRATION_REQUIRED'
@@ -2648,13 +3021,12 @@ window.PageArkadeEnrollment = {
           this.state = 'pending_unlocked'
           return
         }
-        await this.$router.push('/wallet')
+        await this.goToWallet()
       } catch {
         this.password = ''
         this.$q.notify({
           type: 'negative',
-          message:
-            'Could not unlock this wallet. Check your password or restore your mnemonic.'
+          message: 'Could not unlock this wallet. Check your password.'
         })
       } finally {
         this.working = false
@@ -2664,7 +3036,7 @@ window.PageArkadeEnrollment = {
       this.working = true
       try {
         await window.ArkadeEnrollment.finish()
-        await this.$router.push('/wallet')
+        await this.goToWallet()
       } catch {
         this.$q.notify({
           type: 'negative',
@@ -2696,7 +3068,7 @@ window.PageArkadeEnrollment = {
         this.passwordRepeat = ''
         this.mnemonic = ''
         this.mode = ''
-        await this.$router.push('/wallet')
+        await this.goToWallet()
       } catch (error) {
         const message =
           error instanceof Error && error.message === 'wallet mismatch'

@@ -639,8 +639,8 @@
       </lnbits-qrcode>
       <lnbits-qrcode
         v-else-if="receive.protocol === 'arkade'"
-        :href="receive.paymentReq"
-        :value="receive.paymentReq"
+        :href="arkadeReceivePayload || receive.paymentReq"
+        :value="arkadeReceivePayload || receive.paymentReq"
       >
       </lnbits-qrcode>
       <lnbits-qrcode

@@ -202,6 +202,107 @@ page.parse.arkade.amount = 42
     {intentId: '22'.repeat(16), approval: {approved: true}}
   ])
   assert.equal(page.arkadeRecovery.length, 0)
+
+  const dialogsBeforeLightningSend = dialogMessages.length
+  const lightningInvoices = []
+  const lightningSubmits = []
+  const apiRequests = []
+  let fundingFails = false
+  window.ArkadeEnrollment.prepareLightningSend = async invoice => {
+    lightningInvoices.push(invoice)
+    return {intentId: 'lightning', amountSat: 1000, feeSat: 4, fundAmount: 1004}
+  }
+  window.ArkadeEnrollment.submitLightningSend = async (intentId, approval) => {
+    lightningSubmits.push({intentId, approval})
+    if (fundingFails) throw new Error('funding response lost')
+  }
+  LNbits.api.request = async (...args) => {
+    apiRequests.push(args)
+    return {data: {payment_request: 'ln-invoice-from-lnurl'}}
+  }
+  LNbits.api.payInvoice = async () => {
+    throw new Error('Arkade must use browser approval before funding')
+  }
+  page.parse.data.request = 'ln-direct-invoice'
+  page.parse.show = true
+  await page.payInvoice()
+  assert.deepEqual(lightningInvoices, ['ln-direct-invoice'])
+  assert.deepEqual(lightningSubmits, [
+    {intentId: 'lightning', approval: {approved: true}}
+  ])
+  assert.equal(apiRequests.length, 0)
+  assert.equal(page.parse.sending, false)
+  assert.equal(page.parse.show, false)
+  // PAY pays: the Arkade path funds the prepared swap with no second dialog.
+  assert.equal(dialogMessages.length, dialogsBeforeLightningSend)
+
+  page.parse.data.request = 'user@example.com'
+  page.parse.data.amount = 1000
+  await page.payLnurl()
+  assert.equal(apiRequests[0][1], '/api/v1/payments/lnurl/prepare')
+  assert.equal(apiRequests[0][2], 'admin')
+  assert.equal(apiRequests[0][3].amount, 1000000)
+  assert.equal(lightningInvoices.at(-1), 'ln-invoice-from-lnurl')
+  assert.equal(lightningSubmits.length, 2)
+  assert.equal(page.parse.sending, false)
+
+  // A second PAY funds again; nothing is released because nothing was cancelled.
+  const releasesBeforeSecondSend = releases.length
+  await page.payInvoice()
+  assert.equal(lightningSubmits.length, 3)
+  assert.equal(releases.length, releasesBeforeSecondSend)
+  const releasesBeforeFunding = releases.length
+  fundingFails = true
+  notifications.length = 0
+  await page.payInvoice()
+  assert.equal(releases.length, releasesBeforeFunding)
+  assert.equal(page.parse.sending, false)
+  assert.equal(notifications.length, 1)
+  assert.equal(notifications[0].message, 'payment_error_message')
+  assert.equal(notifications[0].caption, null)
+  fundingFails = false
+
+  // A refused reservation surfaces the localized message plus the backend's
+  // stable code, never the raw response or a masked generic failure.
+  notifications.length = 0
+  window.ArkadeEnrollment.prepareLightningSend = async () => {
+    throw new Error('payment_error_message (ARKADE_BACKING_DEFICIT)')
+  }
+  const submitsBeforeRefusal = lightningSubmits.length
+  await page.payInvoice()
+  assert.equal(notifications.length, 1)
+  assert.equal(notifications[0].message, 'payment_error_message')
+  assert.equal(notifications[0].caption, 'ARKADE_BACKING_DEFICIT')
+  assert.equal(lightningSubmits.length, submitsBeforeRefusal)
+  assert.equal(page.parse.sending, false)
+
+  // An unrecognised failure keeps the safe generic message and no caption.
+  notifications.length = 0
+  window.ArkadeEnrollment.prepareLightningSend = async () => {
+    throw new Error('some internal failure')
+  }
+  await page.payInvoice()
+  assert.equal(notifications.length, 1)
+  assert.equal(notifications[0].message, 'payment_error_message')
+  assert.equal(notifications[0].caption, null)
+  window.ArkadeEnrollment.prepareLightningSend = async invoice => {
+    lightningInvoices.push(invoice)
+    return {intentId: 'lightning', amountSat: 1000, feeSat: 4, fundAmount: 1004}
+  }
+
+  // Custodial sends keep their existing API and never ask for Arkade approval.
+  page.g.user.installationMode = 'custodial'
+  let custodialCalls = 0
+  LNbits.api.payInvoice = async () => {
+    custodialCalls += 1
+    return {data: {status: 'pending'}}
+  }
+  Quasar.Notify.create = () => () => {}
+  const lightningBeforeCustodial = lightningInvoices.length
+  page.payInvoice()
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(custodialCalls, 1)
+  assert.equal(lightningInvoices.length, lightningBeforeCustodial)
 })().catch(error => {
   console.error(error)
   process.exitCode = 1

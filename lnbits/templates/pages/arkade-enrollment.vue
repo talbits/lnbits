@@ -8,7 +8,6 @@
           LNbits never receives it or your local unlock password.
         </div>
       </q-card-section>
-
       <q-card-section v-if="!g.user">
         <q-banner rounded>Please sign in to enroll an Arkade wallet.</q-banner>
       </q-card-section>
@@ -42,20 +41,23 @@
           label="Local unlock password or PIN"
           @keyup.enter="unlock"
         ></q-input>
-        <q-btn
-          class="q-mt-md"
-          unelevated
-          color="primary"
-          label="Unlock"
-          :loading="working"
-          @click="unlock"
-        ></q-btn>
-        <q-btn
-          class="q-mt-md q-ml-sm"
-          flat
-          label="Restore with mnemonic"
-          @click="startRestore"
-        ></q-btn>
+        <div class="row items-center q-gutter-sm q-mt-md">
+          <q-btn
+            unelevated
+            color="primary"
+            label="Unlock"
+            :loading="working"
+            @click="unlock"
+          ></q-btn>
+          <q-space></q-space>
+          <q-btn
+            outline
+            color="primary"
+            icon="logout"
+            :label="$t('logout')"
+            @click="utils.logout"
+          ></q-btn>
+        </div>
       </q-card-section>
       <q-card-section v-else-if="state === 'pending_unlocked'">
         <div class="text-h6">Finish wallet setup</div>
@@ -78,12 +80,20 @@
           This browser has no usable local vault. Restore the same recovery
           phrase to continue.
         </p>
-        <q-btn
-          unelevated
-          color="primary"
-          label="Restore wallet"
-          @click="startRestore"
-        ></q-btn>
+        <div class="row justify-end q-gutter-sm q-mt-md">
+          <q-btn
+            unelevated
+            color="primary"
+            label="Restore wallet"
+            @click="startRestore"
+          ></q-btn>
+          <q-btn
+            flat
+            icon="logout"
+            :label="$t('logout')"
+            @click="utils.logout"
+          ></q-btn>
+        </div>
       </q-card-section>
       <q-card-section v-else-if="state === 'pending' && !mode">
         <div class="text-h6">Create or restore</div>
@@ -280,6 +290,7 @@
           label="PIN (optional)"
           inputmode="numeric"
           maxlength="6"
+          autocomplete="new-password"
           class="q-mt-md"
         ></q-input>
         <q-input
@@ -288,6 +299,7 @@
           label="Confirm PIN"
           inputmode="numeric"
           maxlength="6"
+          autocomplete="new-password"
         ></q-input>
         <div class="text-caption text-grey-7 q-mt-sm">
           Optional 6-digit PIN. Forgetting it is recoverable with your mnemonic

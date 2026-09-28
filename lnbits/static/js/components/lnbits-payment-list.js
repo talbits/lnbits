@@ -493,9 +493,11 @@ window.app.component('lnbits-payment-list', {
         return
       }
       try {
+        const paymentId =
+          this.selectedPayment.payment_hash || this.selectedPayment.native_id
         await LNbits.api.request(
           'PUT',
-          `/api/v1/payments/${this.selectedPayment.payment_hash}/labels`,
+          `/api/v1/payments/${paymentId}/labels`,
           this.wallet.adminkey,
           {
             labels: labels
@@ -503,7 +505,7 @@ window.app.component('lnbits-payment-list', {
         )
 
         const payment = this.payments.find(
-          p => p.checking_id === this.selectedPayment.checking_id
+          p => (p.payment_hash || p.native_id) === paymentId
         )
         if (payment) {
           payment.labels = [...labels]
