@@ -133,15 +133,7 @@ async def get_standalone_wallet(
 ) -> Wallet | None:
     query = f"""
             SELECT {WALLET_COLUMNS}, COALESCE((
-                SELECT CASE WHEN wallets.wallet_type = 'onchain' THEN (
-                    SELECT COALESCE(SUM(coins.amount), 0) * 1000 FROM (
-                        SELECT a.address, MAX(a.amount) AS amount
-                        FROM onchain_addresses a
-                        WHERE a.wallet = wallets.id GROUP BY a.address
-                    ) coins
-                ) ELSE (
-                    SELECT balance FROM balances WHERE wallet_id = wallets.id
-                ) END
+                SELECT balance FROM balances WHERE wallet_id = wallets.id
             ), 0) AS balance_msat FROM wallets
             WHERE id = :wallet
             """  # noqa: S608
@@ -188,15 +180,7 @@ async def get_wallets(
 ) -> list[Wallet]:
     query = f"""
             SELECT {WALLET_COLUMNS}, COALESCE((
-                SELECT CASE WHEN wallets.wallet_type = 'onchain' THEN (
-                    SELECT COALESCE(SUM(coins.amount), 0) * 1000 FROM (
-                        SELECT a.address, MAX(a.amount) AS amount
-                        FROM onchain_addresses a
-                        WHERE a.wallet = wallets.id GROUP BY a.address
-                    ) coins
-                ) ELSE (
-                    SELECT balance FROM balances WHERE wallet_id = wallets.id
-                ) END
+                SELECT balance FROM balances WHERE wallet_id = wallets.id
             ), 0) AS balance_msat FROM wallets
             WHERE "user" = :user
             """  # noqa: S608
@@ -230,15 +214,7 @@ async def get_wallets_paginated(
     wallets = await (conn or db).fetch_page(
         f"""
             SELECT {WALLET_COLUMNS}, COALESCE((
-                SELECT CASE WHEN wallets.wallet_type = 'onchain' THEN (
-                    SELECT COALESCE(SUM(coins.amount), 0) * 1000 FROM (
-                        SELECT a.address, MAX(a.amount) AS amount
-                        FROM onchain_addresses a
-                        WHERE a.wallet = wallets.id GROUP BY a.address
-                    ) coins
-                ) ELSE (
-                    SELECT balance FROM balances WHERE wallet_id = wallets.id
-                ) END
+                SELECT balance FROM balances WHERE wallet_id = wallets.id
             ), 0) AS balance_msat FROM wallets
         """,  # noqa: S608
         where=where,
@@ -305,15 +281,7 @@ async def get_wallet_for_key(
     wallet = await (conn or db).fetchone(
         f"""
         SELECT {WALLET_COLUMNS}, COALESCE((
-            SELECT CASE WHEN wallets.wallet_type = 'onchain' THEN (
-                    SELECT COALESCE(SUM(coins.amount), 0) * 1000 FROM (
-                        SELECT a.address, MAX(a.amount) AS amount
-                        FROM onchain_addresses a
-                        WHERE a.wallet = wallets.id GROUP BY a.address
-                    ) coins
-                ) ELSE (
-                    SELECT balance FROM balances WHERE wallet_id = wallets.id
-                ) END
+            SELECT balance FROM balances WHERE wallet_id = wallets.id
         ), 0)
         AS balance_msat FROM wallets
         INNER JOIN accounts ON wallets.user = accounts.id
