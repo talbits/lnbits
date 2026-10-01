@@ -18,12 +18,18 @@ from types import SimpleNamespace
 import pytest
 
 from lnbits.core import migrations as core_migrations
-from lnbits.core.crud.payments import get_payment_by_native_id
+from lnbits.core.crud.payments import (
+    compare_and_set_arkade_payment_failed,
+    get_payment_by_native_id,
+    get_standalone_payment,
+    update_payment,
+)
 from lnbits.core.helpers import (
     check_installation_mode,
     initialize_installation_mode,
     run_migration,
 )
+from lnbits.core.models import PaymentState
 from lnbits.core.models.misc import DbVersion
 from lnbits.db import Database
 from lnbits.settings import settings
@@ -166,27 +172,61 @@ async def test_legacy_payments_still_load_with_incomplete_identifiers(tmp_path: 
 
 
 @pytest.mark.anyio
-async def test_arkade_native_id_lookup_also_matches_legacy_payments(tmp_path: Path):
-    """Characterises the identity collision created by the migration backfill.
+async def test_lightning_payments_mirror_native_id_from_checking_id(tmp_path: Path):
+    """The identity model that makes the migration backfill intentional.
 
-    The migration sets ``native_id = checking_id`` for every legacy payment, while
-    ``get_payment_by_native_id`` filters only on ``native_id``. An Arkade intent
-    lookup can therefore resolve to a pre-Arkade Lightning payment. This test
-    pins the current behaviour so the decision (filter by protocol, or stop
-    backfilling) is visible and the guard can be tightened deliberately.
+    ``create_payment`` stores ``native_id = data.native_id or checking_id`` for
+    every payment, so a Lightning row carries its checking_id as native_id; the
+    migration brings pre-existing rows to that same state. Custodial writes must
+    keep locating rows by ``checking_id``, so a Lightning payment stays updatable
+    even when its native_id no longer matches.
     """
     original_data_folder = settings.lnbits_data_folder
     try:
         database = await _upgraded_legacy_database(tmp_path)
         async with database.connect() as conn:
-            found = await get_payment_by_native_id("legacy-paid", conn=conn)
+            payment = await get_payment_by_native_id("legacy-paid", conn=conn)
+            assert payment is not None
+            assert payment.protocol == "lightning"
+            assert payment.native_id == payment.checking_id == "legacy-paid"
+
+            payment.memo = "custodial update"
+            payment.native_id = "deliberately-different"
+            await update_payment(payment, conn=conn)
+
+            reloaded = await get_standalone_payment("legacy-paid", conn=conn)
     finally:
         settings.lnbits_data_folder = original_data_folder
 
-    assert found is not None
-    # The lookup is not protocol aware, so a Lightning payment answers it.
-    assert found.protocol == "lightning"
-    assert found.native_id == found.checking_id
+    assert reloaded is not None
+    assert reloaded.memo == "custodial update", "custodial updates key on checking_id"
+
+
+@pytest.mark.anyio
+async def test_arkade_mutations_refuse_lightning_payments(tmp_path: Path):
+    """Arkade state changes are scoped to Arkade rows.
+
+    Every native_id-keyed UPDATE carries ``WHERE protocol = 'arkade'``, so a
+    Lightning payment sharing an identifier can never be mutated by the Arkade
+    flows. This pins the guard that keeps the shared native_id column safe: if
+    the filter is ever dropped, a collision would rewrite a custodial payment.
+    """
+    original_data_folder = settings.lnbits_data_folder
+    try:
+        database = await _upgraded_legacy_database(tmp_path)
+        async with database.connect() as conn:
+            payment = await get_payment_by_native_id("legacy-paid", conn=conn)
+            assert payment is not None
+            assert payment.status == PaymentState.PENDING.value
+
+            mutated = await compare_and_set_arkade_payment_failed(payment, conn=conn)
+            reloaded = await get_standalone_payment("legacy-paid", conn=conn)
+    finally:
+        settings.lnbits_data_folder = original_data_folder
+
+    assert mutated is False, "an Arkade mutation must not claim a Lightning row"
+    assert reloaded is not None
+    assert reloaded.status == PaymentState.PENDING.value
 
 
 @pytest.mark.anyio
