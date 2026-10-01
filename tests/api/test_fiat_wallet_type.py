@@ -176,6 +176,7 @@ async def test_fiat_wallet_receives_but_cannot_spend(
     assert "permission" in response.text
 
     # The service used by extensions, including withdrawals, enforces the same rule.
+    assert invoice.bolt11 is not None
     with pytest.raises(PaymentError, match="permission to pay"):
         await pay_invoice(wallet_id=wallet.id, payment_request=invoice.bolt11)
     dispatch.assert_not_awaited()

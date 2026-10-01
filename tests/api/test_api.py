@@ -419,7 +419,9 @@ async def test_create_arkade_lightning_payment_tracks_intent_and_replay(
     assert created_body["amount"] == -42_000
     assert created_body["browser_required"] is True
     assert created_body["intent"]["destination_kind"] == "lightning"
-    parsed_quote = reserve.await_args.args[2]
+    reserve_args = reserve.await_args
+    assert reserve_args is not None
+    parsed_quote = reserve_args.args[2]
     assert parsed_quote.lockup_address == intent.lockup_address
     assert parsed_quote.payment_hash == intent.payment_hash
     assert parsed_quote.max_fee_msat == 15_000

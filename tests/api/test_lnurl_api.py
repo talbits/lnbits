@@ -266,9 +266,10 @@ async def test_lnurl_prepare_returns_invoice_without_paying(mocker):
 
     prepared = await api_payments_prepare_lnurl(
         CreateLnurlPayment(res=pay_response, amount=2_000, unit="sat"),
-        wallet_info,
+        wallet_info,  # type: ignore[reportArgumentType]
     )
 
+    assert action_response.successAction is not None
     assert prepared["payment_request"] == TEST_BOLT11
     assert prepared["extra"] == {
         "stored": True,

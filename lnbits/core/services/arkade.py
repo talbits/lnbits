@@ -794,15 +794,17 @@ async def submit_arkade_lightning_intent(  # noqa: C901
             or payment.status != PaymentState.PENDING.value
         ):
             raise ArkadeOutgoingError("ARKADE_OUTGOING_CORRUPT")
+        lockup_address = intent.lockup_address
         if (
-            intent.lockup_address != funding.lockup_address
+            lockup_address is None
+            or lockup_address != funding.lockup_address
             or intent.swap_rfq_id != funding.swap_rfq_id
             or intent.solver_pubkey != funding.solver_pubkey
         ):
             raise ArkadeOutgoingError("ARKADE_OUTGOING_OUTPUT_CONFLICT")
         try:
             lockup_script = decode_arkade_address_script(
-                intent.lockup_address,
+                lockup_address,
                 binding.server_pubkey,
                 ARKADE_HRPS[binding.network],
             )

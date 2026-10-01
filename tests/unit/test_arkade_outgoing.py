@@ -356,7 +356,7 @@ async def test_fetch_operator_pubkey_normalizes_both_key_encodings(
 
 
 class _LightningInvoice:
-    def __init__(self, amount_msat=5_000_000, expiry_time=None):
+    def __init__(self, amount_msat: int | None = 5_000_000, expiry_time=None):
         self.amount_msat = amount_msat
         self.payment_hash = LIGHTNING_HASH
         self.expiry_time = (

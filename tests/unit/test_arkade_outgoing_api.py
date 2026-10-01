@@ -137,8 +137,10 @@ async def test_outgoing_api_isolation_and_canonical_response(monkeypatch):
     assert authorized.status_code == 200
     assert funding.status_code == 200
     submitted.assert_awaited_once()
-    assert submitted.await_args.args[:2] == (ACCOUNT_ID, INTENT_ID)
-    assert submitted.await_args.args[2].ark_txid == TXID
+    submitted_args = submitted.await_args
+    assert submitted_args is not None
+    assert submitted_args.args[:2] == (ACCOUNT_ID, INTENT_ID)
+    assert submitted_args.args[2].ark_txid == TXID
     assert released.status_code == 200
     assert released.json()["success"] is True
     release.assert_awaited_once_with(ACCOUNT_ID, INTENT_ID)

@@ -46,7 +46,7 @@ async def ensure_arkade_binding_for_existing_account(
         "SELECT 1 FROM accounts WHERE id = :account_id", {"account_id": account_id}
     ):
         return None
-    existing = await get_arkade_binding(account_id, conn=database)
+    existing = await get_arkade_binding(account_id, conn=conn)
     if existing:
         return existing
     occupied = await database.fetchone(
@@ -94,7 +94,7 @@ async def ensure_arkade_binding_for_existing_account(
             "updated_at": now,
         },
     )
-    return await get_arkade_binding(account_id, conn=database)
+    return await get_arkade_binding(account_id, conn=conn)
 
 
 async def get_arkade_binding(
