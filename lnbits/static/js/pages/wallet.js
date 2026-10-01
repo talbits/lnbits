@@ -17,6 +17,79 @@ const arkadeReceiveBip21 = (address, amountMsat) => {
   return `bitcoin:?ark=${address}&amount=${whole}${fraction ? `.${fraction}` : ''}`
 }
 
+// Follow the upstream wallet's case-insensitive BIP21 keys and Arkade priority.
+const arkadeDecodeBip21 = uri => {
+  const query = uri.slice(8).split('?')[1] || ''
+  const params = new Map()
+  for (const [key, value] of new URLSearchParams(query)) {
+    const name = key.toLowerCase()
+    if (params.has(name) || name.startsWith('req-') || name === 'assetid')
+      throw new Error('Unsupported payment URI')
+    params.set(name, value)
+  }
+  let amount = null
+  if (params.has('amount')) {
+    const decimal = params.get('amount')
+    if (!/^\d+(\.\d{1,8})?$/.test(decimal))
+      throw new Error('Invalid payment amount')
+    const [whole, fraction = ''] = decimal.split('.')
+    const sats = BigInt(whole) * 100_000_000n + BigInt(fraction.padEnd(8, '0'))
+    if (sats > 2_100_000_000_000_000n) throw new Error('Invalid payment amount')
+    amount = Number(sats)
+  }
+  const ark = params.get('ark')?.trim().toLowerCase()
+  if (params.has('ark') && !/^(t?ark)1[023456789ac-hj-np-z]+$/.test(ark || ''))
+    throw new Error('Invalid Arkade address')
+  const request = ark || params.get('lightning')?.trim()
+  if (!request) throw new Error('Unsupported payment URI')
+  return {request, amount}
+}
+
+const arkadeLightningErrorCaption = (error, stage) => {
+  const gates = {
+    invoice_expired: 'Invoice has expired. Request a new invoice.',
+    quote_expired: 'The solver quote has expired. Request a fresh quote.',
+    insufficient_headroom: 'The refund deadline is too close to fund safely.',
+    non_positive_amount: 'The solver quote amount is invalid.',
+    max_fee_unbounded: 'The fee limit is missing.',
+    max_fee_out_of_range: 'The fee limit is invalid.',
+    fee_gate_unavailable:
+      'The solver quote cannot be checked against the fee limit.',
+    fee_too_high: 'The solver fee exceeds the allowed limit.'
+  }
+  if (Object.hasOwn(gates, error?.reason)) return gates[error.reason]
+  if (error?.reconciliationRequired)
+    return 'A previous payment needs reconciliation. Check the Lightning journal.'
+  const clients = {
+    'wallet is locked': 'Unlock your Arkade wallet before paying.',
+    'Arkade Lightning preparation is locked':
+      'Unlock your Arkade wallet before paying.',
+    'Arkade Lightning invoice is expired':
+      'Invoice has expired. Request a new invoice.',
+    'Arkade Lightning invoice is invalid': 'The Lightning invoice is invalid.',
+    'Arkade Lightning invoice decoder unavailable':
+      'The invoice decoder is unavailable. Reload the page.',
+    'Arkade Lightning invoice amount is outside the solver range':
+      'The invoice amount is outside the solver range.',
+    'Arkade Lightning quote request failed':
+      'The solver quote request failed. Check relay connectivity and try again.',
+    'Arkade Lightning wallet unavailable':
+      'Your Arkade wallet is unavailable. Unlock it and retry.',
+    'Arkade Lightning reservation changed':
+      'The payment reservation changed. Check the Lightning journal.',
+    'Arkade Lightning intent changed':
+      'The payment intent changed. Check the Lightning journal.',
+    'Arkade Lightning funding changed':
+      'The funding state changed. Check the Lightning journal.'
+  }
+  if (Object.hasOwn(clients, error?.message)) return clients[error.message]
+  if (/^payment_error_message \(ARKADE_[A-Z_]+\)$/.test(error?.message || ''))
+    return error.message.replace(/^.*\((.*)\)$/, '$1')
+  return stage === 'funding'
+    ? 'Funding could not be confirmed. Check the Lightning journal before retrying.'
+    : 'Payment preparation failed. Check your wallet connection and retry.'
+}
+
 window.PageWallet = {
   template: '#page-wallet',
   data() {
@@ -598,40 +671,42 @@ window.PageWallet = {
     },
     decodeRequest() {
       this.parse.show = true
-      this.parse.data.request = this.parse.data.request.trim()
-      const req = this.parse.data.request.toLowerCase()
-      if (req.startsWith('lightning:')) {
-        this.parse.data.request = this.parse.data.request.slice(10)
-      } else if (req.startsWith('lnurl:')) {
-        this.parse.data.request = this.parse.data.request.slice(6)
-      } else if (req.includes('lightning=lnurl1')) {
-        this.parse.data.request = this.parse.data.request
-          .split('lightning=')[1]
-          .split('&')[0]
+      this.parse.invoice = null
+      this.parse.arkade = null
+      this.parse.lnurlpay = null
+      this.parse.lnurlauth = null
+      let request = this.parse.data.request.trim()
+      let amount = null
+      try {
+        if (request.toLowerCase().startsWith('bitcoin:')) {
+          const bip21 = arkadeDecodeBip21(request)
+          request = bip21.request
+          amount = bip21.amount
+        }
+      } catch {
+        Quasar.Notify.create({
+          type: 'warning',
+          message: 'Invalid or unsupported payment URI.',
+          caption: '400 BAD REQUEST'
+        })
+        this.parse.show = false
+        return
       }
-      if (this.isLnurl(this.parse.data.request)) {
+      if (/^lightning:/i.test(request)) request = request.slice(10)
+      else if (/^lnurl:/i.test(request)) request = request.slice(6)
+      this.parse.data.request = request
+      if (this.isLnurl(request)) {
         this.lnurlScan()
         return
       }
-
-      if (/^(t?ark)1[023456789ac-hj-np-z]+$/i.test(this.parse.data.request)) {
-        this.parse.invoice = null
+      if (/^(t?ark)1[023456789ac-hj-np-z]+$/i.test(request)) {
+        this.parse.data.request = request.toLowerCase()
         this.parse.arkade = {
           address: this.parse.data.request,
-          amount: null,
+          amount,
           idempotencyKey: this.newArkadeIdempotencyKey()
         }
         return
-      }
-
-      // BIP-21 support
-      if (this.parse.data.request.toLowerCase().includes('lightning')) {
-        this.parse.data.request = this.parse.data.request.split('lightning=')[1]
-
-        // fail safe to check there's nothing after the lightning= part
-        if (this.parse.data.request.includes('&')) {
-          this.parse.data.request = this.parse.data.request.split('&')[0]
-        }
       }
 
       let invoice
@@ -652,7 +727,9 @@ window.PageWallet = {
         msat: invoice.human_readable_part.amount,
         sat: invoice.human_readable_part.amount / 1000,
         fsat: LNbits.utils.formatSat(invoice.human_readable_part.amount / 1000),
-        bolt11: this.parse.data.request
+        bolt11: this.parse.data.request,
+        expiresAt: (invoice.data.time_stamp + 3600) * 1000,
+        expired: Date.now() >= (invoice.data.time_stamp + 3600) * 1000
       }
 
       _.each(invoice.data.tags, tag => {
@@ -683,7 +760,8 @@ window.PageWallet = {
               .local()
               .fromNow()
 
-            cleanInvoice.expired = false // TODO
+            cleanInvoice.expiresAt = expireDate.getTime()
+            cleanInvoice.expired = Date.now() >= cleanInvoice.expiresAt
           }
         }
       })
@@ -706,8 +784,6 @@ window.PageWallet = {
       if (this.parse.sending || !this.canPay) return
       this.parse.sending = true
       try {
-        if (this.g.user?.installationMode === 'arkade_noncustodial')
-          await this.refreshArkadeRecovery()
         const response = await LNbits.api.payArkade(
           this.g.wallet,
           this.parse.arkade.address,
@@ -723,6 +799,8 @@ window.PageWallet = {
           })
           return
         }
+        if (this.g.user?.installationMode === 'arkade_noncustodial')
+          await this.refreshArkadeRecovery()
         if (!response.data.intent_id)
           throw new Error('Arkade browser approval is unavailable')
         let prepared
@@ -772,20 +850,14 @@ window.PageWallet = {
     async payArkadeLightning(bolt11) {
       let prepared
       try {
+        if (!window.ArkadeEnrollment?.prepareLightningSend)
+          throw new Error('Arkade Lightning wallet unavailable')
         prepared = await window.ArkadeEnrollment.prepareLightningSend(bolt11)
       } catch (error) {
-        // The enrollment bundle only emits the generic message plus a code it
-        // recognised from the backend. Show the localized message and keep the
-        // stable code as the caption for diagnosis.
-        const recognized =
-          typeof error?.message === 'string' &&
-          /^payment_error_message \(ARKADE_[A-Z_]+\)$/.test(error.message)
         this.$q.notify({
           type: 'warning',
           message: this.$t('payment_error_message'),
-          caption: recognized
-            ? error.message.replace(/^.*\((.*)\)$/, '$1')
-            : null,
+          caption: arkadeLightningErrorCaption(error, 'prepare'),
           closeBtn: true
         })
         return
@@ -801,7 +873,7 @@ window.PageWallet = {
         this.$q.notify({
           type: 'warning',
           message: this.$t('payment_error_message'),
-          caption: null,
+          caption: arkadeLightningErrorCaption(error, 'funding'),
           closeBtn: true
         })
         return
@@ -812,6 +884,17 @@ window.PageWallet = {
     },
     payInvoice() {
       if (this.parse.sending) return
+      if (
+        this.parse.invoice &&
+        (this.parse.invoice.expired ||
+          Date.now() >= this.parse.invoice.expiresAt)
+      ) {
+        this.$q.notify({
+          type: 'warning',
+          message: 'Invoice has expired. Request a new invoice.'
+        })
+        return
+      }
 
       if (this.g.user?.installationMode === 'arkade_noncustodial') {
         this.parse.sending = true
