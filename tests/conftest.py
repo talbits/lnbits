@@ -11,6 +11,7 @@ from asgi_lifespan import LifespanManager
 from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
 
+import tests._env  # noqa: F401  effective only if imported before lnbits
 from lnbits.app import create_app
 from lnbits.core.crud import (
     create_wallet,

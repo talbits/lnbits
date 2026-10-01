@@ -81,8 +81,9 @@ class CreatePayment(BaseModel):
         else:
             if values.get("arkade_address") is not None:
                 raise ValueError("Lightning payments cannot have an Arkade address")
-            if not all(values.get(field) for field in ("payment_hash", "bolt11")):
-                raise ValueError("Lightning payments require Lightning identifiers")
+            # Lightning identifiers are not required to be present: internal and
+            # legacy payments carry None or an empty bolt11, and rows already
+            # stored in a database must stay loadable.
         return values
 
 
@@ -131,10 +132,9 @@ class Payment(BaseModel):
         else:
             if values.get("arkade_address") is not None:
                 raise ValueError("Lightning payments cannot have an Arkade address")
-            if not all(
-                values.get(field) for field in ("checking_id", "payment_hash", "bolt11")
-            ):
-                raise ValueError("Lightning payments require Lightning identifiers")
+            # Lightning identifiers are not required to be present: internal and
+            # legacy payments carry None or an empty bolt11, and rows already
+            # stored in a database must stay loadable.
         return values
 
     def __init__(self, **data):

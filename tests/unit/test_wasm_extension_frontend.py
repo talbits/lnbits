@@ -22,7 +22,7 @@ def test_wasm_extension_routes_keep_global_wallet_dialog_mounted():
     )
     wallet_dialog = base_template[wallet_dialog_start:wallet_dialog_end]
 
-    assert 'v-if="g.user && !g.isPublicPage"' in wallet_dialog
+    assert 'v-if="g.user && !g.isPublicPage' in wallet_dialog
     assert "!$route.path.startsWith('/ext/')" not in wallet_dialog
 
 
