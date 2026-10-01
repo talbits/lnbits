@@ -571,6 +571,35 @@ const makeLightningFixture = () => {
 }
 
 async function lightningBrowserChecks() {
+  const expired = makeLightningFixture()
+  const decode = expired.window.decode
+  expired.window.decode = () => {
+    const invoice = decode()
+    invoice.data.time_stamp = Math.floor(Date.now() / 1000) - 3601
+    return invoice
+  }
+  await assert.rejects(
+    expired.window.ArkadeEnrollment.prepareLightningSend(
+      expired.lightningBolt11
+    ),
+    /invoice is expired/
+  )
+  assert.equal(expired.requests.length, 0)
+  const gated = makeLightningFixture()
+  gated.window.__ARKADE_ENROLLMENT_TEST__.requestLightningSend = async () => {
+    throw Object.assign(new Error('private SDK response'), {
+      reason: 'quote_expired'
+    })
+  }
+  await assert.rejects(
+    gated.window.ArkadeEnrollment.prepareLightningSend(gated.lightningBolt11),
+    error => {
+      assert.equal(error.reason, 'quote_expired')
+      assert.equal(error.message, 'Arkade Lightning quote request failed')
+      return true
+    }
+  )
+
   const fixture = makeLightningFixture()
   const summary = await fixture.window.ArkadeEnrollment.prepareLightningSend(
     fixture.lightningBolt11

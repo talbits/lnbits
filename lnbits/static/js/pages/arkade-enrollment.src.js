@@ -1394,6 +1394,8 @@ const prepareLightningSend = async bolt11 => {
   if (!identity || !activeBinding || activeBinding.state !== 'ready')
     throw new Error('wallet is locked')
   const facts = lightningInvoiceFacts(bolt11)
+  if (Date.now() >= facts.expiresAt * 1000)
+    throw new Error('Arkade Lightning invoice is expired')
   const networkConfig = lightningNetworkConfig(activeBinding.network)
   if (
     facts.amountSats < networkConfig.minQuoteAmountSat ||
@@ -1437,8 +1439,9 @@ const prepareLightningSend = async bolt11 => {
       )
     }
   } catch (error) {
-    console.error('Arkade Lightning quote request failed', error)
-    throw new Error('Arkade Lightning quote request failed')
+    throw Object.assign(new Error('Arkade Lightning quote request failed'), {
+      reason: error?.reason
+    })
   } finally {
     await transport?.close?.()
   }
