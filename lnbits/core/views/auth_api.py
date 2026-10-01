@@ -197,6 +197,8 @@ async def impersonate_user(
     user: User = Depends(check_admin),
     cookie_access_token: Annotated[str | None, Cookie()] = None,
 ) -> JSONResponse:
+    if settings.lnbits_effective_installation_mode == "arkade_noncustodial":
+        raise HTTPException(HTTPStatus.FORBIDDEN, "ARKADE_IMPERSONATION_UNSUPPORTED")
     if not cookie_access_token:
         raise HTTPException(
             HTTPStatus.UNAUTHORIZED, "Only cookie based impersonation is allowed."

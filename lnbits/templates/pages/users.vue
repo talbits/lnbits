@@ -731,6 +731,7 @@
                 </q-td>
                 <q-td>
                   <q-btn
+                    v-if="g.user.installationMode !== 'arkade_noncustodial'"
                     icon="face"
                     size="sm"
                     flat

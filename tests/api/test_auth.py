@@ -2529,6 +2529,32 @@ async def test_impersonate_user_success(http_client: AsyncClient, admin_user: Us
 
 
 @pytest.mark.anyio
+async def test_impersonate_user_arkade_refused(
+    http_client: AsyncClient, admin_user: User, settings: Settings, monkeypatch
+):
+    response = await http_client.post(
+        "/api/v1/auth", json={"username": admin_user.username, "password": "secret1234"}
+    )
+    assert response.status_code == 200
+    admin_token = response.json()["access_token"]
+    monkeypatch.setattr(
+        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
+    )
+    response = await http_client.post(
+        "/api/v1/auth/impersonate", json={"usr": uuid4().hex}
+    )
+    assert response.status_code == 403
+    assert response.json()["detail"] == "ARKADE_IMPERSONATION_UNSUPPORTED"
+    assert "admin_access_token" not in response.cookies
+    assert "is_lnbits_user_impersonated" not in response.cookies
+    # An old impersonation session can still return to its admin.
+    http_client.cookies.set("admin_access_token", admin_token)
+    response = await http_client.delete("/api/v1/auth/impersonate")
+    assert response.status_code == 200
+    assert response.cookies.get("cookie_access_token") == admin_token
+
+
+@pytest.mark.anyio
 async def test_impersonate_user_no_cookie(http_client: AsyncClient, admin_user: User):
     response = await http_client.post(
         "/api/v1/auth", json={"username": admin_user.username, "password": "secret1234"}
