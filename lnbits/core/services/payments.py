@@ -69,7 +69,7 @@ from .arkade import (
 )
 from .fiat_providers import check_fiat_status
 from .lnurl import execute_withdraw as lnurl_withdraw
-from .notifications import send_payment_notification_in_background
+from .notifications import send_payment_notification_for_wallet
 
 payment_lock = asyncio.Lock()
 wallets_payments_lock: dict[str, asyncio.Lock] = {}
@@ -1034,7 +1034,7 @@ async def _pay_internal_invoice(
     await update_payment(internal_payment, conn=conn)
     logger.success(f"internal payment successful {internal_payment.checking_id}")
 
-    await _send_payment_notification_in_background(
+    await send_payment_notification_for_wallet(
         wallet.id, payment, conn=conn
     )  # notify the sender
 
@@ -1118,7 +1118,7 @@ async def _pay_external_invoice(
             new_checking_id=payment_response.checking_id,
         )
 
-        await _send_payment_notification_in_background(wallet.id, payment, conn=conn)
+        await send_payment_notification_for_wallet(wallet.id, payment, conn=conn)
         logger.success(f"payment successful {payment.checking_id}")
 
     # payment pending
@@ -1345,16 +1345,6 @@ async def cancel_hold_invoice(payment: Payment) -> InvoiceResponse:
     await update_payment(payment)
 
     return response
-
-
-async def _send_payment_notification_in_background(
-    wallet_id: str, payment: Payment, conn: Connection | None = None
-):
-    # fetch balance again
-    wallet = await get_wallet(wallet_id, conn=conn)
-    if not wallet:
-        raise PaymentError(f"Could not fetch wallet '{wallet_id}'.", status="failed")
-    send_payment_notification_in_background(wallet, payment)
 
 
 async def update_invoice_from_paid_invoices_stream(checking_id: str) -> Payment | None:

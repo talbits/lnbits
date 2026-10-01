@@ -1,3 +1,4 @@
+import json
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -19,7 +20,7 @@ from lnbits.core.models import (
     PaymentState,
     Wallet,
 )
-from lnbits.core.services import arkade, payments
+from lnbits.core.services import arkade, notifications, payments
 from lnbits.db import SQLITE, Connection
 from lnbits.settings import settings
 from lnbits.task_manager import task_manager
@@ -541,7 +542,22 @@ async def test_same_account_transfer_is_atomic_and_replay_safe(
     wallets, request, address = await _prepare_same_account_transfer(
         connection, ready_mode, monkeypatch
     )
-    notify = mocker.patch.object(arkade, "send_payment_notification_in_background")
+
+    # Fetch balances from the database, rather than returning fixed fixture wallets.
+    async def get_current_wallet(wallet_id, conn=None):
+        row = await connection.fetchone(
+            "SELECT balance FROM balances WHERE wallet_id = :wallet_id",
+            {"wallet_id": wallet_id},
+        )
+        return wallets[wallet_id].copy(
+            update={"balance_msat": row["balance"] if row else 0}
+        )
+
+    monkeypatch.setattr(arkade, "get_wallet", get_current_wallet)
+    monkeypatch.setattr(notifications, "get_wallet", get_current_wallet)
+    notify = mocker.patch.object(
+        notifications, "send_payment_notification_in_background"
+    )
     while not task_manager.internal_invoice_queue.empty():
         task_manager.internal_invoice_queue.get_nowait()
 
@@ -571,6 +587,18 @@ async def test_same_account_transfer_is_atomic_and_replay_safe(
     assert sender.amount == -42_000 and receiver.amount == 42_000
     assert sender.fee == receiver.fee == 0
     assert notify.call_count == 2
+    assert [call.args[0].balance_msat for call in notify.call_args_list] == [
+        58_000,
+        42_000,
+    ]
+    websocket = mocker.patch.object(notifications.websocket_manager, "send")
+    for call in notify.call_args_list:
+        await notifications.send_ws_payment_notification(*call.args)
+    assert [
+        json.loads(call.args[1])["wallet_balance"]
+        for call in websocket.call_args_list
+        if "wallet_balance" in call.args[1]
+    ] == [58, 58, 42, 42]
     assert task_manager.internal_invoice_queue.qsize() == 1
     stored_request = await arkade.get_arkade_receive_request(
         request.native_request_id, conn=connection

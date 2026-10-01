@@ -30,6 +30,8 @@ from lnbits.core.models.notifications import (
 from lnbits.core.models.users import UserNotifications
 from lnbits.core.services.nostr import fetch_nip5_details, send_nostr_dm
 from lnbits.core.services.websockets import websocket_manager
+from lnbits.db import Connection
+from lnbits.exceptions import PaymentError
 from lnbits.helpers import check_callback_url, is_valid_email_address
 from lnbits.settings import settings
 from lnbits.utils.nostr import normalize_private_key
@@ -339,6 +341,16 @@ async def send_payment_notification(  # noqa: C901
             await dispatch_webhook(payment)
     except Exception as e:
         logger.error(f"Error dispatching webhook: {e!s}")
+
+
+async def send_payment_notification_for_wallet(
+    wallet_id: str, payment: Payment, conn: Connection | None = None
+):
+    # fetch balance again
+    wallet = await get_wallet(wallet_id, conn=conn)
+    if not wallet:
+        raise PaymentError(f"Could not fetch wallet '{wallet_id}'.", status="failed")
+    send_payment_notification_in_background(wallet, payment)
 
 
 def send_payment_notification_in_background(

@@ -110,7 +110,7 @@ from lnbits.db import SQLITE, Connection
 from lnbits.settings import settings
 from lnbits.task_manager import task_manager
 
-from .notifications import send_payment_notification_in_background
+from .notifications import send_payment_notification_for_wallet
 
 if TYPE_CHECKING:
     from .arkade_evidence import ArkadeLightningEvidenceVerdict
@@ -360,8 +360,10 @@ async def settle_arkade_same_account_transfer(  # noqa: C901
             raise ArkadeOutgoingError("ARKADE_OUTGOING_BUSY") from None
         raise
 
-    send_payment_notification_in_background(sender_wallet, sender_payment)
-    send_payment_notification_in_background(receiver_wallet, receiver_payment)
+    await send_payment_notification_for_wallet(wallet_id, sender_payment, conn=conn)
+    await send_payment_notification_for_wallet(
+        request.wallet_id, receiver_payment, conn=conn
+    )
     task_manager.internal_invoice_queue.put_nowait(receiver_payment)
     return sender_payment, receiver_payment
 
