@@ -212,7 +212,7 @@ include('components/lnbits-error.vue') %}
         </q-item-label>
       </q-item-section>
     </q-item>
-    <q-item>
+    <q-item v-if="payment.payment_hash">
       <q-item-section>
         <q-item-label v-text="$t('payment_hash')"></q-item-label>
         <q-item-label
@@ -237,7 +237,7 @@ include('components/lnbits-error.vue') %}
         </q-tooltip>
       </q-item-section>
     </q-item>
-    <q-item>
+    <q-item v-if="payment.bolt11">
       <q-item-section>
         <q-item-label v-text="$t('Invoice')"></q-item-label>
         <q-item-label
@@ -260,6 +260,25 @@ include('components/lnbits-error.vue') %}
         <q-tooltip>
           <span v-text="payment.bolt11"></span>
         </q-tooltip>
+      </q-item-section>
+    </q-item>
+    <q-item v-if="payment.arkade_address || payment.native_id">
+      <q-item-section>
+        <q-item-label>Arkade</q-item-label>
+        <q-item-label
+          caption
+          class="text-wrap"
+          v-text="payment.arkade_address || payment.native_id"
+        ></q-item-label>
+      </q-item-section>
+      <q-item-section side>
+        <q-icon
+          name="content_copy"
+          @click="utils.copyText(payment.arkade_address || payment.native_id)"
+          size="1em"
+          color="grey"
+          class="cursor-pointer"
+        />
       </q-item-section>
     </q-item>
     <q-item>

@@ -166,6 +166,8 @@ window.app.component('lnbits-payment-list', {
         bolt11: data.bolt11,
         preimage: data.preimage,
         payment_hash: data.payment_hash,
+        native_id: data.native_id,
+        arkade_address: data.arkade_address,
         expiry: data.expiry,
         extra: data.extra ?? {},
         wallet_id: data.wallet_id,
@@ -364,7 +366,7 @@ window.app.component('lnbits-payment-list', {
         .catch(LNbits.utils.notifyApiError)
     },
     paymentTableRowKey(row) {
-      return row.payment_hash + row.amount
+      return (row.payment_hash || row.native_id) + row.amount
     },
     async exportCSV(detailed = false) {
       // status is important for export but it is not in paymentsTable

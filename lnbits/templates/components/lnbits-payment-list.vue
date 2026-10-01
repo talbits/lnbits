@@ -483,6 +483,7 @@
                   <q-btn
                     outline
                     color="grey"
+                    v-if="props.row.payment_hash"
                     @click="checkPayment(props.row.payment_hash)"
                     icon="refresh"
                     :label="$t('payment_check')"
