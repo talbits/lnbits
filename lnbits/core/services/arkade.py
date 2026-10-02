@@ -3698,14 +3698,11 @@ async def reconcile_arkade_receive(  # noqa: C901
                 )
     requests = await get_arkade_receive_requests(account_id, conn=conn)
     for request in requests:
-        if request.state == "reconciliation_required":
-            required = True
-            last_error = last_error or "ARKADE_RECONCILIATION_REQUIRED"
-            continue
         total = await get_arkade_receive_request_total(
             request.native_request_id, conn=conn
         )
         if total > request.amount_sat:
+            # Durable: the request was over-received. Re-derived every pass.
             required = True
             last_error = "ARKADE_RECEIVE_AMOUNT_CONFLICT"
             await mark_arkade_receive_outpoints_conflict(
@@ -3717,78 +3714,82 @@ async def reconcile_arkade_receive(  # noqa: C901
                 request.native_request_id,
                 conn,
             )
-        elif total == request.amount_sat and request.state in {
-            "acknowledged",
-            "settled",
-        }:
-            address = request.address
-            payment = await get_payment_by_native_id(
-                request.native_request_id, conn=conn
-            )
-            if payment:
-                if (
-                    payment.protocol != "arkade"
-                    or payment.native_id != request.native_request_id
-                    or payment.wallet_id != request.wallet_id
-                    or payment.amount != request.amount_sat * 1000
-                    or not address
-                    or payment.arkade_address != address
-                ):
-                    required = True
-                    last_error = "ARKADE_RECONCILIATION_REQUIRED"
-                    await mark_arkade_receive_outpoints_conflict(
+            continue
+        if total != request.amount_sat:
+            # Not fully received, or an attributed outpoint is under conflict
+            # (the total counts only 'valid' rows, so a conflict drops it below
+            # the amount). Nothing to settle either way: re-evaluate next pass
+            # instead of recording a request as settled without its amount.
+            continue
+        # Fully received. A request previously marked reconciliation_required is
+        # re-evaluated here rather than skipped, so a condition that has since
+        # resolved can settle instead of latching the account forever.
+        address = request.address
+        payment = await get_payment_by_native_id(request.native_request_id, conn=conn)
+        if payment:
+            if (
+                payment.protocol != "arkade"
+                or payment.native_id != request.native_request_id
+                or payment.wallet_id != request.wallet_id
+                or payment.amount != request.amount_sat * 1000
+                or not address
+                or payment.arkade_address != address
+            ):
+                required = True
+                last_error = "ARKADE_RECONCILIATION_REQUIRED"
+                await mark_arkade_receive_outpoints_conflict(
+                    request.native_request_id, conn=conn
+                )
+                await _mark_receive_reconciliation_required(
+                    account_id,
+                    last_error,
+                    request.native_request_id,
+                    conn,
+                )
+                continue
+            if payment.status in {
+                PaymentState.PENDING.value,
+                PaymentState.FAILED.value,
+            }:
+                updated = await compare_and_set_payment_success(
+                    request.native_request_id,
+                    wallet_id=request.wallet_id,
+                    amount_msat=request.amount_sat * 1000,
+                    arkade_address=address,
+                    conn=conn,
+                )
+                if updated:
+                    payment.status = PaymentState.SUCCESS.value
+                    settled_payments.append(payment)
+                else:
+                    current = await get_payment_by_native_id(
                         request.native_request_id, conn=conn
                     )
-                    await _mark_receive_reconciliation_required(
-                        account_id,
-                        last_error,
-                        request.native_request_id,
-                        conn,
-                    )
-                    continue
-                if payment.status in {
-                    PaymentState.PENDING.value,
-                    PaymentState.FAILED.value,
-                }:
-                    updated = await compare_and_set_payment_success(
-                        request.native_request_id,
-                        wallet_id=request.wallet_id,
-                        amount_msat=request.amount_sat * 1000,
-                        arkade_address=address,
-                        conn=conn,
-                    )
-                    if updated:
-                        payment.status = PaymentState.SUCCESS.value
-                        settled_payments.append(payment)
-                    else:
-                        current = await get_payment_by_native_id(
-                            request.native_request_id, conn=conn
+                    if not current or current.status != PaymentState.SUCCESS.value:
+                        required = True
+                        last_error = "ARKADE_RECONCILIATION_REQUIRED"
+                        await _mark_receive_reconciliation_required(
+                            account_id,
+                            last_error,
+                            request.native_request_id,
+                            conn,
                         )
-                        if not current or current.status != PaymentState.SUCCESS.value:
-                            required = True
-                            last_error = "ARKADE_RECONCILIATION_REQUIRED"
-                            await _mark_receive_reconciliation_required(
-                                account_id,
-                                last_error,
-                                request.native_request_id,
-                                conn,
-                            )
-                            continue
-                elif payment.status != PaymentState.SUCCESS.value:
-                    required = True
-                    last_error = "ARKADE_RECONCILIATION_REQUIRED"
-                    await _mark_receive_reconciliation_required(
-                        account_id,
-                        last_error,
-                        request.native_request_id,
-                        conn,
-                    )
-                    continue
-            if request.state != "settled":
-                now = datetime.now(timezone.utc)
-                await settle_arkade_receive_request(
-                    request.native_request_id, now, conn=conn
+                        continue
+            elif payment.status != PaymentState.SUCCESS.value:
+                required = True
+                last_error = "ARKADE_RECONCILIATION_REQUIRED"
+                await _mark_receive_reconciliation_required(
+                    account_id,
+                    last_error,
+                    request.native_request_id,
+                    conn,
                 )
+                continue
+        if request.state != "settled":
+            now = datetime.now(timezone.utc)
+            await settle_arkade_receive_request(
+                request.native_request_id, now, conn=conn
+            )
     # Recorded conflicts are durable facts that evidence may stop re-reporting
     # once the offending VTXO leaves the indexer, so they are read back rather
     # than re-derived. Everything else clears once its cause is gone. Checked

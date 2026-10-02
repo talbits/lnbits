@@ -1401,3 +1401,100 @@ async def test_disputed_intent_stays_reconciliation_required(connection, ready_m
     state = await arkade.get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
     assert state and state.state == "reconciliation_required"
     assert state.last_error == "ARKADE_LIGHTNING_EVIDENCE_CONTRADICTORY"
+
+
+async def _mark_request_reconciliation_required(connection, request):
+    await connection.execute(
+        "UPDATE arkade_receive_requests SET state = "
+        "'reconciliation_required', \"index\" = 0, address = :address, "
+        "script = :script, child_xonly_pubkey = :child "
+        "WHERE native_request_id = :native_id",
+        {
+            "address": "tark1latchedrequest",
+            "script": "51",
+            "child": "ab" * 32,
+            "native_id": request.native_request_id,
+        },
+    )
+
+
+async def _attribute_outpoint(connection, request, txid, status):
+    await connection.execute(
+        "INSERT INTO arkade_receive_outpoints "
+        "(account_id, native_request_id, txid, vout, amount_sat, script, status) "
+        "VALUES (:account_id, :native_id, :txid, 0, :amount, :script, :status)",
+        {
+            "account_id": ACCOUNT_ID,
+            "native_id": request.native_request_id,
+            "txid": txid,
+            "amount": request.amount_sat,
+            "script": "51",
+            "status": status,
+        },
+    )
+
+
+@pytest.mark.anyio
+async def test_marked_request_settles_once_its_condition_is_gone(
+    connection, ready_mode
+):
+    """A marked request must be re-evaluated, not skipped forever."""
+    request = await _create(connection)
+    await _mark_request_reconciliation_required(connection, request)
+    await _attribute_outpoint(connection, request, "9a" * 32, "valid")
+    evidence = [ArkadeIndexerVtxo(txid="9a" * 32, vout=0, amount_sat=100, script="51")]
+
+    await arkade.reconcile_arkade_receive(ACCOUNT_ID, evidence, conn=connection)
+
+    stored = await arkade.get_arkade_receive_request(
+        request.native_request_id, conn=connection
+    )
+    assert stored is not None and stored.state == "settled"
+    state = await arkade.get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
+    assert state and state.state == "ok"
+
+
+@pytest.mark.anyio
+async def test_marked_request_never_settles_on_a_conflicted_total(
+    connection, ready_mode
+):
+    """Conflicted value drops the total, which must not be read as settled."""
+    request = await _create(connection)
+    await _mark_request_reconciliation_required(connection, request)
+    await _attribute_outpoint(connection, request, "9b" * 32, "conflict")
+
+    await arkade.reconcile_arkade_receive(ACCOUNT_ID, [], conn=connection)
+
+    stored = await arkade.get_arkade_receive_request(
+        request.native_request_id, conn=connection
+    )
+    assert stored is not None and stored.state == "reconciliation_required"
+    state = await arkade.get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
+    assert state and state.state == "reconciliation_required"
+    assert state.last_error == "ARKADE_OUTPOINT_CONFLICT"
+
+
+@pytest.mark.anyio
+async def test_acknowledged_request_does_not_settle_before_its_amount(
+    connection, ready_mode
+):
+    """Partial receipt is not settlement."""
+    request = await _create(connection)
+    await connection.execute(
+        "UPDATE arkade_receive_requests SET state = 'acknowledged', "
+        '"index" = 0, address = :address, script = :script, '
+        "child_xonly_pubkey = :child WHERE native_request_id = :native_id",
+        {
+            "address": "tark1partial",
+            "script": "51",
+            "child": "cd" * 32,
+            "native_id": request.native_request_id,
+        },
+    )
+
+    await arkade.reconcile_arkade_receive(ACCOUNT_ID, [], conn=connection)
+
+    stored = await arkade.get_arkade_receive_request(
+        request.native_request_id, conn=connection
+    )
+    assert stored is not None and stored.state == "acknowledged"
