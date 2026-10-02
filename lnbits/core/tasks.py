@@ -1,7 +1,5 @@
 import asyncio
-import time
 
-import httpx
 from loguru import logger
 
 from lnbits.core.crud import create_audit_entry
@@ -32,42 +30,19 @@ from lnbits.utils.cache import cache
 from lnbits.utils.exchange_rates import btc_price_from_aggregator, btc_rates
 
 audit_queue: asyncio.Queue[AuditEntry] = asyncio.Queue()
-arkade_changed = asyncio.Event()
-
-
-async def listen_arkade_transactions():
-    """Wake reconciliation from public SDK-compatible /v1/txs notifications.
-
-    Notifications are hints only; reconciliation still reads verified evidence.
-    Reconnecting triggers catch-up; the separate loop also polls every 30s.
-    """
-    if settings.lnbits_effective_installation_mode != "arkade_noncustodial":
-        return
-    arkade_changed.set()
-    async with httpx.AsyncClient(timeout=httpx.Timeout(30, read=None)) as client:
-        async with client.stream(
-            "GET", f"{settings.lnbits_arkade_server_url}/v1/txs"
-        ) as response:
-            response.raise_for_status()
-            async for line in response.aiter_lines():
-                if line.startswith("data:") or line.startswith("{"):
-                    arkade_changed.set()
 
 
 async def reconcile_arkade_events():
+    """Reconcile pending Arkade payments once per registered task interval.
+
+    The reference wallet discovers Arkade activity by polling verified
+    evidence. The SDK's `/v1/txs` server-sent event stream is optional and
+    is not implemented by the Mutinynet server, so reconciliation must not
+    depend on it.
+    """
     if settings.lnbits_effective_installation_mode != "arkade_noncustodial":
         return
-    # The single consumer prevents event/fallback checks from overlapping.
-    while True:
-        try:
-            await asyncio.wait_for(arkade_changed.wait(), timeout=30)
-        except TimeoutError:
-            pass
-        arkade_changed.clear()
-        started = time.monotonic()
-        await check_pending_payments()
-        # Batch traffic is global. Coalesce bursts to the old maximum frequency.
-        await asyncio.sleep(max(0, 5 - (time.monotonic() - started)))
+    await check_pending_payments()
 
 
 async def dispatch_arkade_lightning_terminal_events() -> None:  # noqa: C901
