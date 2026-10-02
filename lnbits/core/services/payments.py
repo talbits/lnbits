@@ -622,7 +622,7 @@ async def check_pending_payments():  # noqa: C901
                     f"Task: Arkade receive check failed for account {account_id}: {exc}"
                 )
                 continue
-        logger.info(
+        logger.debug(
             "Task: Arkade pending check finished for "
             "settled payments "
             f"(took {time.time() - start_time:0.3f} s)"

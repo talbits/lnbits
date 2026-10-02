@@ -2325,7 +2325,8 @@ async def fetch_arkade_indexer_vtxos(  # noqa: C901
         scripts = sorted({request.script for request in requests if request.script})
         changes = await (conn or db).fetchall(
             "SELECT change_script AS script FROM arkade_outgoing_intents "
-            "WHERE account_id = :account_id AND status = 'settled' "
+            "WHERE account_id = :account_id "
+            "AND status IN ('submitted', 'settled', 'disputed') "
             "AND change_script IS NOT NULL UNION "
             "SELECT refund_pk_script AS script FROM arkade_outgoing_intents "
             "WHERE account_id = :account_id AND refund_pk_script IS NOT NULL",
@@ -3317,7 +3318,7 @@ async def reconcile_arkade_receive(  # noqa: C901
             required = True
             last_error = "ARKADE_RECONCILIATION_REQUIRED"
     changes = await database.fetchall(
-        "SELECT arkade_txid, change_script, change_amount_sat "
+        "SELECT status, arkade_txid, change_script, change_amount_sat "
         "FROM arkade_outgoing_intents "
         "WHERE account_id = :account_id "
         "AND status IN ('submitted', 'settled', 'disputed') "
@@ -3332,9 +3333,9 @@ async def reconcile_arkade_receive(  # noqa: C901
         key = (row["arkade_txid"], 1)
         vtxo = observed.get(key)
         if vtxo is None:
-            # A recorded change that is no longer observed is a divergence; an
-            # unrecorded one means this funding produced no change output.
-            if recorded:
+            # Submitted change may not be indexed yet. Outgoing verification
+            # owns that pending state; a missing terminal change is divergence.
+            if recorded and row["status"] != "submitted":
                 required = True
                 last_error = "ARKADE_RECONCILIATION_REQUIRED"
             continue

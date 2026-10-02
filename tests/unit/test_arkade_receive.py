@@ -1132,3 +1132,86 @@ async def test_browser_funded_swap_attributes_spend_and_change(connection, ready
                 ]
             }
         )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("status", "observed_script", "required"),
+    [
+        ("submitted", None, False),
+        ("settled", None, True),
+        ("submitted", "5120" + "a1" * 32, False),
+        ("submitted", "5120" + "a2" * 32, True),
+    ],
+)
+async def test_change_reconciliation_waits_for_verified_settlement(
+    connection, ready_mode, status, observed_script, required
+):
+    funding_txid = "a0" * 32
+    intent_id = await _browser_funded_lightning_intent(
+        connection, funding_txid=funding_txid
+    )
+    await connection.execute(
+        "UPDATE arkade_outgoing_intents SET destination_kind = 'arkade_address', "
+        "max_fee_msat = 0, status = :status, change_index = 1, "
+        "change_script = :script, change_amount_sat = 10 WHERE intent_id = :intent",
+        {"status": status, "script": "5120" + "a1" * 32, "intent": intent_id},
+    )
+    evidence = (
+        [
+            ArkadeIndexerVtxo(
+                txid=funding_txid, vout=1, amount_sat=10, script=observed_script
+            )
+        ]
+        if observed_script
+        else []
+    )
+    await arkade.reconcile_arkade_receive(ACCOUNT_ID, evidence, conn=connection)
+    state = await arkade.get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
+    assert state is not None
+    assert (state.state == "reconciliation_required") is required
+
+
+@pytest.mark.anyio
+async def test_indexer_queries_submitted_native_change(
+    connection, ready_mode, monkeypatch
+):
+    intent_id = await _browser_funded_lightning_intent(
+        connection, funding_txid="a0" * 32
+    )
+    script = "5120" + "a1" * 32
+    await connection.execute(
+        "UPDATE arkade_outgoing_intents SET destination_kind = 'arkade_address', "
+        "max_fee_msat = 0, change_index = 1, change_script = :script, "
+        "change_amount_sat = 10 WHERE intent_id = :intent",
+        {"script": script, "intent": intent_id},
+    )
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, _url, params):
+            assert [value for key, value in params if key == "scripts"] == [script]
+            return type(
+                "Response",
+                (),
+                {
+                    "raise_for_status": lambda _self: None,
+                    "json": lambda _self: {
+                        "vtxos": [],
+                        "page": {"current": 1, "next": 1, "total": 1},
+                    },
+                },
+            )()
+
+    # Without the submitted change script the fetch returns early, never GETs.
+    client = Client()
+    get = AsyncMock(wraps=client.get)
+    monkeypatch.setattr(client, "get", get)
+    monkeypatch.setattr(arkade.httpx, "AsyncClient", lambda **_kwargs: client)
+    assert await arkade.fetch_arkade_indexer_vtxos(ACCOUNT_ID, connection) == []
+    get.assert_awaited_once()
