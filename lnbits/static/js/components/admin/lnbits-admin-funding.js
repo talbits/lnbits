@@ -11,6 +11,7 @@ window.app.component('lnbits-admin-funding', {
   },
   methods: {
     getAudit() {
+      if (this.g.user.installationMode === 'arkade_noncustodial') return
       LNbits.api
         // TODO: should not use admin key here
         .request('GET', '/admin/api/v1/audit', this.g.user.wallets[0].adminkey)

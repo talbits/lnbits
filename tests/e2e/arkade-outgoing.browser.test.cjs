@@ -483,7 +483,7 @@ const makeLightningFixture = () => {
     account_id: fixture.window.g.user.id,
     wallet_id: 'wallet-1',
     amount_msat: 500_000,
-    max_fee_msat: 2_000,
+    max_fee_msat: 100_000,
     destination: lightningBolt11,
     bolt11: lightningBolt11,
     payment_hash: paymentHash,
@@ -600,6 +600,19 @@ async function lightningBrowserChecks() {
     }
   )
 
+  const feeLimited = makeLightningFixture()
+  feeLimited.quote.from_amount = 554
+  await assert.rejects(
+    feeLimited.window.ArkadeEnrollment.prepareLightningSend(
+      feeLimited.lightningBolt11,
+      4
+    ),
+    error =>
+      error.reason === 'fee_too_high' &&
+      error.feeSat === 54 &&
+      error.maxFeeSat === 4
+  )
+  assert.equal(feeLimited.requests.length, 0)
   const fixture = makeLightningFixture()
   const summary = await fixture.window.ArkadeEnrollment.prepareLightningSend(
     fixture.lightningBolt11
@@ -624,7 +637,7 @@ async function lightningBrowserChecks() {
       bolt11: fixture.lightningBolt11,
       paymentHash: fixture.paymentHash,
       amountMsat: 500_000,
-      maxFeeMsat: 2_000,
+      maxFeeMsat: 100_000,
       quotePair: fixture.quote.pair,
       quoteFromAmountSat: 501,
       quoteToAmountSat: 500,
@@ -961,6 +974,66 @@ async function main() {
       error.status === 'submitted' && error.reconciliationRequired === true
   )
   assert.equal(broadcast.wallet.submitCount, 1)
+
+  const stalled = makeFixture({amountSat: 1_000, inputValue: 1_000})
+  const stalledPlan = await stalled.window.ArkadeEnrollment.prepareOutgoing(
+    intentId,
+    walletId
+  )
+  let finishBroadcast
+  stalled.wallet.buildAndSubmitOffchainTx = async () => {
+    stalled.wallet.submitCount += 1
+    return new Promise(resolve => {
+      finishBroadcast = resolve
+    })
+  }
+  const deadlines = []
+  stalled.window.setTimeout = (callback, delay) => {
+    if (delay === 30_000) {
+      deadlines.push(callback)
+      return 0
+    }
+    return setTimeout(callback, delay)
+  }
+  const pendingSend = stalled.window.ArkadeEnrollment.submitOutgoing(
+    stalledPlan,
+    {approved: true}
+  )
+  const timeoutAssertion = assert.rejects(
+    pendingSend,
+    error => error.reconciliationRequired === true
+  )
+  await new Promise(resolve => setTimeout(resolve, 0))
+  assert.equal(stalled.wallet.submitCount, 1)
+  deadlines.shift()()
+  await timeoutAssertion
+  const joinedRecovery = stalled.window.ArkadeEnrollment.recoverOutgoing(
+    intentId,
+    {approved: true}
+  )
+  finishBroadcast({arkTxid: 'ee'.repeat(32)})
+  await joinedRecovery
+  assert.equal(stalled.wallet.submitCount, 1)
+
+  const reservedRecovery = makeFixture({amountSat: 1_000, inputValue: 1_000})
+  await reservedRecovery.window.ArkadeEnrollment.prepareOutgoing(
+    intentId,
+    walletId
+  )
+  reservedRecovery.window.LNbits.api.arkadeOutgoingRelease = async () => {
+    reservedRecovery.state.status = 'released'
+    return {data: {status: 'released'}}
+  }
+  const releasedReservation =
+    await reservedRecovery.window.ArkadeEnrollment.recoverOutgoing(intentId, {
+      approved: true
+    })
+  assert.equal(releasedReservation.status, 'released')
+  assert.equal(reservedRecovery.wallet.submitCount, 0)
+  assert.equal(
+    (await reservedRecovery.window.ArkadeEnrollment.listOutgoing()).length,
+    0
+  )
 
   const recovery = makeFixture({amountSat: 1_000, inputValue: 1_000})
   const recoveryPlan = await recovery.window.ArkadeEnrollment.prepareOutgoing(

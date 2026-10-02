@@ -6,7 +6,7 @@ from shutil import make_archive
 from subprocess import Popen
 from urllib.parse import ParseResult, urlparse
 
-from fastapi import APIRouter, Depends, File
+from fastapi import APIRouter, Depends, File, HTTPException
 from fastapi.responses import FileResponse
 
 from lnbits.core.models.notifications import NotificationType
@@ -80,6 +80,12 @@ async def api_get_settings(
 async def api_update_settings(
     data: UpdateSettings, account: Account = Depends(check_admin)
 ):
+    if (
+        settings.lnbits_effective_installation_mode == "arkade_noncustodial"
+        and "lnbits_backend_wallet_class" in data.__fields_set__
+        and data.lnbits_backend_wallet_class != settings.lnbits_backend_wallet_class
+    ):
+        raise HTTPException(HTTPStatus.BAD_REQUEST, "ARKADE_FUNDING_SOURCE_UNSUPPORTED")
     enqueue_admin_notification(
         NotificationType.settings_update, {"username": account.username}
     )

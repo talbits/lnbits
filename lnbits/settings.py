@@ -1451,7 +1451,10 @@ class PublicSettings(BaseModel):
             hasNodemanager=settings.has_nodemanager,
             showNodemanager=settings.lnbits_node_ui and settings.has_nodemanager,
             customLogo=settings.lnbits_custom_logo,
-            showVoidwallet=settings.lnbits_backend_wallet_class == "VoidWallet",
+            showVoidwallet=(
+                settings.lnbits_effective_installation_mode != "arkade_noncustodial"
+                and settings.lnbits_backend_wallet_class == "VoidWallet"
+            ),
             version=settings.version,
             showHomePageElements=settings.lnbits_show_home_page_elements,
             hideApi=settings.lnbits_hide_api,

@@ -209,18 +209,22 @@
         <q-card-section>
           <div class="text-subtitle1">Arkade outgoing recovery</div>
           <div class="text-caption q-mb-sm">
-            An outgoing payment needs wallet recovery before it can finish.
+            Outgoing attempts awaiting confirmation. Recover only if an attempt
+            remains unresolved.
           </div>
           <div
             v-for="record in arkadeRecovery"
             :key="record.intentId"
             class="row items-center q-gutter-sm q-mb-sm"
           >
-            <div class="col">
+            <div class="col" style="min-width: 0">
               <div
-                v-text="`${record.amountSat} sat to ${record.destination}`"
+                class="ellipsis"
+                v-text="
+                  `${record.amountSat} sat to ${record.destination.slice(0, 12)}…${record.destination.slice(-8)}`
+                "
               ></div>
-              <div class="text-caption" v-text="record.intentId"></div>
+              <div class="text-caption ellipsis" v-text="record.intentId"></div>
             </div>
             <q-btn
               color="primary"
@@ -801,6 +805,34 @@
         </div>
         <q-separator></q-separator>
         <h6 class="text-center" v-text="parse.invoice.description"></h6>
+        <div
+          v-if="g.user.installationMode === 'arkade_noncustodial'"
+          class="q-mb-md"
+        >
+          <q-input
+            filled
+            dense
+            type="number"
+            v-model.number="parse.lightningFeeCap"
+            label="Maximum swap fee (sats)"
+            min="1"
+            max="50000"
+            :disable="parse.sending || !!parse.lightningQuote"
+          ></q-input>
+          <p class="text-caption q-mt-sm q-mb-none">
+            The invoice may already include the receiver's fee. Your send fee is
+            added on top.
+          </p>
+          <div v-if="parse.lightningQuote" class="q-mt-md">
+            <div
+              v-text="`Invoice: ${parse.lightningQuote.amountSat} sats`"
+            ></div>
+            <div v-text="`Swap fee: ${parse.lightningQuote.feeSat} sats`"></div>
+            <strong
+              v-text="`Total: ${parse.lightningQuote.fundAmount} sats`"
+            ></strong>
+          </div>
+        </div>
         <q-input
           autogrow
           filled
@@ -913,7 +945,14 @@
             color="primary"
             @click="payInvoice"
             :disable="parse.sending || !g.wallet.canSendPayments"
-            :label="parse.sending ? $t('sending') + '...' : $t('pay')"
+            :label="
+              parse.sending
+                ? $t('sending') + '...'
+                : g.user.installationMode === 'arkade_noncustodial' &&
+                    !parse.lightningQuote
+                  ? 'Check fee'
+                  : $t('pay')
+            "
           ></q-btn>
           <q-btn
             v-close-popup

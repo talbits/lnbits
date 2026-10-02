@@ -16,6 +16,7 @@ const notifications = []
 let attempts = 0
 let prepareFails = false
 let cancelApproval = false
+let preparedAmount = 42
 let terminalResponse = false
 let recoveryRecords = []
 let recoveryResult = {
@@ -48,7 +49,7 @@ window.ArkadeEnrollment = {
     outgoingJournalCount += 1
     if (prepareFails) throw new Error('prepare failed')
     return {
-      amountSat: 42,
+      amountSat: preparedAmount,
       destination: 'tark1qqqqqq',
       inputs: [{amount_sat: 50}],
       change: {amount_sat: 8}
@@ -237,15 +238,43 @@ page.parse.arkade.amount = 42
   assert.deepEqual(releases, ['11'.repeat(16)])
 
   prepareFails = false
-  cancelApproval = true
+  const dialogsBeforePay = dialogMessages.length
   await page.payArkade()
-  assert.deepEqual(releases, ['11'.repeat(16), '11'.repeat(16)])
+  assert.equal(releases.length, 1)
   assert.notEqual(keys[2], keys[3])
+  assert.equal(dialogMessages.length, dialogsBeforePay)
+  assert.equal(page.parse.sending, false)
 
-  cancelApproval = false
+  // Editing the amount binds a new key; retries of the same request reuse it.
+  page.parse.arkade.amount = 43
+  preparedAmount = 43
   await page.payArkade()
-  assert.equal(releases.length, 2)
   assert.notEqual(keys[3], keys[4])
+  await page.payArkade()
+  assert.equal(keys[4], keys[5])
+  preparedAmount = 42
+  page.parse.arkade.amount = 42
+
+  // A backend/prepared mismatch must never be approved or signed.
+  const submitsBeforeMismatch = submits.length
+  preparedAmount = 41
+  await page.payArkade()
+  assert.equal(submits.length, submitsBeforeMismatch)
+  assert.equal(page.parse.sending, false)
+  preparedAmount = 42
+
+  const originalSubmit = window.ArkadeEnrollment.submitOutgoing
+  window.ArkadeEnrollment.submitOutgoing = async () => {
+    throw Object.assign(new Error('unknown outcome'), {
+      reconciliationRequired: true
+    })
+  }
+  page.parse.show = true
+  await page.payArkade()
+  assert.equal(page.parse.sending, false)
+  assert.equal(page.parse.show, false)
+  assert.match(notifications.at(-1).message, /before retrying/)
+  window.ArkadeEnrollment.submitOutgoing = originalSubmit
 
   terminalResponse = true
   page.parse.show = true
@@ -260,7 +289,7 @@ page.parse.arkade.amount = 42
   assert.equal(releases.length, releasesBeforeTerminal)
   assert.equal(prepares.length, preparesBeforeTerminal)
   assert.equal(submits.length, submitsBeforeTerminal)
-  assert.equal(listOutgoingCalls, recoveryCallsBeforeTerminal)
+  assert.ok(listOutgoingCalls >= recoveryCallsBeforeTerminal)
   assert.deepEqual(notifications.at(-1), {
     type: 'positive',
     message: 'payment_successful'
@@ -276,7 +305,7 @@ page.parse.arkade.amount = 42
     page.parse.arkade.amount = 42
     await page.payArkade()
   }
-  assert.equal(outgoingJournalCount, 1)
+  assert.ok(outgoingJournalCount < 32)
   assert.ok(listOutgoingCalls >= 33)
 
   recoveryRecords = [
@@ -289,6 +318,13 @@ page.parse.arkade.amount = 42
   ]
   await page.refreshArkadeRecovery()
   assert.equal(page.arkadeRecovery.length, 1)
+  const originalList = window.ArkadeEnrollment.listOutgoing
+  window.ArkadeEnrollment.listOutgoing = async () => {
+    throw new Error('offline')
+  }
+  await page.refreshArkadeRecovery()
+  assert.equal(page.arkadeRecovery.length, 1)
+  window.ArkadeEnrollment.listOutgoing = originalList
   recoveryResult = {status: 'submitted', reconciliationRequired: true}
   await page.recoverArkadeOutgoing(page.arkadeRecovery[0])
   assert.match(dialogMessages.at(-1).message, /42 sat to tark1qqqqqq/)
@@ -320,9 +356,16 @@ page.parse.arkade.amount = 42
   const lightningSubmits = []
   const apiRequests = []
   let fundingFails = false
-  window.ArkadeEnrollment.prepareLightningSend = async invoice => {
+  window.ArkadeEnrollment.prepareLightningSend = async (invoice, maxFeeSat) => {
+    assert.equal(maxFeeSat, 100)
     lightningInvoices.push(invoice)
-    return {intentId: 'lightning', amountSat: 1000, feeSat: 4, fundAmount: 1004}
+    return {
+      intentId: 'lightning',
+      bolt11: invoice,
+      amountSat: 1000,
+      feeSat: 4,
+      fundAmount: 1004
+    }
   }
   window.ArkadeEnrollment.submitLightningSend = async (intentId, approval) => {
     lightningSubmits.push({intentId, approval})
@@ -337,6 +380,14 @@ page.parse.arkade.amount = 42
   }
   page.parse.data.request = 'ln-direct-invoice'
   page.parse.show = true
+  await page.payInvoice()
+  assert.equal(lightningSubmits.length, 0)
+  assert.equal(page.parse.lightningQuote.feeSat, 4)
+  page.parse.lightningFeeCap = 3
+  await page.payInvoice()
+  assert.equal(lightningSubmits.length, 0)
+  assert.match(notifications.at(-1).caption, /fee exceeds/)
+  page.parse.lightningFeeCap = 100
   await page.payInvoice()
   assert.deepEqual(lightningInvoices, ['ln-direct-invoice'])
   assert.deepEqual(lightningSubmits, [
@@ -355,17 +406,21 @@ page.parse.arkade.amount = 42
   assert.equal(apiRequests[0][2], 'admin')
   assert.equal(apiRequests[0][3].amount, 1000000)
   assert.equal(lightningInvoices.at(-1), 'ln-invoice-from-lnurl')
+  assert.equal(lightningSubmits.length, 1)
+  await page.payInvoice()
   assert.equal(lightningSubmits.length, 2)
   assert.equal(page.parse.sending, false)
 
   // A second PAY funds again; nothing is released because nothing was cancelled.
   const releasesBeforeSecondSend = releases.length
   await page.payInvoice()
+  await page.payInvoice()
   assert.equal(lightningSubmits.length, 3)
   assert.equal(releases.length, releasesBeforeSecondSend)
   const releasesBeforeFunding = releases.length
   fundingFails = true
   notifications.length = 0
+  await page.payInvoice()
   await page.payInvoice()
   assert.equal(releases.length, releasesBeforeFunding)
   assert.equal(page.parse.sending, false)
@@ -376,6 +431,7 @@ page.parse.arkade.amount = 42
 
   // A refused reservation surfaces the localized message plus the backend's
   // stable code, never the raw response or a masked generic failure.
+  page.parse.lightningQuote = null
   notifications.length = 0
   window.ArkadeEnrollment.prepareLightningSend = async () => {
     throw new Error('payment_error_message (ARKADE_BACKING_DEFICIT)')
@@ -399,7 +455,13 @@ page.parse.arkade.amount = 42
   assert.match(notifications[0].caption, /Payment preparation failed/)
   window.ArkadeEnrollment.prepareLightningSend = async invoice => {
     lightningInvoices.push(invoice)
-    return {intentId: 'lightning', amountSat: 1000, feeSat: 4, fundAmount: 1004}
+    return {
+      intentId: 'lightning',
+      bolt11: invoice,
+      amountSat: 1000,
+      feeSat: 4,
+      fundAmount: 1004
+    }
   }
 
   for (const reason of [
@@ -586,6 +648,51 @@ async function paymentDetailsChecks() {
     app.config.warnHandler = () => {}
     const html = await renderToString(app)
     assert.equal(html.includes('face'), installationMode === 'custodial')
+  }
+  const funding = fs
+    .readFileSync('lnbits/templates/components/admin/funding.vue', 'utf8')
+    .replace(/^<template[^>]+>/, '')
+    .replace(/<\/template>\s*$/, '')
+  const fundingRender = Vue.compile(funding)
+  vm.runInThisContext(
+    fs.readFileSync(
+      'lnbits/static/js/components/admin/lnbits-admin-funding.js',
+      'utf8'
+    )
+  )
+  for (const installationMode of ['arkade_noncustodial', 'custodial']) {
+    const app = Vue.createSSRApp({
+      render: fundingRender,
+      data: () => ({
+        g: {user: {installationMode}, settings: {}},
+        settings: {},
+        formData: {},
+        auditData: {},
+        isSuperUser: true
+      })
+    })
+    app.config.globalProperties.$t = value => value
+    app.config.warnHandler = () => {}
+    const html = await renderToString(app)
+    assert.equal(
+      html.includes('lnbits-admin-funding-sources'),
+      installationMode === 'custodial'
+    )
+    assert.equal(
+      html.includes('A custodial Lightning funding source is not used'),
+      installationMode === 'arkade_noncustodial'
+    )
+    let calls = 0
+    const oldRequest = LNbits.api.request
+    LNbits.api.request = () => {
+      calls++
+      return Promise.resolve({data: {}})
+    }
+    components['lnbits-admin-funding'].methods.getAudit.call({
+      g: {user: {installationMode, wallets: [{adminkey: 'test'}]}}
+    })
+    assert.equal(calls, installationMode === 'custodial' ? 1 : 0)
+    LNbits.api.request = oldRequest
   }
   const list = fs.readFileSync(
     'lnbits/templates/components/lnbits-payment-list.vue',

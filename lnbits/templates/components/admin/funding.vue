@@ -1,5 +1,14 @@
 <template id="lnbits-admin-funding">
-  <q-card-section class="q-pa-none">
+  <q-card-section
+    v-if="g.user.installationMode === 'arkade_noncustodial'"
+    class="q-pa-none"
+  >
+    <p>
+      Non-custodial wallets use Arkade. A custodial Lightning funding source is
+      not used in this installation.
+    </p>
+  </q-card-section>
+  <q-card-section v-else class="q-pa-none">
     <h6 class="q-my-none q-mb-sm">
       <span v-text="$t('wallets_management')"></span>
     </h6>

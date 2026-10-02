@@ -148,7 +148,6 @@ const LIGHTNING_NETWORK_CONFIG = {
 const lightningNetworkConfig = network =>
   LIGHTNING_NETWORK_CONFIG[network] || LIGHTNING_NETWORK_CONFIG.bitcoin
 const LIGHTNING_QUOTE_PAIR = 'arkade:BTC->lightning:BTC'
-const LIGHTNING_FEE_BPS = 30
 const LIGHTNING_REFUND_HEADROOM_SECONDS = 10_800
 const OUTGOING_PHASES = /* @__PURE__ */ new Set([
   'prepared',
@@ -1139,11 +1138,7 @@ const lightningInvoiceFacts = bolt11 => {
     expiresAt
   }
 }
-// The card charges its spread on the funded amount, not the net invoice.
-const lightningMaxFeeSat = amountSats =>
-  Math.ceil((amountSats * LIGHTNING_FEE_BPS) / (10_000 - LIGHTNING_FEE_BPS))
-const lightningMaxFeeMsat = amountSats => lightningMaxFeeSat(amountSats) * 1000
-const lightningPublicQuote = (facts, swap) => {
+const lightningPublicQuote = (facts, swap, maxFeeSat) => {
   const quote = swap?.quote
   if (
     !quote ||
@@ -1173,12 +1168,22 @@ const lightningPublicQuote = (facts, swap) => {
   const now = Math.floor(Date.now() / 1000)
   if (quote.refund_locktime < now + LIGHTNING_REFUND_HEADROOM_SECONDS)
     throw new Error('Arkade Lightning refund window is too short')
-  assertFundable({
-    quote,
-    invoiceExpiresAt: facts.expiresAt,
-    now,
-    maxFee: {sats: lightningMaxFeeSat(facts.amountSats)}
-  })
+  try {
+    assertFundable({
+      quote,
+      invoiceExpiresAt: facts.expiresAt,
+      now,
+      maxFee: {sats: maxFeeSat}
+    })
+  } catch (error) {
+    if (error?.reason === 'fee_too_high')
+      throw Object.assign(new Error('Arkade Lightning fee limit exceeded'), {
+        reason: 'fee_too_high',
+        feeSat: quote.from_amount - quote.to_amount,
+        maxFeeSat
+      })
+    throw error
+  }
   if (
     !Number.isSafeInteger(swap.fundAmount) ||
     typeof swap.address !== 'string' ||
@@ -1199,7 +1204,7 @@ const lightningPublicQuote = (facts, swap) => {
   return {
     payment_hash: facts.paymentHash,
     amount_msat: facts.amountMsat,
-    max_fee_msat: lightningMaxFeeMsat(facts.amountSats),
+    max_fee_msat: maxFeeSat * 1000,
     quote_pair: quote.pair,
     quote_from_amount_sat: quote.from_amount,
     quote_to_amount_sat: quote.to_amount,
@@ -1389,7 +1394,11 @@ const lightningPlanFromRecord = async (record, wallet, current) => {
     fundingArkTxid: record.fundingArkTxid
   }
 }
-const prepareLightningSend = async bolt11 => {
+const prepareLightningSend = async (bolt11, maxFeeSat = 100) => {
+  if (!Number.isSafeInteger(maxFeeSat) || maxFeeSat <= 0 || maxFeeSat > 50000)
+    throw Object.assign(new Error('Arkade Lightning fee limit is invalid'), {
+      reason: 'max_fee_out_of_range'
+    })
   const accountId = window.g.user.id
   if (!identity || !activeBinding || activeBinding.state !== 'ready')
     throw new Error('wallet is locked')
@@ -1415,6 +1424,12 @@ const prepareLightningSend = async bolt11 => {
         'cannot resume this non-quote-ready intent'
       )
     const plan = await lightningPlanFromRecord(persisted, wallet, current)
+    assertFundable({
+      quote: plan.swap.quote,
+      invoiceExpiresAt: facts.expiresAt,
+      now: Math.floor(Date.now() / 1000),
+      maxFee: {sats: maxFeeSat}
+    })
     lightningPlans.set(persisted.intentId, plan)
     return plan.summary
   }
@@ -1445,7 +1460,7 @@ const prepareLightningSend = async bolt11 => {
   } finally {
     await transport?.close?.()
   }
-  const publicQuote = lightningPublicQuote(facts, swap)
+  const publicQuote = lightningPublicQuote(facts, swap, maxFeeSat)
   const apiWallet = window.g.wallet || window.g.user?.wallets?.[0]
   if (!apiWallet?.adminkey)
     throw new Error('Arkade Lightning wallet unavailable')
@@ -1536,7 +1551,11 @@ const submitLightningSend = async (intentId, approval) => {
   // here strands the intent - funded, unreported and unresumable.
   if (plan.fundingState === 'quote_ready') {
     try {
-      lightningPublicQuote(plan.facts, plan.swap)
+      lightningPublicQuote(
+        plan.facts,
+        plan.swap,
+        plan.publicQuote.max_fee_msat / 1000
+      )
     } catch {
       throw new Error('Arkade Lightning quote is no longer fundable')
     }
@@ -2143,7 +2162,7 @@ const submitOutgoing = async (prepared, approval) => {
     authorization = (
       await LNbits.api.arkadeOutgoingAuthorize(plan.intentId, request)
     ).data
-  } catch {
+  } catch (error) {
     let afterFailure
     try {
       afterFailure = (await LNbits.api.arkadeOutgoingIntent(plan.intentId)).data
@@ -2180,6 +2199,7 @@ const submitOutgoing = async (prepared, approval) => {
     }
     if (afterSnapshot.status !== 'submitted') {
       updateOutgoingJournalPhase(plan.accountId, plan.intentId, 'prepared')
+      if (outgoingErrorCode(error)) throw error
       throw new Error('Arkade outgoing authorization failed')
     }
     if (!sameOutgoingPlan(plan, afterFailure)) {
@@ -2233,6 +2253,42 @@ const submitOutgoing = async (prepared, approval) => {
     )
     throw new ArkadeOutgoingReconciliationError(plan.intentId, 'submitted')
   }
+}
+// A timeout leaves the operation running and the journal intact. Recovery must
+// join it rather than broadcast the same spend concurrently.
+const waitForOutgoing = async (operation, intentId) => {
+  let timer
+  try {
+    return await Promise.race([
+      operation,
+      new Promise((_, reject) => {
+        timer = setTimeout(
+          () =>
+            reject(
+              new ArkadeOutgoingReconciliationError(
+                intentId,
+                'authorization_unknown'
+              )
+            ),
+          30_000
+        )
+      })
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+const submitOutgoingSerialized = (prepared, approval) => {
+  const key = `${window.g.user.id}:${prepared.intentId}`
+  let operation = outgoingRecoveries.get(key)
+  if (!operation) {
+    operation = submitOutgoing(prepared, approval).finally(() => {
+      if (outgoingRecoveries.get(key) === operation)
+        outgoingRecoveries.delete(key)
+    })
+    outgoingRecoveries.set(key, operation)
+  }
+  return waitForOutgoing(operation, prepared.intentId)
 }
 const outgoingJournalResponseBindingMatches = (record, response, binding) => {
   try {
@@ -2492,8 +2548,12 @@ const recoverOutgoing = async (intentId, approval) => {
     updateOutgoingJournalPhase(accountId, intentId, 'reconciliation_required')
     return {intentId, phase: 'reconciliation_required'}
   }
-  if (response.status === 'reserved')
-    return {intentId, status: response.status, phase: record.phase}
+  if (response.status === 'reserved') {
+    if (!approval || approval.approved !== true)
+      throw new Error('Arkade outgoing recovery approval required')
+    await LNbits.api.arkadeOutgoingRelease(intentId)
+    response = (await LNbits.api.arkadeOutgoingIntent(intentId)).data
+  }
   if (response.status === 'released') {
     if (releasedOutgoingJournalMatches(record, response, activeBinding)) {
       removeOutgoingJournal(accountId, intentId)
@@ -2642,12 +2702,12 @@ const recoverOutgoing = async (intentId, approval) => {
 const recoverOutgoingSerialized = (intentId, approval) => {
   const key = `${window.g.user.id}:${intentId}`
   const existing = outgoingRecoveries.get(key)
-  if (existing) return existing
+  if (existing) return waitForOutgoing(existing, intentId)
   const recovery = recoverOutgoing(intentId, approval).finally(() => {
     if (outgoingRecoveries.get(key) === recovery) outgoingRecoveries.delete(key)
   })
   outgoingRecoveries.set(key, recovery)
-  return recovery
+  return waitForOutgoing(recovery, intentId)
 }
 const probe = async () => {
   const accountId = window.g.user.id
@@ -2854,10 +2914,10 @@ window.ArkadeEnrollment = {
     return prepareOutgoing(intentId, walletId)
   },
   async submitOutgoing(prepared, approval) {
-    return submitOutgoing(prepared, approval)
+    return submitOutgoingSerialized(prepared, approval)
   },
-  async prepareLightningSend(bolt11) {
-    return prepareLightningSend(bolt11)
+  async prepareLightningSend(bolt11, maxFeeSat) {
+    return prepareLightningSend(bolt11, maxFeeSat)
   },
   async submitLightningSend(intentId, approval) {
     return submitLightningSend(intentId, approval)

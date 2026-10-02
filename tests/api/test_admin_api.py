@@ -188,3 +188,32 @@ async def test_admin_delete_settings_requires_superuser(
     assert spark_l2_confirmed and spark_l2_confirmed.value is True
 
     server_restart.clear()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("method", ["put", "patch"])
+async def test_noncustodial_funding_selection_disabled(
+    client, superuser_token, monkeypatch, method, settings: Settings
+):
+    monkeypatch.setattr(
+        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
+    )
+    original = settings.lnbits_backend_wallet_class
+    response = await getattr(client, method)(
+        "/admin/api/v1/settings",
+        json={
+            "lnbits_backend_wallet_class": (
+                "VoidWallet" if original != "VoidWallet" else "FakeWallet"
+            )
+        },
+        headers={"Authorization": f"Bearer {superuser_token}"},
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == "ARKADE_FUNDING_SOURCE_UNSUPPORTED"
+    assert settings.lnbits_backend_wallet_class == original
+    response = await getattr(client, method)(
+        "/admin/api/v1/settings",
+        json={"lnbits_backend_wallet_class": original},
+        headers={"Authorization": f"Bearer {superuser_token}"},
+    )
+    assert response.status_code == 200

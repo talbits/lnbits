@@ -106,7 +106,10 @@ async def startup(app: FastAPI):
 
     # initialize WALLET
     try:
-        set_funding_source()
+        if settings.lnbits_effective_installation_mode == "arkade_noncustodial":
+            set_funding_source("VoidWallet")
+        else:
+            set_funding_source()
     except Exception as e:
         logger.error(f"Error initializing {settings.lnbits_backend_wallet_class}: {e}")
         set_void_wallet_class()
@@ -224,6 +227,8 @@ def create_app() -> FastAPI:
 
 
 async def check_funding_source() -> None:
+    if settings.lnbits_effective_installation_mode == "arkade_noncustodial":
+        return
     funding_source = get_funding_source()
 
     max_retries = settings.funding_source_max_retries
@@ -579,31 +584,37 @@ def register_async_tasks() -> None:
     # periodic tasks
     task_manager.create_permanent_task(cache.invalidate_cache, interval=10)
     task_manager.create_permanent_task(delete_expired_audit_entries, interval=60 * 60)
+    pending_interval = (
+        5
+        if settings.lnbits_effective_installation_mode == "arkade_noncustodial"
+        else settings.lnbits_funding_source_pending_interval_seconds
+    )
     task_manager.create_permanent_task(
-        check_pending_payments,
-        interval=settings.lnbits_funding_source_pending_interval_seconds,
+        check_pending_payments, interval=pending_interval
     )
     task_manager.create_permanent_task(
         dispatch_arkade_lightning_terminal_events,
-        interval=settings.lnbits_funding_source_pending_interval_seconds,
+        interval=pending_interval,
     )
     task_manager.create_permanent_task(
         collect_exchange_rates_data,
         interval=max(60, settings.lnbits_exchange_history_refresh_interval_seconds),
     )
-    task_manager.create_permanent_task(check_balance_delta_changed, interval=60)
-    task_manager.create_permanent_task(
-        check_server_balance_against_node,
-        interval=60 * settings.lnbits_watchdog_interval_minutes,
-    )
-    task_manager.create_permanent_task(
-        notify_server_status,
-        interval=60 * 60 * settings.lnbits_notification_server_status_hours,
-    )
+    if settings.lnbits_effective_installation_mode != "arkade_noncustodial":
+        task_manager.create_permanent_task(check_balance_delta_changed, interval=60)
+        task_manager.create_permanent_task(
+            check_server_balance_against_node,
+            interval=60 * settings.lnbits_watchdog_interval_minutes,
+        )
+        task_manager.create_permanent_task(
+            notify_server_status,
+            interval=60 * 60 * settings.lnbits_notification_server_status_hours,
+        )
     task_manager.create_permanent_task(refresh_extension_cache, interval=60)
 
     # permanent tasks run in a loop, will be restarted if they fail
-    task_manager.create_permanent_task(fundingsource_invoice_producer)
+    if settings.lnbits_effective_installation_mode != "arkade_noncustodial":
+        task_manager.create_permanent_task(fundingsource_invoice_producer)
     task_manager.create_permanent_task(process_next_notification)
     task_manager.create_permanent_task(process_next_audit_entry)
 

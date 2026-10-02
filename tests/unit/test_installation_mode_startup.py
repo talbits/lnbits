@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock
 
@@ -188,3 +189,96 @@ def test_installation_mode_is_authenticated_user_data_only():
 
     assert user.dict()["installation_mode"] == "arkade_noncustodial"
     assert "installation_mode" not in PublicSettings.from_settings(settings).dict()
+
+
+@pytest.mark.parametrize(
+    "mode,expected", [("custodial", 1800), ("arkade_noncustodial", 5)]
+)
+def test_arkade_reconciliation_uses_prompt_polling(monkeypatch, mode, expected):
+    calls = []
+    monkeypatch.setattr(settings, "lnbits_effective_installation_mode", mode)
+    monkeypatch.setattr(
+        settings, "lnbits_funding_source_pending_interval_seconds", 1800
+    )
+    monkeypatch.setattr(app_module.task_manager, "init", lambda: None)
+    monkeypatch.setattr(
+        app_module.task_manager, "register_invoice_listener", lambda *a: None
+    )
+    monkeypatch.setattr(
+        app_module.task_manager,
+        "create_permanent_task",
+        lambda func, **kw: calls.append((func, kw)),
+    )
+    app_module.register_async_tasks()
+    for func in [
+        app_module.check_pending_payments,
+        app_module.dispatch_arkade_lightning_terminal_events,
+    ]:
+        assert next(kw["interval"] for f, kw in calls if f == func) == expected
+    custodial_tasks = {
+        app_module.check_balance_delta_changed,
+        app_module.check_server_balance_against_node,
+        app_module.notify_server_status,
+        app_module.fundingsource_invoice_producer,
+    }
+    assert custodial_tasks.intersection(f for f, _ in calls) == (
+        custodial_tasks if mode == "custodial" else set()
+    )
+
+
+@pytest.mark.parametrize(
+    "mode,warning", [("custodial", True), ("arkade_noncustodial", False)]
+)
+def test_voidwallet_banner_only_for_custodial_mode(monkeypatch, mode, warning):
+    monkeypatch.setattr(settings, "lnbits_effective_installation_mode", mode)
+    monkeypatch.setattr(settings, "lnbits_backend_wallet_class", "VoidWallet")
+    assert PublicSettings.from_settings(settings).show_voidwallet is warning
+
+
+@pytest.mark.anyio
+async def test_noncustodial_startup_does_not_check_custodial_source(monkeypatch):
+    monkeypatch.setattr(
+        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
+    )
+
+    def forbidden():
+        raise AssertionError("custodial funding source must not be contacted")
+
+    monkeypatch.setattr(app_module, "get_funding_source", forbidden)
+    await app_module.check_funding_source()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("mode", ["custodial", "arkade_noncustodial"])
+async def test_startup_funding_source_is_mode_specific(monkeypatch, mode):
+    monkeypatch.setattr(settings, "lnbits_effective_installation_mode", mode)
+    monkeypatch.setattr(settings, "lnbits_running", True)
+    monkeypatch.setattr(settings, "lnbits_backend_wallet_class", "FakeWallet")
+    for name in [
+        "migrate_databases",
+        "check_admin_settings",
+        "check_webpush_settings",
+        "check_and_register_extensions",
+        "check_funding_source",
+    ]:
+        monkeypatch.setattr(app_module, name, AsyncMock())
+    for name in [
+        "log_server_info",
+        "init_core_routers",
+        "create_llms_txt_route",
+        "register_async_tasks",
+        "enqueue_admin_notification",
+    ]:
+        monkeypatch.setattr(app_module, name, lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        app_module,
+        "core_app_extra",
+        SimpleNamespace(register_new_ratelimiter=lambda: None),
+    )
+    calls = []
+    monkeypatch.setattr(
+        app_module, "set_funding_source", lambda *args: calls.append(args)
+    )
+    await app_module.startup(FastAPI())
+    assert calls == [("VoidWallet",) if mode == "arkade_noncustodial" else ()]
+    assert settings.lnbits_backend_wallet_class == "FakeWallet"

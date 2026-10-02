@@ -134,7 +134,6 @@ _MAX_INDEXER_PSBT_BYTES = 4 * 1024 * 1024
 _MAX_INDEXER_PSBT_BASE64_LENGTH = 4 * ((_MAX_INDEXER_PSBT_BYTES + 2) // 3)
 LIGHTNING_MIN_QUOTE_AMOUNT_SAT = 500
 LIGHTNING_MAX_QUOTE_AMOUNT_SAT = 50_000
-LIGHTNING_MAX_FEE_BPS = 30
 LIGHTNING_REFUND_HEADROOM_SECONDS = 10_800
 LIGHTNING_QUOTE_PAIR = "arkade:BTC->lightning:BTC"
 _TAPROOT_UNSPENDABLE_KEY = bytes.fromhex(
@@ -646,15 +645,9 @@ async def reserve_arkade_lightning_intent(  # noqa: C901
     if quote.quote_from_amount_sat < quote.quote_to_amount_sat:
         raise ArkadeOutgoingError("ARKADE_OUTGOING_INVALID_REQUEST")
     quote_fee_msat = (quote.quote_from_amount_sat - quote.quote_to_amount_sat) * 1000
-    # The solver charges its spread on the funded amount, not the invoice amount.
-    fee_denominator = 10_000 - LIGHTNING_MAX_FEE_BPS
-    fee_ceiling_msat = (
-        (quote.quote_to_amount_sat * LIGHTNING_MAX_FEE_BPS + fee_denominator - 1)
-        // fee_denominator
-    ) * 1000
+    # The authenticated caller chooses the fee cap; reserve it in full.
     if (
-        quote.max_fee_msat > fee_ceiling_msat
-        or quote_fee_msat > fee_ceiling_msat
+        quote.max_fee_msat > LIGHTNING_MAX_QUOTE_AMOUNT_SAT * 1000
         or quote_fee_msat > quote.max_fee_msat
     ):
         raise ArkadeOutgoingError("ARKADE_OUTGOING_INVALID_REQUEST")
@@ -1351,6 +1344,14 @@ async def authorize_arkade_outgoing(  # noqa: C901
         scripts = {
             request.script.lower() for request in receive_requests if request.script
         }
+        # Verified change remains owned by this account after a native send.
+        changes: list[dict[str, str]] = await (conn or db).fetchall(
+            "SELECT change_script FROM arkade_outgoing_intents "
+            "WHERE account_id = :account_id AND status = 'settled' "
+            "AND change_script IS NOT NULL",
+            {"account_id": account_id},
+        )
+        scripts.update(row["change_script"].lower() for row in changes)
         if not scripts:
             raise ArkadeOutgoingError("ARKADE_OUTGOING_INPUT_UNREGISTERED")
         try:

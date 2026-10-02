@@ -529,9 +529,10 @@ async def test_lightning_reservation_rejects_account_over_commitment(
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
-    ("amount_sat", "fee_sat"), [(500, 2), (1_000, 4), (9_970, 30), (50_000, 151)]
+    ("amount_sat", "fee_sat"),
+    [(500, 2), (1_000, 4), (1_153, 54), (9_970, 30), (50_000, 151)],
 )
-async def test_lightning_reservation_enforces_solver_spread(
+async def test_lightning_reservation_enforces_user_fee_cap(
     connection, monkeypatch, amount_sat, fee_sat
 ):
     monkeypatch.setattr(
@@ -560,7 +561,7 @@ async def test_lightning_reservation_enforces_solver_spread(
     )
 
     for updates in (
-        {"max_fee_msat": (fee_sat + 1) * 1000},
+        {"max_fee_msat": 50_001_000},
         {"quote_from_amount_sat": amount_sat + fee_sat + 1},
     ):
         with pytest.raises(
@@ -1702,6 +1703,63 @@ async def test_authorize_exact_inputs_and_submitted_replay(
     assert replay == result
 
 
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "previous_status,owned", [("settled", True), ("submitted", False)]
+)
+async def test_authorize_spending_previous_change(
+    connection, monkeypatch, previous_status, owned
+):
+    monkeypatch.setattr(
+        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
+    )
+    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", _backing)
+    await _credit(connection, WALLET_ID, 20_000)
+    previous = _intent().copy(
+        update={"intent_id": "ab" * 16, "idempotency_key": "previous"}
+    )
+    await arkade.reserve_arkade_outgoing_intent(ACCOUNT_ID, previous, conn=connection)
+    await connection.execute(
+        "UPDATE arkade_outgoing_intents SET status = :status, "
+        "change_script = :script WHERE intent_id = :id",
+        {"status": previous_status, "script": CHANGE_SCRIPT, "id": previous.intent_id},
+    )
+    await arkade.reserve_arkade_outgoing_intent(ACCOUNT_ID, _intent(), conn=connection)
+
+    async def registered(*args, **kwargs):
+        return [SimpleNamespace(script="aa")]
+
+    async def exact(*args, **kwargs):
+        return [
+            arkade.ArkadeIndexerVtxo(
+                txid="97" * 32, vout=0, amount_sat=10, script=CHANGE_SCRIPT
+            )
+        ]
+
+    monkeypatch.setattr(arkade, "get_arkade_receive_requests", registered)
+    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos_for_outpoints", exact)
+    if owned:
+        result = await arkade.authorize_arkade_outgoing(
+            ACCOUNT_ID,
+            INTENT_ID,
+            _selected(amount_sat=10),
+            conn=connection,
+            destination_script=DESTINATION_SCRIPT,
+        )
+        assert result.status == "submitted"
+    else:
+        with pytest.raises(
+            arkade.ArkadeOutgoingError, match="ARKADE_OUTGOING_INPUT_UNREGISTERED"
+        ):
+            await arkade.authorize_arkade_outgoing(
+                ACCOUNT_ID,
+                INTENT_ID,
+                _selected(amount_sat=10),
+                conn=connection,
+                destination_script=DESTINATION_SCRIPT,
+            )
+
+
 async def _submitted_intent(connection):
     await _credit(connection, WALLET_ID, 20_000)
     await arkade.reserve_arkade_outgoing_intent(
@@ -2510,7 +2568,7 @@ async def test_lightning_quote_rejects_fee_above_backend_ceiling(
     monkeypatch.setattr(arkade.bolt11, "decode", lambda _bolt11: _LightningInvoice())
     quote = _lightning_quote(
         quote_from_amount_sat=5_016,
-        max_fee_msat=10_000_000,
+        max_fee_msat=50_001_000,
     )
     with pytest.raises(
         arkade.ArkadeOutgoingError,
