@@ -154,6 +154,7 @@ window.PageWallet = {
       arkadeRecovery: [],
       arkadeRecoveryBusy: false,
       arkadeBacking: null,
+      arkadeBackingDialog: false,
       arkadeBackingError: '',
       arkadeMaintenanceBusy: false,
       arkadeAutoRenew: false,
@@ -317,6 +318,17 @@ window.PageWallet = {
         return this.formattedTotalBreakdown
       }
       return this.formattedTotalBreakdownFiat
+    },
+    arkadeBackingAttention() {
+      if (this.arkadeBackingError) return true
+      const backing = this.arkadeBacking
+      if (!backing) return false
+      return (
+        backing.state !== 'ok' ||
+        !!backing.maintenance ||
+        backing.recoverable_sat > 0 ||
+        !!backing.maintenance_inputs?.length
+      )
     }
   },
   methods: {
