@@ -531,8 +531,9 @@ async def test_partial_receive_remains_acknowledged(connection, ready_mode):
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("change_state", ["spendable", "expired", "swept"])
 async def test_verified_outgoing_change_is_backing_without_income(
-    connection, ready_mode
+    connection, ready_mode, change_state
 ):
     request = await _ack(connection, await _create(connection))
     assert request.script
@@ -557,11 +558,18 @@ async def test_verified_outgoing_change_is_backing_without_income(
         script=change_script,
         is_preconfirmed=True,
     )
+    if change_state == "expired":
+        change = change.copy(
+            update={"expires_at": datetime.now(timezone.utc) - timedelta(seconds=1)}
+        )
+    elif change_state == "swept":
+        change = change.copy(update={"is_swept": True})
 
     await arkade.reconcile_arkade_receive(ACCOUNT_ID, [spent, change], conn=connection)
 
     state = await arkade.get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
-    assert state and state.state == "ok"
+    expected_state = "ok" if change_state == "spendable" else "reconciliation_required"
+    assert state and state.state == expected_state
     outpoints = await connection.fetchone(
         "SELECT COUNT(*) AS count, COALESCE(SUM(amount_sat), 0) AS total "
         "FROM arkade_receive_outpoints WHERE account_id = :account_id",
