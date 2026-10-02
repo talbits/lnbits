@@ -3461,6 +3461,21 @@ async def reconcile_arkade_receive(  # noqa: C901
             last_error = "ARKADE_RECONCILIATION_REQUIRED"
         observed[key] = vtxo
     database = conn or db
+    # One solvency verdict for the whole pass: recorded ledger against the
+    # spendable backing we can prove. Lineage drift below only matters when it
+    # leaves value unaccounted for; on a fully backed account it is history.
+    ledger_msat = int(
+        (
+            await database.fetchone(
+                "SELECT COALESCE(SUM(b.balance), 0) AS total FROM balances b "
+                'JOIN wallets w ON w.id = b.wallet_id WHERE w."user" = :id',
+                {"id": account_id},
+            )
+        )["total"]
+    )
+    unbacked = ledger_msat > sum(
+        v.amount_sat * 1000 for v in evidence if _is_spendable_vtxo(v)
+    )
     consumed, maintenance_outputs, restored = await reconcile_maintenance(
         account_id, evidence, database
     )
@@ -3540,11 +3555,19 @@ async def reconcile_arkade_receive(  # noqa: C901
             continue
         vtxo = observed.get(key)
         if vtxo is None:
-            # Submitted change may not be indexed yet. Outgoing verification
-            # owns that pending state; a missing terminal change is divergence.
+            # Submitted change may not be indexed yet, and a terminal change can
+            # leave the indexer entirely once it expires and is swept. That is
+            # history, not a solvency problem: spendable backing against the
+            # ledger is checked below and is what actually protects funds. Hold
+            # nothing on it, or an account stays flagged forever.
             if recorded and row["status"] != "submitted":
-                required = True
-                last_error = "ARKADE_RECONCILIATION_REQUIRED"
+                logger.warning(
+                    f"Arkade outgoing change {row['arkade_txid']}:1 is no "
+                    f"longer indexed for account {account_id}"
+                )
+                if unbacked:
+                    required = True
+                    last_error = "ARKADE_RECONCILIATION_REQUIRED"
             continue
         change_outpoints.add(key)
         if not recorded:
@@ -3582,17 +3605,9 @@ async def reconcile_arkade_receive(  # noqa: C901
     already_flagged = bool(
         previous_state and previous_state.state == "reconciliation_required"
     )
-    if restored or already_flagged:
-        balances = await database.fetchone(
-            "SELECT COALESCE(SUM(b.balance), 0) AS total FROM balances b "
-            'JOIN wallets w ON w.id = b.wallet_id WHERE w."user" = :id',
-            {"id": account_id},
-        )
-        if int(balances["total"]) > sum(
-            v.amount_sat * 1000 for v in evidence if _is_spendable_vtxo(v)
-        ):
-            required = True
-            last_error = "ARKADE_RECONCILIATION_REQUIRED"
+    if unbacked and (restored or already_flagged):
+        required = True
+        last_error = "ARKADE_RECONCILIATION_REQUIRED"
     for vtxo in evidence:
         if (vtxo.txid, vtxo.vout) in change_outpoints | consumed | maintenance_outputs:
             continue

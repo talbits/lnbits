@@ -1236,7 +1236,7 @@ async def test_browser_funded_swap_attributes_spend_and_change(connection, ready
     ("status", "observed_script", "required"),
     [
         ("submitted", None, False),
-        ("settled", None, True),
+        ("settled", None, False),
         ("submitted", "5120" + "a1" * 32, False),
         ("submitted", "5120" + "a2" * 32, True),
     ],
@@ -1267,6 +1267,30 @@ async def test_change_reconciliation_waits_for_verified_settlement(
     state = await arkade.get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
     assert state is not None
     assert (state.state == "reconciliation_required") is required
+
+
+@pytest.mark.anyio
+async def test_missing_terminal_change_flags_only_when_unbacked(connection, ready_mode):
+    """The same drift must still hold an account that cannot cover its ledger."""
+    funding_txid = "a0" * 32
+    intent_id = await _browser_funded_lightning_intent(
+        connection, funding_txid=funding_txid
+    )
+    await connection.execute(
+        "UPDATE arkade_outgoing_intents SET destination_kind = 'arkade_address', "
+        "max_fee_msat = 0, status = 'settled', change_index = 1, "
+        "change_script = :script, change_amount_sat = 10 WHERE intent_id = :intent",
+        {"script": "5120" + "a1" * 32, "intent": intent_id},
+    )
+    await connection.execute(
+        "INSERT INTO balances (wallet_id, balance) VALUES (:wallet_id, 1000000)",
+        {"wallet_id": WALLET_ID},
+    )
+
+    await arkade.reconcile_arkade_receive(ACCOUNT_ID, [], conn=connection)
+
+    state = await arkade.get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
+    assert state and state.state == "reconciliation_required"
 
 
 @pytest.mark.anyio
