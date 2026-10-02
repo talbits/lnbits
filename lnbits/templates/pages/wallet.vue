@@ -222,10 +222,17 @@
             guarantee spendable backing.
           </div>
           <div v-if="arkadeBacking">
-            <div>Available: {{ arkadeBacking.spendable_sat }} sats</div>
-            <div>Recoverable: {{ arkadeBacking.recoverable_sat }} sats</div>
+            <div>
+              Available:
+              <span v-text="arkadeBacking.spendable_sat"></span> sats
+            </div>
+            <div>
+              Recoverable:
+              <span v-text="arkadeBacking.recoverable_sat"></span> sats
+            </div>
             <div v-if="arkadeBacking.expiring_sat">
-              Expiring within 3 days: {{ arkadeBacking.expiring_sat }} sats
+              Expiring within 3 days:
+              <span v-text="arkadeBacking.expiring_sat"></span> sats
             </div>
             <q-banner
               v-if="arkadeBacking.state !== 'ok'"
@@ -265,8 +272,8 @@
             v-if="arkadeBackingError"
             rounded
             class="bg-orange-2 text-black q-my-sm"
-            >{{ arkadeBackingError }}</q-banner
-          >
+            v-text="arkadeBackingError"
+          ></q-banner>
           <q-checkbox
             :model-value="arkadeAutoRenew"
             label="Automatically renew while unlocked (zero fee)"

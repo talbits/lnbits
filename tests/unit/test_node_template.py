@@ -29,3 +29,8 @@ def test_homepage_renders_node_template_with_client_bindings(settings, bundle_as
     assert "phoenixd.version ||" in html
     assert "phoenixd.blockheight ??" in html
     assert 'v-text="phoenixd.fee_credit_sat"' in html
+    # Arkade backing values are client-side only; Jinja must not consume them.
+    assert 'v-text="arkadeBacking.spendable_sat"' in html
+    assert 'v-text="arkadeBacking.recoverable_sat"' in html
+    assert 'v-text="arkadeBacking.expiring_sat"' in html
+    assert 'v-text="arkadeBackingError"' in html
