@@ -1275,7 +1275,10 @@ async def test_reconciliation_resolve_clears_flag_once_and_audits(
 
 
 @pytest.mark.anyio
-async def test_reservation_rejects_held_backing(connection, monkeypatch):
+async def test_reservation_allows_held_backing_when_still_solvent(
+    connection, monkeypatch
+):
+    """A reconciliation flag must not block a payment the backing still covers."""
     monkeypatch.setattr(
         settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
     )
@@ -1288,10 +1291,12 @@ async def test_reservation_rejects_held_backing(connection, monkeypatch):
         conn=connection,
     )
 
-    with pytest.raises(arkade.ArkadeOutgoingError, match="RECONCILIATION_REQUIRED"):
-        await arkade.reserve_arkade_outgoing_intent(
-            ACCOUNT_ID, _intent(), conn=connection
-        )
+    intent, _payment = await arkade.reserve_arkade_outgoing_intent(
+        ACCOUNT_ID, _intent(), conn=connection
+    )
+
+    assert intent.intent_id == INTENT_ID
+    assert intent.status == "reserved"
 
 
 @pytest.mark.anyio

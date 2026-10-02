@@ -219,11 +219,6 @@ async def settle_arkade_same_account_transfer(  # noqa: C901
                 binding = await get_arkade_binding(account_id, conn=database)
                 if not binding or binding.state != "ready":
                     raise ArkadeOutgoingError("ARKADE_ENROLLMENT_REQUIRED")
-                reconciliation = await get_arkade_reconciliation(
-                    account_id, conn=database
-                )
-                if reconciliation and reconciliation.state == "reconciliation_required":
-                    raise ArkadeOutgoingError("ARKADE_BACKING_RECONCILIATION_REQUIRED")
 
                 sender_wallet = await get_wallet(wallet_id, conn=database)
                 receiver_wallet = await get_wallet(request.wallet_id, conn=database)
@@ -518,10 +513,9 @@ async def _reserve_arkade_outgoing_intent(  # noqa: C901
             or receiver_request.native_request_id != receiver_native_request_id
         ):
             raise ArkadeOutgoingError("ARKADE_TRANSFER_RECEIVER_INVALID")
-    reconciliation = await get_arkade_reconciliation(account_id, conn=conn)
-    if reconciliation and reconciliation.state == "reconciliation_required":
-        raise ArkadeOutgoingError("ARKADE_BACKING_RECONCILIATION_REQUIRED")
-
+    # Deliberately not gated on the account's reconciliation flag: solvency is
+    # enforced by the backing-deficit check below, so a flagged account whose
+    # spendable VTXOs still cover its obligations must stay able to pay.
     wallet = await get_wallet(intent.wallet_id, conn=conn)
     if not wallet or wallet.id != intent.wallet_id or wallet.user != account_id:
         raise ArkadeOutgoingError("ARKADE_WALLET_NOT_OWNED")
@@ -3336,6 +3330,7 @@ async def get_arkade_backing_status(account_id: str) -> ArkadeBackingStatus:
             and v.expires_at <= now + timedelta(days=3)
         ),
         state=state.state if state else "ok",
+        last_error=state.last_error if state else None,
         maintenance=next(
             (
                 ArkadeMaintenancePlan.parse_raw(r["plan_json"])
@@ -3452,14 +3447,12 @@ async def reconcile_arkade_receive(  # noqa: C901
         raise ArkadeReceiveError("ARKADE_RECEIVE_UNAVAILABLE")
     await require_arkade_ready(account_id, conn=conn)
     previous_state = await get_arkade_reconciliation(account_id, conn=conn)
-    required = bool(
-        previous_state and previous_state.state == "reconciliation_required"
-    )
-    last_error = (
-        previous_state.last_error
-        if required and previous_state and previous_state.last_error
-        else None
-    )
+    # Every guard below re-derives from the current evidence and rows, so the
+    # previous state is not inherited: inheriting it latched transient
+    # conditions (an unattributed VTXO seen before its receive request was
+    # recorded, for example) and locked the account permanently.
+    required = False
+    last_error: str | None = None
     observed: dict[tuple[str, int], ArkadeIndexerVtxo] = {}
     for vtxo in evidence:
         key = (vtxo.txid, vtxo.vout)
@@ -3580,7 +3573,16 @@ async def reconcile_arkade_receive(  # noqa: C901
     if any(r["state"] == "planned" for r in await maintenance_rows(account_id, conn)):
         required = True
         last_error = last_error or "ARKADE_RECONCILIATION_REQUIRED"
-    if restored:
+    # The recorded ledger must never exceed the spendable backing we can prove.
+    # Only checked once a renewal has completed, or on an account that is
+    # already flagged: while a renewal is in flight the old inputs are spent
+    # and the new outputs are not indexed yet, so a healthy account is
+    # genuinely over-credit for a pass. Re-checking a flagged account keeps the
+    # verdict stable across replays instead of clearing it on the next pass.
+    already_flagged = bool(
+        previous_state and previous_state.state == "reconciliation_required"
+    )
+    if restored or already_flagged:
         balances = await database.fetchone(
             "SELECT COALESCE(SUM(b.balance), 0) AS total FROM balances b "
             'JOIN wallets w ON w.id = b.wallet_id WHERE w."user" = :id',
@@ -3772,6 +3774,26 @@ async def reconcile_arkade_receive(  # noqa: C901
                 await settle_arkade_receive_request(
                     request.native_request_id, now, conn=conn
                 )
+    # Recorded conflicts are durable facts that evidence may stop re-reporting
+    # once the offending VTXO leaves the indexer, so they are read back rather
+    # than re-derived. Everything else clears once its cause is gone. Checked
+    # last so the specific terminal reason wins over a generic guard.
+    conflicts = await database.fetchone(
+        "SELECT COUNT(*) AS count FROM arkade_receive_outpoints "
+        "WHERE account_id = :account_id AND status = 'conflict'",
+        {"account_id": account_id},
+    )
+    if conflicts and conflicts["count"]:
+        required = True
+        last_error = "ARKADE_OUTPOINT_CONFLICT"
+    disputed = await database.fetchone(
+        "SELECT COUNT(*) AS count FROM arkade_outgoing_intents "
+        "WHERE account_id = :account_id AND status = 'disputed'",
+        {"account_id": account_id},
+    )
+    if disputed and disputed["count"]:
+        required = True
+        last_error = "ARKADE_LIGHTNING_EVIDENCE_CONTRADICTORY"
     state = "reconciliation_required" if required else "ok"
     await update_arkade_reconciliation(
         account_id,

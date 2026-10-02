@@ -324,6 +324,11 @@
             Payments are paused until account backing is verified. Recover
             expired funds below; if recovery does not resolve this,
             reconciliation needs review.
+            <div
+              v-if="arkadeBacking.last_error"
+              class="text-caption q-mt-xs"
+              v-text="`Reason: ${arkadeBacking.last_error}`"
+            ></div>
           </q-banner>
           <q-banner
             v-if="arkadeBacking.maintenance"

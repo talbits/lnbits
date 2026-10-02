@@ -356,6 +356,7 @@ class ArkadeBackingStatus(BaseModel):
     recoverable_sat: int
     expiring_sat: int
     state: ArkadeReconciliationState
+    last_error: str | None = None
     maintenance: ArkadeMaintenancePlan | None = None
     maintenance_inputs: list[ArkadeOutgoingSelectedInput] = Field(default_factory=list)
 

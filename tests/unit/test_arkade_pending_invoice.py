@@ -649,7 +649,7 @@ async def test_same_account_transfer_rolls_back_on_sender_insert_failure(
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("state", ["expired", "held", "failed"])
+@pytest.mark.parametrize("state", ["expired", "failed"])
 async def test_same_account_transfer_rejects_nonsettleable_receiver(
     connection, ready_mode, monkeypatch, state
 ):
@@ -665,13 +665,6 @@ async def test_same_account_transfer_rejects_nonsettleable_receiver(
                 "native_id": request.native_request_id,
             },
         )
-    elif state == "held":
-        await connection.execute(
-            "INSERT INTO arkade_reconciliation_state "
-            "(account_id, state, observed_at, updated_at) "
-            "VALUES (:account_id, 'reconciliation_required', :now, :now)",
-            {"account_id": ACCOUNT_ID, "now": datetime.now(timezone.utc)},
-        )
     else:
         await connection.execute(
             "UPDATE apipayments SET status = 'failed' WHERE native_id = :native_id",
@@ -683,6 +676,28 @@ async def test_same_account_transfer_rejects_nonsettleable_receiver(
             ACCOUNT_ID, SECOND_WALLET_ID, address, 42_000, conn=connection
         )
     assert await _count(connection, "apipayments") == 2
+
+
+@pytest.mark.anyio
+async def test_same_account_transfer_allows_held_backing(
+    connection, ready_mode, monkeypatch
+):
+    """Reallocating between one account's own wallets cannot worsen its backing."""
+    _, _request, address = await _prepare_same_account_transfer(
+        connection, ready_mode, monkeypatch
+    )
+    await connection.execute(
+        "INSERT INTO arkade_reconciliation_state "
+        "(account_id, state, observed_at, updated_at) "
+        "VALUES (:account_id, 'reconciliation_required', :now, :now)",
+        {"account_id": ACCOUNT_ID, "now": datetime.now(timezone.utc)},
+    )
+
+    await arkade.settle_arkade_same_account_transfer(
+        ACCOUNT_ID, SECOND_WALLET_ID, address, 42_000, conn=connection
+    )
+
+    assert await _count(connection, "apipayments") == 3
 
 
 async def _prepare_cross_account_transfer(connection, ready_mode, monkeypatch):

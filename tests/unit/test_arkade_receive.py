@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 import lnbits.db as db_module
 from lnbits.core import migrations
 from lnbits.core.crud import wallets
+from lnbits.core.crud.arkade import update_arkade_reconciliation
 from lnbits.core.crud.arkade_maintenance import store_maintenance
 from lnbits.core.crud.wallets import (
     delete_unused_wallets,
@@ -59,6 +60,7 @@ async def connection(monkeypatch):
             "CREATE TABLE apipayments ("
             "wallet_id TEXT, native_id TEXT, amount INT, fee INT, status TEXT)"
         )
+        await connection.execute("CREATE TABLE balances (wallet_id TEXT, balance INT)")
         await migrations.m052_create_arkade_account_bindings_table(connection)
         await migrations.m053_create_arkade_receive_tables(connection)
         await migrations.m055_create_arkade_outgoing_tables(connection)
@@ -628,8 +630,8 @@ async def test_renewal_preserves_ledger_and_requires_public_lineage(
     await store_maintenance(ACCOUNT_ID, plan, connection)
     ledger = 61000 if failure == "deficit" else 60000
     await connection.execute(
-        f"CREATE VIEW balances AS SELECT '{WALLET_ID}' AS wallet_id, "
-        f"{ledger} AS balance"
+        "INSERT INTO balances (wallet_id, balance) " "VALUES (:wallet_id, :balance)",
+        {"wallet_id": WALLET_ID, "balance": ledger},
     )
     before = await connection.fetchone("SELECT balance FROM balances")
     renewed = ArkadeIndexerVtxo(
@@ -1310,3 +1312,68 @@ async def test_indexer_queries_submitted_native_change(
     monkeypatch.setattr(arkade.httpx, "AsyncClient", lambda **_kwargs: client)
     assert await arkade.fetch_arkade_indexer_vtxos(ACCOUNT_ID, connection) == []
     get.assert_awaited_once()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "last_error", ["ARKADE_RECONCILIATION_REQUIRED", "ARKADE_UNATTRIBUTED_VALUE"]
+)
+async def test_transient_reconciliation_clears_with_clean_evidence(
+    connection, ready_mode, last_error
+):
+    """A recorded flag must not outlive the condition that raised it."""
+    await update_arkade_reconciliation(
+        ACCOUNT_ID,
+        state="reconciliation_required",
+        last_error=last_error,
+        conn=connection,
+    )
+
+    await arkade.reconcile_arkade_receive(ACCOUNT_ID, [], conn=connection)
+
+    state = await arkade.get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
+    assert state and state.state == "ok"
+    assert state.last_error is None
+
+
+@pytest.mark.anyio
+async def test_recorded_conflict_stays_reconciliation_required(connection, ready_mode):
+    """Conflicts are durable rows and survive the evidence that revealed them."""
+    await connection.execute(
+        "INSERT INTO arkade_receive_outpoints "
+        "(account_id, txid, vout, amount_sat, script, status) "
+        "VALUES (:account_id, :txid, 0, 100, :script, 'conflict')",
+        {"account_id": ACCOUNT_ID, "txid": "77" * 32, "script": "51"},
+    )
+
+    await arkade.reconcile_arkade_receive(ACCOUNT_ID, [], conn=connection)
+
+    state = await arkade.get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
+    assert state and state.state == "reconciliation_required"
+    assert state.last_error == "ARKADE_OUTPOINT_CONFLICT"
+
+
+@pytest.mark.anyio
+async def test_disputed_intent_stays_reconciliation_required(connection, ready_mode):
+    """Disputed intents are never re-checked, so they must hold the flag."""
+    now = datetime.now(timezone.utc)
+    await connection.execute(
+        "INSERT INTO arkade_outgoing_intents "
+        "(intent_id, account_id, wallet_id, amount_msat, max_fee_msat, "
+        "destination, destination_kind, status, expires_at) "
+        "VALUES (:intent_id, :account_id, :wallet_id, 1000, 0, :destination, "
+        "'arkade_address', 'disputed', :expires_at)",
+        {
+            "intent_id": "88" * 16,
+            "account_id": ACCOUNT_ID,
+            "wallet_id": WALLET_ID,
+            "destination": "tark1" + "q" * 20,
+            "expires_at": now + timedelta(hours=1),
+        },
+    )
+
+    await arkade.reconcile_arkade_receive(ACCOUNT_ID, [], conn=connection)
+
+    state = await arkade.get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
+    assert state and state.state == "reconciliation_required"
+    assert state.last_error == "ARKADE_LIGHTNING_EVIDENCE_CONTRADICTORY"
