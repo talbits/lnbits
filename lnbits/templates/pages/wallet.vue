@@ -309,6 +309,10 @@
             <span v-text="arkadeBacking.spendable_sat"></span> sats
           </div>
           <div>
+            Recorded account:
+            <span v-text="arkadeBackingLedgerSat"></span> sats
+          </div>
+          <div>
             Recoverable:
             <span v-text="arkadeBacking.recoverable_sat"></span> sats
           </div>
@@ -321,9 +325,13 @@
             rounded
             class="bg-orange-2 text-black q-my-sm"
           >
-            Payments are paused until account backing is verified. Recover
-            expired funds below; if recovery does not resolve this,
-            reconciliation needs review.
+            Account backing needs review, so payments that spend unverified
+            backing are refused. Recover expired funds below; if recovery does
+            not resolve this, reconciliation needs review.
+            <div v-if="arkadeBackingShortfallSat" class="text-caption q-mt-xs">
+              Unbacked:
+              <span v-text="arkadeBackingShortfallSat"></span> sats
+            </div>
             <div
               v-if="arkadeBacking.last_error"
               class="text-caption q-mt-xs"
