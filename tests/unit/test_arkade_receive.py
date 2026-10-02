@@ -61,6 +61,13 @@ async def connection(monkeypatch):
             "wallet_id TEXT, native_id TEXT, amount INT, fee INT, status TEXT)"
         )
         await connection.execute("CREATE TABLE balances (wallet_id TEXT, balance INT)")
+        await connection.execute(
+            "CREATE TABLE audit ("
+            "component TEXT, ip_address TEXT, user_id TEXT, path TEXT, "
+            "request_type TEXT, request_method TEXT, request_details TEXT, "
+            "response_code TEXT, duration REAL NOT NULL, delete_at TIMESTAMP, "
+            "created_at TIMESTAMP)"
+        )
         await migrations.m052_create_arkade_account_bindings_table(connection)
         await migrations.m053_create_arkade_receive_tables(connection)
         await migrations.m055_create_arkade_outgoing_tables(connection)
@@ -1236,7 +1243,7 @@ async def test_browser_funded_swap_attributes_spend_and_change(connection, ready
     ("status", "observed_script", "required"),
     [
         ("submitted", None, False),
-        ("settled", None, False),
+        ("settled", None, True),
         ("submitted", "5120" + "a1" * 32, False),
         ("submitted", "5120" + "a2" * 32, True),
     ],
@@ -1270,8 +1277,10 @@ async def test_change_reconciliation_waits_for_verified_settlement(
 
 
 @pytest.mark.anyio
-async def test_missing_terminal_change_flags_only_when_unbacked(connection, ready_mode):
-    """The same drift must still hold an account that cannot cover its ledger."""
+async def test_missing_terminal_change_holds_regardless_of_solvency(
+    connection, ready_mode
+):
+    """Detection is comprehensive; the signal is the operator's, not the user's."""
     funding_txid = "a0" * 32
     intent_id = await _browser_funded_lightning_intent(
         connection, funding_txid=funding_txid
@@ -1498,3 +1507,22 @@ async def test_acknowledged_request_does_not_settle_before_its_amount(
         request.native_request_id, conn=connection
     )
     assert stored is not None and stored.state == "acknowledged"
+
+
+@pytest.mark.anyio
+async def test_hold_writes_one_operator_audit_entry_on_transition(
+    connection, ready_mode
+):
+    """The operator is told once; the account holder is not told at all."""
+    request = await _create(connection)
+    await _mark_request_reconciliation_required(connection, request)
+    await _attribute_outpoint(connection, request, "9c" * 32, "conflict")
+
+    await arkade.reconcile_arkade_receive(ACCOUNT_ID, [], conn=connection)
+    await arkade.reconcile_arkade_receive(ACCOUNT_ID, [], conn=connection)
+
+    audits = await connection.fetchall("SELECT * FROM audit")
+    assert len(audits) == 1
+    assert audits[0]["component"] == "arkade"
+    assert audits[0]["user_id"] == ACCOUNT_ID
+    assert audits[0]["request_method"] == "SYSTEM"

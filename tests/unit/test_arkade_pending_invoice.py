@@ -87,6 +87,13 @@ async def connection(monkeypatch):
             SELECT wallet_id, SUM(amount - ABS(fee)) AS balance
             FROM apipayments GROUP BY wallet_id
         """)
+        await connection.execute(
+            "CREATE TABLE audit ("
+            "component TEXT, ip_address TEXT, user_id TEXT, path TEXT, "
+            "request_type TEXT, request_method TEXT, request_details TEXT, "
+            "response_code TEXT, duration REAL NOT NULL, delete_at TIMESTAMP, "
+            "created_at TIMESTAMP)"
+        )
         await migrations.m052_create_arkade_account_bindings_table(connection)
         await migrations.m053_create_arkade_receive_tables(connection)
         now = datetime.now(timezone.utc)

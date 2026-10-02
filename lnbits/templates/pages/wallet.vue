@@ -18,12 +18,6 @@
                 class="q-ml-xs"
                 @click="arkadeBackingDialog = true"
               >
-                <q-badge
-                  v-if="arkadeBackingAttention"
-                  color="orange"
-                  floating
-                  rounded
-                />
                 <q-tooltip>Arkade account backing</q-tooltip>
               </q-btn>
             </div>
@@ -320,24 +314,6 @@
             Expiring within 3 days:
             <span v-text="arkadeBacking.expiring_sat"></span> sats
           </div>
-          <q-banner
-            v-if="arkadeBacking.state !== 'ok'"
-            rounded
-            class="bg-orange-2 text-black q-my-sm"
-          >
-            Account backing needs review, so payments that spend unverified
-            backing are refused. Recover expired funds below; if recovery does
-            not resolve this, reconciliation needs review.
-            <div v-if="arkadeBackingShortfallSat" class="text-caption q-mt-xs">
-              Unbacked:
-              <span v-text="arkadeBackingShortfallSat"></span> sats
-            </div>
-            <div
-              v-if="arkadeBacking.last_error"
-              class="text-caption q-mt-xs"
-              v-text="`Reason: ${arkadeBacking.last_error}`"
-            ></div>
-          </q-banner>
           <q-banner
             v-if="arkadeBacking.maintenance"
             rounded

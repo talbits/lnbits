@@ -3457,6 +3457,10 @@ async def reconcile_arkade_receive(  # noqa: C901
     for vtxo in evidence:
         key = (vtxo.txid, vtxo.vout)
         if key in observed and observed[key] != vtxo:
+            logger.warning(
+                f"Arkade reconciliation hold for account {account_id}: "
+                "indexer returned conflicting vtxos for one outpoint"
+            )
             required = True
             last_error = "ARKADE_RECONCILIATION_REQUIRED"
         observed[key] = vtxo
@@ -3476,6 +3480,23 @@ async def reconcile_arkade_receive(  # noqa: C901
     unbacked = ledger_msat > sum(
         v.amount_sat * 1000 for v in evidence if _is_spendable_vtxo(v)
     )
+
+    def hold(guard: str) -> str:
+        """Raise the account flag, naming the guard that did it.
+
+        `last_error` is a fixed enum shared by every guard, so the code alone
+        made it impossible to tell which check is holding an account. The
+        guard name goes to the log, and the transition to the operator audit
+        trail, but never to the account holder: this is an operator concern,
+        like the LNbits watchdog on the funding source, not something a user
+        can act on.
+        """
+        nonlocal required, last_error
+        logger.warning(f"Arkade reconciliation hold for account {account_id}: {guard}")
+        required = True
+        last_error = "ARKADE_RECONCILIATION_REQUIRED"
+        return last_error
+
     consumed, maintenance_outputs, restored = await reconcile_maintenance(
         account_id, evidence, database
     )
@@ -3534,9 +3555,11 @@ async def reconcile_arkade_receive(  # noqa: C901
         ):
             # Our own browser-funded swap consumed this VTXO.
             continue
-        if not vtxo or _arkade_backing_diverged(vtxo, claim):
-            required = True
-            last_error = "ARKADE_RECONCILIATION_REQUIRED"
+        if not vtxo:
+            hold("recorded receive outpoint is no longer indexed")
+            continue
+        if _arkade_backing_diverged(vtxo, claim):
+            hold("recorded receive outpoint diverged")
     changes = await database.fetchall(
         "SELECT status, arkade_txid, change_script, change_amount_sat "
         "FROM arkade_outgoing_intents "
@@ -3561,13 +3584,7 @@ async def reconcile_arkade_receive(  # noqa: C901
             # ledger is checked below and is what actually protects funds. Hold
             # nothing on it, or an account stays flagged forever.
             if recorded and row["status"] != "submitted":
-                logger.warning(
-                    f"Arkade outgoing change {row['arkade_txid']}:1 is no "
-                    f"longer indexed for account {account_id}"
-                )
-                if unbacked:
-                    required = True
-                    last_error = "ARKADE_RECONCILIATION_REQUIRED"
+                hold("outgoing change is no longer indexed")
             continue
         change_outpoints.add(key)
         if not recorded:
@@ -3585,14 +3602,15 @@ async def reconcile_arkade_receive(  # noqa: C901
             or vtxo.amount_sat != int(row["change_amount_sat"])
             or _arkade_backing_diverged(vtxo, claims_by_outpoint.get(key))
         ):
-            required = True
-            last_error = "ARKADE_RECONCILIATION_REQUIRED"
+            hold("outgoing change does not match the recorded output")
     settled_payments: list[Payment] = []
     for key in maintenance_outputs - consumed:
         vtxo = observed.get(key)
-        if not vtxo or _arkade_backing_diverged(vtxo, claims_by_outpoint.get(key)):
-            required = True
-            last_error = "ARKADE_RECONCILIATION_REQUIRED"
+        if not vtxo:
+            hold("maintenance output is no longer indexed")
+            continue
+        if _arkade_backing_diverged(vtxo, claims_by_outpoint.get(key)):
+            hold("maintenance output diverged")
     if any(r["state"] == "planned" for r in await maintenance_rows(account_id, conn)):
         required = True
         last_error = last_error or "ARKADE_RECONCILIATION_REQUIRED"
@@ -3606,8 +3624,7 @@ async def reconcile_arkade_receive(  # noqa: C901
         previous_state and previous_state.state == "reconciliation_required"
     )
     if unbacked and (restored or already_flagged):
-        required = True
-        last_error = "ARKADE_RECONCILIATION_REQUIRED"
+        hold("ledger exceeds verified spendable backing")
     for vtxo in evidence:
         if (vtxo.txid, vtxo.vout) in change_outpoints | consumed | maintenance_outputs:
             continue
@@ -3735,14 +3752,13 @@ async def reconcile_arkade_receive(  # noqa: C901
                 or not address
                 or payment.arkade_address != address
             ):
-                required = True
-                last_error = "ARKADE_RECONCILIATION_REQUIRED"
+                reason = hold("receive payment does not match its request")
                 await mark_arkade_receive_outpoints_conflict(
                     request.native_request_id, conn=conn
                 )
                 await _mark_receive_reconciliation_required(
                     account_id,
-                    last_error,
+                    reason,
                     request.native_request_id,
                     conn,
                 )
@@ -3766,21 +3782,19 @@ async def reconcile_arkade_receive(  # noqa: C901
                         request.native_request_id, conn=conn
                     )
                     if not current or current.status != PaymentState.SUCCESS.value:
-                        required = True
-                        last_error = "ARKADE_RECONCILIATION_REQUIRED"
+                        reason = hold("receive payment could not be settled")
                         await _mark_receive_reconciliation_required(
                             account_id,
-                            last_error,
+                            reason,
                             request.native_request_id,
                             conn,
                         )
                         continue
             elif payment.status != PaymentState.SUCCESS.value:
-                required = True
-                last_error = "ARKADE_RECONCILIATION_REQUIRED"
+                reason = hold("receive payment is neither settleable nor successful")
                 await _mark_receive_reconciliation_required(
                     account_id,
-                    last_error,
+                    reason,
                     request.native_request_id,
                     conn,
                 )
@@ -3817,4 +3831,30 @@ async def reconcile_arkade_receive(  # noqa: C901
         last_error=last_error if required else None,
         conn=conn,
     )
+    # Only on the transition, so a standing condition does not write an audit
+    # entry every pass. The account holder is not told: this is the operator's
+    # signal, mirroring the funding-source watchdog.
+    was_flagged = bool(
+        previous_state and previous_state.state == "reconciliation_required"
+    )
+    if required and not was_flagged:
+        await create_audit_entry(
+            AuditEntry(
+                component="arkade",
+                user_id=account_id,
+                path="/arkade/reconciliation",
+                request_method="SYSTEM",
+                request_details=json.dumps(
+                    {
+                        "account_id": account_id,
+                        "state": state,
+                        "last_error": last_error,
+                        "ledger_msat": ledger_msat,
+                    }
+                ),
+                response_code="409",
+                duration=0.0,
+            ),
+            conn=conn,
+        )
     return settled_payments

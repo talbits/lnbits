@@ -319,27 +319,8 @@ window.PageWallet = {
       }
       return this.formattedTotalBreakdownFiat
     },
-    arkadeBackingAttention() {
-      if (this.arkadeBackingError) return true
-      const backing = this.arkadeBacking
-      if (!backing) return false
-      return (
-        backing.state !== 'ok' ||
-        !!backing.maintenance ||
-        backing.recoverable_sat > 0 ||
-        !!backing.maintenance_inputs?.length
-      )
-    },
     arkadeBackingLedgerSat() {
       return Math.floor((this.arkadeBacking?.ledger_msat ?? 0) / 1000)
-    },
-    arkadeBackingShortfallSat() {
-      const backing = this.arkadeBacking
-      if (!backing) return 0
-      return Math.max(
-        0,
-        Math.floor((backing.ledger_msat - backing.spendable_sat * 1000) / 1000)
-      )
     }
   },
   methods: {
