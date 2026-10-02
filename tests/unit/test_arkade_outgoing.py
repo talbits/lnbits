@@ -1,3 +1,4 @@
+import hashlib
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -38,6 +39,7 @@ from lnbits.core.crud.payments import (
 from lnbits.core.models.arkade import (
     ArkadeLightningFundingEvidence,
     ArkadeLightningQuoteInput,
+    ArkadeMaintenancePlan,
     ArkadeOutgoingChangeCommitment,
     ArkadeOutgoingEvidenceResult,
     ArkadeOutgoingIntent,
@@ -176,6 +178,7 @@ async def connection(monkeypatch):
         await migrations.m060_add_arkade_lightning_refund_binding(connection)
         await migrations.m061_add_arkade_lightning_failed_state(connection)
         await migrations.m062_extend_arkade_reconciliation_errors(connection)
+        await migrations.m064_arkade_maintenance(connection)
         await migrations.m063_arkade_outgoing_retryable_invoice(connection)
         yield connection
     await engine.dispose()
@@ -301,6 +304,84 @@ def _change():
         exit_tapleaf=CHANGE_TAPLEAF,
         exit_control_block=CHANGE_CONTROL,
     )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "failure", [None, "signature", "foreign_output", "fee", "spent", "conflict"]
+)
+async def test_maintenance_authorization_is_signed_owned_and_durable(
+    connection, monkeypatch, failure
+):
+    monkeypatch.setattr(
+        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
+    )
+    key = PrivateKey.from_int(2)
+    await connection.execute(
+        "UPDATE arkade_account_bindings SET identity_xonly_pubkey = :key",
+        {"key": key.public_key_xonly.format().hex()},
+    )
+
+    @asynccontextmanager
+    async def use_connection():
+        yield connection
+
+    monkeypatch.setattr(arkade.db, "connect", use_connection)
+    evidence = [_observed(amount_sat=40)]
+    if failure == "spent":
+        evidence[0] = evidence[0].copy(update={"is_spent": True})
+    monkeypatch.setattr(
+        arkade, "fetch_arkade_indexer_vtxos", AsyncMock(return_value=evidence)
+    )
+    output = _change().copy(update={"amount_sat": 39 if failure == "fee" else 40})
+    if failure == "foreign_output":
+        output = output.copy(update={"index": 1})
+    plan = ArkadeMaintenancePlan(
+        operation_id="e0" * 16, inputs=_selected(), output=output, signature="00" * 64
+    )
+    signature = key.sign_schnorr(
+        hashlib.sha256(
+            arkade.maintenance_statement(ACCOUNT_ID, plan).encode("ascii")
+        ).digest()
+    ).hex()
+    plan = plan.copy(
+        update={"signature": "00" * 64 if failure == "signature" else signature}
+    )
+    if failure == "conflict":
+        await arkade.update_arkade_reconciliation(
+            ACCOUNT_ID,
+            state="reconciliation_required",
+            last_error="ARKADE_LIGHTNING_EVIDENCE_CONTRADICTORY",
+            conn=connection,
+        )
+    if failure:
+        with pytest.raises(arkade.ArkadeOutgoingError):
+            await arkade.register_arkade_maintenance(ACCOUNT_ID, plan)
+        assert not await connection.fetchone("SELECT * FROM arkade_maintenance")
+    else:
+        await arkade.register_arkade_maintenance(ACCOUNT_ID, plan)
+        await arkade.register_arkade_maintenance(ACCOUNT_ID, plan)
+        assert (
+            await connection.fetchone(
+                "SELECT COUNT(*) AS count FROM arkade_maintenance"
+            )
+        )["count"] == 1
+        state = await arkade.get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
+        assert state and state.state == "reconciliation_required"
+        changed = plan.copy(update={"inputs": _selected("98" * 32)})
+        changed = changed.copy(
+            update={
+                "signature": key.sign_schnorr(
+                    hashlib.sha256(
+                        arkade.maintenance_statement(ACCOUNT_ID, changed).encode(
+                            "ascii"
+                        )
+                    ).digest()
+                ).hex()
+            }
+        )
+        with pytest.raises(arkade.ArkadeOutgoingError, match="IDEMPOTENCY_CONFLICT"):
+            await arkade.register_arkade_maintenance(ACCOUNT_ID, changed)
 
 
 def _observed(

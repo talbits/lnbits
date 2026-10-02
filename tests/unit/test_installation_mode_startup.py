@@ -194,7 +194,7 @@ def test_installation_mode_is_authenticated_user_data_only():
 @pytest.mark.parametrize(
     "mode,expected", [("custodial", 1800), ("arkade_noncustodial", 5)]
 )
-def test_arkade_reconciliation_uses_prompt_polling(monkeypatch, mode, expected):
+def test_arkade_reconciliation_uses_events_with_fallback(monkeypatch, mode, expected):
     calls = []
     monkeypatch.setattr(settings, "lnbits_effective_installation_mode", mode)
     monkeypatch.setattr(
@@ -210,11 +210,26 @@ def test_arkade_reconciliation_uses_prompt_polling(monkeypatch, mode, expected):
         lambda func, **kw: calls.append((func, kw)),
     )
     app_module.register_async_tasks()
-    for func in [
-        app_module.check_pending_payments,
-        app_module.dispatch_arkade_lightning_terminal_events,
-    ]:
+    for func in [app_module.dispatch_arkade_lightning_terminal_events]:
         assert next(kw["interval"] for f, kw in calls if f == func) == expected
+    registered = {f for f, _ in calls}
+    if mode == "arkade_noncustodial":
+        assert app_module.check_pending_payments not in registered
+        assert {
+            app_module.listen_arkade_transactions,
+            app_module.reconcile_arkade_events,
+        } <= registered
+    else:
+        assert (
+            next(
+                kw["interval"]
+                for f, kw in calls
+                if f == app_module.check_pending_payments
+            )
+            == 1800
+        )
+        assert app_module.listen_arkade_transactions not in registered
+        assert app_module.reconcile_arkade_events not in registered
     custodial_tasks = {
         app_module.check_balance_delta_changed,
         app_module.check_server_balance_against_node,

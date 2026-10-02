@@ -113,6 +113,7 @@ async def connection(monkeypatch):
         await migrations.m060_add_arkade_lightning_refund_binding(connection)
         await migrations.m061_add_arkade_lightning_failed_state(connection)
         await migrations.m062_extend_arkade_reconciliation_errors(connection)
+        await migrations.m064_arkade_maintenance(connection)
         yield connection
     await engine.dispose()
 

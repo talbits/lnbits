@@ -17,6 +17,7 @@ from lnbits.core.models import (
     ArkadeReconciliationResolveResponse,
     SimpleStatus,
 )
+from lnbits.core.models.arkade import ArkadeBackingStatus, ArkadeMaintenancePlan
 from lnbits.core.services.arkade import (
     ArkadeEnrollmentError,
     ArkadeEnrollmentMigrationRequiredError,
@@ -28,9 +29,11 @@ from lnbits.core.services.arkade import (
     complete_enrollment,
     create_enrollment_challenge,
     fail_arkade_lightning_intent,
+    get_arkade_backing_status,
     get_arkade_outgoing_intent_for_account,
     get_arkade_receive_request_for_account,
     list_arkade_submitted_outgoing_intents,
+    register_arkade_maintenance,
     release_arkade_outgoing_payment,
     resolve_arkade_reconciliation,
     submit_arkade_lightning_intent,
@@ -38,6 +41,34 @@ from lnbits.core.services.arkade import (
 from lnbits.decorators import check_admin, check_authenticated_account
 
 arkade_router = APIRouter(prefix="/api/v1/arkade", tags=["Arkade"])
+
+
+@arkade_router.get("/backing", response_model=ArkadeBackingStatus)
+async def api_arkade_backing(account: Account = Depends(check_authenticated_account)):
+    try:
+        return await get_arkade_backing_status(account.id)
+    except ArkadeOutgoingError as exc:
+        raise _public_outgoing_error(exc) from exc
+    except (ArkadeReceiveError, ArkadeEnrollmentError) as exc:
+        raise HTTPException(
+            HTTPStatus.BAD_REQUEST, "ARKADE_BACKING_UNAVAILABLE"
+        ) from exc
+
+
+@arkade_router.post("/maintenance", response_model=SimpleStatus)
+async def api_arkade_maintenance(
+    data: ArkadeMaintenancePlan,
+    account: Account = Depends(check_authenticated_account),
+):
+    try:
+        await register_arkade_maintenance(account.id, data)
+        return SimpleStatus(success=True, message="Renewal registered")
+    except ArkadeOutgoingError as exc:
+        raise _public_outgoing_error(exc) from exc
+    except (ArkadeReceiveError, ArkadeEnrollmentError) as exc:
+        raise HTTPException(
+            HTTPStatus.BAD_REQUEST, "ARKADE_MAINTENANCE_UNAVAILABLE"
+        ) from exc
 
 
 def _public_error(exc: ArkadeEnrollmentError) -> HTTPException:

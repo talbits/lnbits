@@ -153,6 +153,11 @@ window.PageWallet = {
       nfcReaderAbortController: null,
       arkadeRecovery: [],
       arkadeRecoveryBusy: false,
+      arkadeBacking: null,
+      arkadeBackingError: '',
+      arkadeMaintenanceBusy: false,
+      arkadeAutoRenew: false,
+      arkadeBackingTimer: null,
       formattedFiatAmount: 0,
       totalBreakdown: {
         show: false,
@@ -315,6 +320,86 @@ window.PageWallet = {
     }
   },
   methods: {
+    async refreshArkadeBacking() {
+      if (this.g.user?.installationMode !== 'arkade_noncustodial') return
+      try {
+        this.arkadeBacking = (
+          await LNbits.api.request('GET', '/api/v1/arkade/backing')
+        ).data
+        this.arkadeBackingError = ''
+        if (
+          this.arkadeAutoRenew &&
+          this.arkadeBacking.expiring_sat > 0 &&
+          !this.arkadeBacking.maintenance &&
+          !this.arkadeMaintenanceBusy
+        )
+          await this.maintainArkadeVtxos(true)
+      } catch {
+        this.arkadeBackingError =
+          'Backing could not be verified. Refresh before paying.'
+      }
+    },
+    async enableArkadeAutoRenew(value) {
+      if (value) {
+        const approved = await new Promise(resolve => {
+          this.$q
+            .dialog({
+              title: 'Automatic VTXO renewal',
+              message:
+                'Allow this browser to sign zero-fee renewals while your wallet is unlocked? Keep it open to renew before expiry. This cannot renew funds while the browser is closed.',
+              cancel: true,
+              persistent: true
+            })
+            .onOk(() => resolve(true))
+            .onCancel(() => resolve(false))
+        })
+        if (!approved) return
+      }
+      this.arkadeAutoRenew = value
+      this.$q.localStorage.set(
+        `lnbits.arkade.autoRenew.${this.g.user.id}`,
+        value
+      )
+      if (value) void this.refreshArkadeBacking()
+    },
+    async maintainArkadeVtxos(automatic = false) {
+      if (this.arkadeMaintenanceBusy) return
+      if (!automatic) {
+        const approved = await new Promise(resolve => {
+          this.$q
+            .dialog({
+              title: 'Recover / renew Arkade funds',
+              message:
+                'Sign a zero-fee batch settlement back to your own wallet? This restores or extends VTXO backing without changing your recorded balance. Settlement can take several minutes.',
+              cancel: true,
+              persistent: true
+            })
+            .onOk(() => resolve(true))
+            .onCancel(() => resolve(false))
+        })
+        if (!approved) return
+      }
+      this.arkadeMaintenanceBusy = true
+      try {
+        this.arkadeBacking = await window.ArkadeEnrollment.maintainVtxos({
+          approved: true
+        })
+        this.arkadeBackingError = ''
+        this.$q.notify({
+          type: 'info',
+          message: this.arkadeBacking.maintenance
+            ? 'Settlement submitted; awaiting backing verification.'
+            : 'Arkade backing refreshed.'
+        })
+      } catch (error) {
+        this.arkadeBackingError =
+          error?.response?.data?.detail ||
+          error.message ||
+          'Recovery needs another attempt.'
+      } finally {
+        this.arkadeMaintenanceBusy = false
+      }
+    },
     showWalletTotalBreakdown() {
       this.totalBreakdown.show = true
       if (!this.totalBreakdown.rows.length) {
@@ -1249,8 +1334,18 @@ window.PageWallet = {
       this.g.wallet = wallet
       this.g.lastActiveWallet = wallet.id
       this.$q.localStorage.setItem('lnbits.lastActiveWallet', wallet.id)
-      if (this.g.user.installationMode === 'arkade_noncustodial')
+      if (this.g.user.installationMode === 'arkade_noncustodial') {
         void this.refreshArkadeRecovery()
+        this.arkadeAutoRenew =
+          this.$q.localStorage.getItem(
+            `lnbits.arkade.autoRenew.${this.g.user.id}`
+          ) === true
+        void this.refreshArkadeBacking()
+        this.arkadeBackingTimer = setInterval(
+          () => void this.refreshArkadeBacking(),
+          30000
+        )
+      }
       // the dialog needs the wallet, and a dialog opened while this navigation
       // is still in flight gets torn down by it, so handle the payment request
       // only once the url rewrite has settled
@@ -1268,12 +1363,16 @@ window.PageWallet = {
       this.$router.push('/error')
     }
   },
+  beforeUnmount() {
+    clearInterval(this.arkadeBackingTimer)
+  },
   watch: {
     'g.updatePaymentsHash'() {
       this.receive.show = false
     },
     'g.updatePayments'() {
       void this.refreshArkadeRecovery()
+      void this.refreshArkadeBacking()
       this.parse.show = false
       if (
         this.g.wallet.currency &&

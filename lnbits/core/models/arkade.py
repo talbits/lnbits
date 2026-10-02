@@ -340,6 +340,26 @@ class ArkadeOutgoingAuthorizeRequest(BaseModel):
         extra = "forbid"
 
 
+class ArkadeMaintenancePlan(BaseModel):
+    operation_id: str = Field(regex=r"^[0-9a-f]{32}$")
+    inputs: list[ArkadeOutgoingSelectedInput] = Field(..., min_items=1, max_items=100)
+    output: ArkadeOutgoingChangeCommitment
+    signature: str = Field(regex=r"^[0-9a-f]{128}$")
+
+    class Config:
+        extra = "forbid"
+
+
+class ArkadeBackingStatus(BaseModel):
+    ledger_msat: int
+    spendable_sat: int
+    recoverable_sat: int
+    expiring_sat: int
+    state: ArkadeReconciliationState
+    maintenance: ArkadeMaintenancePlan | None = None
+    maintenance_inputs: list[ArkadeOutgoingSelectedInput] = Field(default_factory=list)
+
+
 class ArkadeOutgoingIntentResponse(BaseModel):
     action: Literal["lnbits-arkade-outgoing-v1"] = "lnbits-arkade-outgoing-v1"
     version: Literal[1] = 1

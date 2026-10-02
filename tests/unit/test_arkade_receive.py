@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 import lnbits.db as db_module
 from lnbits.core import migrations
 from lnbits.core.crud import wallets
+from lnbits.core.crud.arkade_maintenance import store_maintenance
 from lnbits.core.crud.wallets import (
     delete_unused_wallets,
     remove_deleted_wallets,
@@ -19,6 +20,11 @@ from lnbits.core.models import (
     ArkadeIndexerVtxo,
     ArkadeReceiveAcknowledgement,
     Wallet,
+)
+from lnbits.core.models.arkade import (
+    ArkadeMaintenancePlan,
+    ArkadeOutgoingChangeCommitment,
+    ArkadeOutgoingSelectedInput,
 )
 from lnbits.core.services import arkade
 from lnbits.db import SQLITE, Connection
@@ -62,6 +68,7 @@ async def connection(monkeypatch):
         await migrations.m060_add_arkade_lightning_refund_binding(connection)
         await migrations.m061_add_arkade_lightning_failed_state(connection)
         await migrations.m062_extend_arkade_reconciliation_errors(connection)
+        await migrations.m064_arkade_maintenance(connection)
         now = datetime.now(timezone.utc)
         await connection.execute(
             "INSERT INTO arkade_account_bindings "
@@ -577,6 +584,86 @@ async def test_verified_outgoing_change_is_backing_without_income(
     )
     assert outpoints["count"] == 1
     assert outpoints["total"] == 100
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "failure",
+    [None, "amount", "batch", "unconsumed", "expired", "duplicate", "deficit"],
+)
+async def test_renewal_preserves_ledger_and_requires_public_lineage(
+    connection, ready_mode, failure
+):
+    request = await _ack(connection, await _create(connection))
+    assert request.script
+    received = ArkadeIndexerVtxo(
+        txid="a1" * 32, vout=0, amount_sat=100, script=request.script
+    )
+    await arkade.reconcile_arkade_receive(ACCOUNT_ID, [received], conn=connection)
+    txid, script = await _settled_outgoing_with_change(
+        connection, input_txid=received.txid, input_amount_sat=100, change_amount_sat=60
+    )
+    spent = received.copy(
+        update={"is_spent": True, "arkade_txid": txid, "is_swept": True}
+    )
+    expired = ArkadeIndexerVtxo(
+        txid=txid, vout=1, amount_sat=60, script=script, is_swept=True
+    )
+    await arkade.reconcile_arkade_receive(ACCOUNT_ID, [spent, expired], conn=connection)
+    data = _ack_data(request)
+    plan = ArkadeMaintenancePlan(
+        operation_id="e0" * 16,
+        inputs=[ArkadeOutgoingSelectedInput(txid=txid, vout=1, amount_sat=60)],
+        signature="00" * 64,
+        output=ArkadeOutgoingChangeCommitment(
+            index=8,
+            address=data.address,
+            script="5120" + "e1" * 32,
+            amount_sat=60,
+            child_xonly_pubkey=data.child_xonly_pubkey,
+            exit_tapleaf=data.exit_tapleaf,
+            exit_control_block=data.exit_control_block,
+        ),
+    )
+    await store_maintenance(ACCOUNT_ID, plan, connection)
+    ledger = 61000 if failure == "deficit" else 60000
+    await connection.execute(
+        f"CREATE VIEW balances AS SELECT '{WALLET_ID}' AS wallet_id, "
+        f"{ledger} AS balance"
+    )
+    before = await connection.fetchone("SELECT balance FROM balances")
+    renewed = ArkadeIndexerVtxo(
+        txid="e2" * 32,
+        vout=0,
+        amount_sat=59 if failure == "amount" else 60,
+        script=plan.output.script,
+        commitment_txids=["e3" * 32],
+        expires_at=datetime.now(timezone.utc)
+        + timedelta(days=-1 if failure == "expired" else 7),
+    )
+    old = expired.copy(
+        update={
+            "settled_by": (
+                None
+                if failure == "unconsumed"
+                else "e4" * 32 if failure == "batch" else "e3" * 32
+            )
+        }
+    )
+    evidence = [spent, old, renewed] + ([renewed] if failure == "duplicate" else [])
+    await arkade.reconcile_arkade_receive(ACCOUNT_ID, evidence, conn=connection)
+    state = await arkade.get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
+    assert state
+    assert state.state == ("reconciliation_required" if failure else "ok")
+    assert await connection.fetchone("SELECT balance FROM balances") == before
+    assert not await connection.fetchone(
+        "SELECT * FROM arkade_receive_outpoints WHERE txid = :txid",
+        {"txid": renewed.txid},
+    )
+    # Restart/replay has exactly the same result, with no replacement income.
+    await arkade.reconcile_arkade_receive(ACCOUNT_ID, evidence, conn=connection)
+    replay = await arkade.get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
+    assert replay and replay.state == state.state
 
 
 @pytest.mark.anyio

@@ -2808,6 +2808,88 @@ const unlock = async password => {
   resetIdleTimer()
   return activeBinding?.state === 'pending'
 }
+// Keep SDK autonomous settlement disabled: every renewal must first persist
+// public lineage in LNbits, otherwise its new output would look like income.
+const maintenanceStatement = (accountId, plan) =>
+  [
+    'action=lnbits-arkade-maintenance-v1',
+    `account_id=${accountId}`,
+    `operation_id=${plan.operation_id}`,
+    `inputs=${plan.inputs
+      .map(i => `${i.txid}:${i.vout}:${i.amount_sat}`)
+      .sort()
+      .join(',')}`,
+    `output=${plan.output.index}:${plan.output.script}:${plan.output.amount_sat}:${plan.output.child_xonly_pubkey}`
+  ].join('\n')
+let maintenanceInFlight = null
+const maintainVtxos = async approval => {
+  if (!approval?.approved) throw new Error('VTXO renewal needs approval')
+  if (maintenanceInFlight) return maintenanceInFlight
+  const work = async () => {
+    const accountId = window.g.user.id
+    const generation = unlockGeneration
+    const fingerprint = outgoingBindingFingerprint(activeBinding)
+    const wallet = await outgoingWallet(accountId, activeBinding)
+    const status = (await LNbits.api.request('GET', '/api/v1/arkade/backing'))
+      .data
+    let plan = status.maintenance
+    const selected = plan?.inputs || status.maintenance_inputs
+    if (!selected?.length) return status
+    const coins = await wallet.getVtxos({
+      withRecoverable: true,
+      withUnrolled: false
+    })
+    const inputs = selected.map(i =>
+      coins.find(
+        v => v.txid === i.txid && v.vout === i.vout && v.value === i.amount_sat
+      )
+    )
+    if (inputs.some(v => !v))
+      throw new Error(
+        'Renewal is awaiting SDK/indexer synchronization. Refresh before retrying.'
+      )
+    const info = await wallet.arkProvider.getInfo()
+    const fees = info.fees?.intentFee || {}
+    if (
+      [fees.offchainInput, fees.offchainOutput].some(
+        f => f != null && Number(f) !== 0
+      )
+    )
+      throw new Error(
+        'Fee-bearing renewal is not supported yet. No funds were moved.'
+      )
+    if (!plan) {
+      const [address] = await wallet.getNewAddresses({forceNew: true})
+      const output = outgoingChangeCommitment(wallet, address)
+      output.amount_sat = selected.reduce((sum, i) => sum + i.amount_sat, 0)
+      if (BigInt(output.amount_sat) < BigInt(info.dust))
+        throw new Error('Renewal amount is below the server dust limit')
+      plan = {operation_id: randomHex(16), inputs: selected, output}
+      plan.signature = bytesToHex(
+        await identity.signMessage(
+          await digest(maintenanceStatement(accountId, plan)),
+          'schnorr'
+        )
+      )
+    }
+    if (!outgoingContextIsLive(accountId, generation, fingerprint))
+      throw new Error('wallet is locked')
+    await LNbits.api.request('POST', '/api/v1/arkade/maintenance', null, plan)
+    if (!outgoingContextIsLive(accountId, generation, fingerprint))
+      throw new Error('wallet is locked')
+    await wallet.settle({
+      inputs,
+      outputs: [
+        {address: plan.output.address, amount: BigInt(plan.output.amount_sat)}
+      ]
+    })
+    return (await LNbits.api.request('GET', '/api/v1/arkade/backing')).data
+  }
+  maintenanceInFlight = work().finally(() => {
+    maintenanceInFlight = null
+  })
+  return maintenanceInFlight
+}
 const lock = () => {
   unlockGeneration += 1
   identity = null
@@ -2930,12 +3012,19 @@ window.ArkadeEnrollment = {
   },
   async binding() {
     return activeBinding
+  },
+  async maintainVtxos(approval) {
+    return maintainVtxos(approval)
   }
 }
 if (ARKADE_ENROLLMENT_TEST && window.__ARKADE_ENROLLMENT_TEST__) {
-  window.ArkadeEnrollment.__setTestReady = (binding, wallet) => {
+  window.ArkadeEnrollment.__setTestReady = (
+    binding,
+    wallet,
+    testIdentity = {}
+  ) => {
     activeBinding = binding
-    identity = {}
+    identity = testIdentity
     window.__ARKADE_ENROLLMENT_TEST__.wallet = wallet
     unlockGeneration += 1
   }

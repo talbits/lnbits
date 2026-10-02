@@ -1727,3 +1727,31 @@ async def m063_arkade_outgoing_retryable_invoice(db: Connection):
         "AND status IN ('reserved', 'quote_ready', 'submitted', 'disputed', "
         "'settled')"
     )
+
+
+async def m064_arkade_maintenance(db: Connection):
+    await db.execute("""
+        CREATE TABLE arkade_maintenance (
+            operation_id TEXT PRIMARY KEY,
+            account_id TEXT NOT NULL REFERENCES accounts(id),
+            plan_json TEXT NOT NULL,
+            script TEXT NOT NULL UNIQUE,
+            amount_sat BIGINT NOT NULL CHECK (amount_sat > 0),
+            state TEXT NOT NULL CHECK (state IN ('planned', 'verified')),
+            output_txid TEXT,
+            output_vout INTEGER,
+            UNIQUE (output_txid, output_vout)
+        )
+    """)
+    await db.execute("""
+        CREATE TABLE arkade_maintenance_inputs (
+            txid TEXT NOT NULL,
+            vout INTEGER NOT NULL,
+            operation_id TEXT NOT NULL REFERENCES arkade_maintenance(operation_id),
+            PRIMARY KEY (txid, vout)
+        )
+    """)
+    await db.execute(
+        "CREATE UNIQUE INDEX idx_arkade_maintenance_pending "
+        "ON arkade_maintenance (account_id) WHERE state = 'planned'"
+    )

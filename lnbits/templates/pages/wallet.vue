@@ -3,6 +3,12 @@
     <div class="col-12 col-md-7 q-gutter-y-md wallet-wrapper">
       <q-card class="wallet-card">
         <q-card-section>
+          <div
+            v-if="g.user.installationMode === 'arkade_noncustodial'"
+            class="text-caption"
+          >
+            Recorded wallet balance
+          </div>
           <div class="row q-gutter-sm">
             <div v-if="g.fiatTracking" class="col-auto">
               <q-btn
@@ -203,6 +209,80 @@
               ></lnbits-update-balance>
             </div>
           </div>
+        </q-card-section>
+      </q-card>
+      <q-card
+        v-if="g.user.installationMode === 'arkade_noncustodial'"
+        class="wallet-card"
+      >
+        <q-card-section>
+          <div class="text-h6">Arkade account backing</div>
+          <div class="text-caption q-mb-sm">
+            Shared by all wallets in this account. Recorded balances do not
+            guarantee spendable backing.
+          </div>
+          <div v-if="arkadeBacking">
+            <div>Available: {{ arkadeBacking.spendable_sat }} sats</div>
+            <div>Recoverable: {{ arkadeBacking.recoverable_sat }} sats</div>
+            <div v-if="arkadeBacking.expiring_sat">
+              Expiring within 3 days: {{ arkadeBacking.expiring_sat }} sats
+            </div>
+            <q-banner
+              v-if="arkadeBacking.state !== 'ok'"
+              rounded
+              class="bg-orange-2 text-black q-my-sm"
+            >
+              Payments are paused until account backing is verified. Recover
+              expired funds below; if recovery does not resolve this,
+              reconciliation needs review.
+            </q-banner>
+            <q-banner
+              v-if="arkadeBacking.maintenance"
+              rounded
+              class="bg-blue-1 text-black q-my-sm"
+            >
+              Recovery / renewal is awaiting batch verification. Refresh or
+              resume this operation; your recorded balance is preserved.
+            </q-banner>
+            <q-btn
+              v-if="
+                arkadeBacking.maintenance ||
+                arkadeBacking.maintenance_inputs.length
+              "
+              color="primary"
+              class="q-my-sm"
+              :loading="arkadeMaintenanceBusy"
+              :label="
+                arkadeBacking.maintenance
+                  ? 'Resume recovery / renewal'
+                  : 'Recover / renew funds'
+              "
+              @click="maintainArkadeVtxos(false)"
+            ></q-btn>
+          </div>
+          <div v-else>Verifying account backing…</div>
+          <q-banner
+            v-if="arkadeBackingError"
+            rounded
+            class="bg-orange-2 text-black q-my-sm"
+            >{{ arkadeBackingError }}</q-banner
+          >
+          <q-checkbox
+            :model-value="arkadeAutoRenew"
+            label="Automatically renew while unlocked (zero fee)"
+            @update:model-value="enableArkadeAutoRenew"
+          ></q-checkbox>
+          <div class="text-caption">
+            Keep this browser open and unlocked for renewal. Offline renewal is
+            not enabled.
+          </div>
+          <q-btn
+            flat
+            dense
+            label="Refresh backing"
+            :disable="arkadeMaintenanceBusy"
+            @click="refreshArkadeBacking"
+          ></q-btn>
         </q-card-section>
       </q-card>
       <q-card v-if="arkadeRecovery.length" class="wallet-card">

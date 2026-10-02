@@ -736,6 +736,63 @@ async function lightningBrowserChecks() {
 }
 
 async function main() {
+  const renewal = makeFixture({inputValue: 1000})
+  const w = renewal.window
+  const binding = await w.ArkadeEnrollment.binding()
+  w.ArkadeEnrollment.__setTestReady(binding, renewal.wallet, identity)
+  renewal.wallet.getVtxos = async () => [renewal.input]
+  let registered = null
+  let settled = false
+  w.LNbits.api.request = async (method, url, key, data) => {
+    if (method === 'POST') {
+      assert.equal(url, '/api/v1/arkade/maintenance')
+      assert.equal(data.output.amount_sat, 1000)
+      assert.match(data.signature, /^[0-9a-f]{128}$/)
+      registered = data
+      return {data: {success: true}}
+    }
+    return {
+      data: {
+        state: 'ok',
+        maintenance: null,
+        maintenance_inputs: settled
+          ? []
+          : [
+              {
+                txid: renewal.input.txid,
+                vout: renewal.input.vout,
+                amount_sat: 1000
+              }
+            ]
+      }
+    }
+  }
+  renewal.wallet.settle = async params => {
+    assert.ok(registered, 'lineage is durable before settlement signing')
+    assert.equal(params.outputs[0].amount, 1000n)
+    assert.equal(params.outputs[0].address, registered.output.address)
+    assert.equal(params.inputs.length, 1)
+    settled = true
+  }
+  await assert.rejects(
+    w.ArkadeEnrollment.maintainVtxos({approved: false}),
+    /approval/
+  )
+  assert.equal(registered, null)
+  await w.ArkadeEnrollment.maintainVtxos({approved: true})
+  assert.equal(settled, true)
+  // A fee change must fail before registering or signing another settlement.
+  settled = false
+  registered = null
+  renewal.wallet.arkProvider.getInfo = async () => ({
+    dust: 100,
+    fees: {intentFee: {offchainInput: '1.0'}}
+  })
+  await assert.rejects(
+    w.ArkadeEnrollment.maintainVtxos({approved: true}),
+    /Fee-bearing/
+  )
+  assert.equal(registered, null)
   const noChange = makeFixture({amountSat: 1_000, inputValue: 1_000})
   const prepared = await noChange.window.ArkadeEnrollment.prepareOutgoing(
     intentId,
