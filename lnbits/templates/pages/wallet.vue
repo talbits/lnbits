@@ -7,7 +7,7 @@
             v-if="g.user.installationMode === 'arkade_noncustodial'"
             class="row items-center"
           >
-            <div class="col text-caption">Recorded wallet balance</div>
+            <div class="col-auto text-caption">Recorded wallet balance</div>
             <div class="col-auto">
               <q-btn
                 flat
@@ -15,6 +15,7 @@
                 round
                 size="sm"
                 icon="info_outline"
+                class="q-ml-xs"
                 @click="arkadeBackingDialog = true"
               >
                 <q-badge
