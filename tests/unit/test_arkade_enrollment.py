@@ -1062,11 +1062,6 @@ async def test_wallet_deletion_guard_checks_all_wallet_money_state(
             "INSERT INTO arkade_receive_requests (wallet_id) VALUES ('w1')",
             "DELETE FROM arkade_receive_requests",
         ),
-        (
-            "INSERT INTO arkade_reconciliation_state (account_id, state) "
-            "VALUES ('a', 'reconciliation_required')",
-            "DELETE FROM arkade_reconciliation_state",
-        ),
     ]
     for insert, cleanup in checks:
         await sqlite_connection.execute(insert)
@@ -1076,6 +1071,10 @@ async def test_wallet_deletion_guard_checks_all_wallet_money_state(
             )
         await sqlite_connection.execute(cleanup)
 
+    await sqlite_connection.execute(
+        "INSERT INTO arkade_reconciliation_state (account_id, state) "
+        "VALUES ('a', 'reconciliation_required')"
+    )
     await arkade.ensure_arkade_wallet_deletion_allowed("w1", conn=sqlite_connection)
 
 

@@ -250,6 +250,8 @@ async def check_invalid_payments(
     invalid_wallets = {}
     for db_payment in settled_db_payments:
         checking_id, _, _ = db_payment.lightning_identifiers
+        if not checking_id:
+            raise ValueError("Payment is missing Lightning checking ID")
         if verbose:
             click.echo(
                 f"Checking Payment: '{checking_id}' for wallet"

@@ -66,6 +66,12 @@ def anyio_backend():
     return "asyncio"
 
 
+@pytest.fixture(scope="session", autouse=True)
+async def session_event_loop(anyio_backend):
+    """Keep shared database locks and the app on one AnyIO runner."""
+    yield
+
+
 @pytest.fixture(scope="session")
 def settings():
     # override settings for tests
@@ -165,7 +171,7 @@ async def admin_user():
 
 
 @pytest.fixture(scope="session")
-async def from_user():
+async def from_user(app):
     user = await create_user_account()
     yield user
 
@@ -200,7 +206,7 @@ async def from_wallet_ws(from_wallet, test_client):
 
 
 @pytest.fixture(scope="session")
-async def to_user():
+async def to_user(app):
     user = await create_user_account()
     yield user
 

@@ -166,6 +166,7 @@ window.app.component('lnbits-payment-list', {
         bolt11: data.bolt11,
         preimage: data.preimage,
         payment_hash: data.payment_hash,
+        protocol: data.protocol,
         native_id: data.native_id,
         arkade_address: data.arkade_address,
         expiry: data.expiry,
@@ -179,8 +180,10 @@ window.app.component('lnbits-payment-list', {
       }
       obj.date = this.utils.formatDate(data.created_at)
       obj.dateFrom = this.utils.formatDateFrom(data.created_at)
-      obj.expirydate = this.utils.formatDate(data.expiry)
-      obj.expirydateFrom = this.utils.formatDateFrom(data.expiry)
+      obj.expirydate = data.expiry ? this.utils.formatDate(data.expiry) : null
+      obj.expirydateFrom = data.expiry
+        ? this.utils.formatDateFrom(data.expiry)
+        : null
       obj.msat = obj.amount
       obj.sat = obj.msat / 1000
       obj.tag = obj.extra?.tag

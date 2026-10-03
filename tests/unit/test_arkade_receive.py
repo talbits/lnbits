@@ -11,8 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 import lnbits.db as db_module
 from lnbits.core import migrations
 from lnbits.core.crud import wallets
-from lnbits.core.crud.arkade import update_arkade_reconciliation
-from lnbits.core.crud.arkade_maintenance import store_maintenance
+from lnbits.core.crud.arkade import get_arkade_reconciliation
 from lnbits.core.crud.wallets import (
     delete_unused_wallets,
     remove_deleted_wallets,
@@ -275,8 +274,8 @@ async def test_receive_ack_and_duplicate_reconciliation(connection, ready_mode):
     )
     await arkade.reconcile_arkade_receive(ACCOUNT_ID, [vtxo, vtxo], conn=connection)
     await arkade.reconcile_arkade_receive(ACCOUNT_ID, [vtxo], conn=connection)
-    state = await arkade.get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
-    assert state and state.state == "ok"
+    state = await get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
+    assert state is None
     stored = await connection.fetchone(
         "SELECT COUNT(*) AS count FROM arkade_receive_outpoints"
     )
@@ -462,8 +461,8 @@ async def test_conflicting_amount_fails_closed(connection, ready_mode):
         ],
         conn=connection,
     )
-    state = await arkade.get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
-    assert state and state.state == "reconciliation_required"
+    state = await get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
+    assert state is None
     outpoint = await connection.fetchone(
         "SELECT status FROM arkade_receive_outpoints WHERE native_request_id = :id",
         {"id": request.native_request_id},
@@ -472,7 +471,7 @@ async def test_conflicting_amount_fails_closed(connection, ready_mode):
     stored_request = await arkade.get_arkade_receive_request(
         request.native_request_id, connection
     )
-    assert stored_request and stored_request.state == "reconciliation_required"
+    assert stored_request and stored_request.state == "acknowledged"
     clean = ArkadeIndexerVtxo(
         txid="89" * 32,
         vout=0,
@@ -480,8 +479,12 @@ async def test_conflicting_amount_fails_closed(connection, ready_mode):
         script=request.script,
     )
     await arkade.reconcile_arkade_receive(ACCOUNT_ID, [clean], conn=connection)
-    state = await arkade.get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
-    assert state and state.state == "reconciliation_required"
+    state = await get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
+    assert state is None
+    stored_request = await arkade.get_arkade_receive_request(
+        request.native_request_id, connection
+    )
+    assert stored_request and stored_request.state == "settled"
 
 
 @pytest.mark.anyio
@@ -538,8 +541,8 @@ async def test_partial_receive_remains_acknowledged(connection, ready_mode):
         ],
         conn=connection,
     )
-    state = await arkade.get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
-    assert state and state.state == "ok"
+    state = await get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
+    assert state is None
     stored_request = await arkade.get_arkade_receive_request(
         request.native_request_id, connection
     )
@@ -583,9 +586,8 @@ async def test_verified_outgoing_change_is_backing_without_income(
 
     await arkade.reconcile_arkade_receive(ACCOUNT_ID, [spent, change], conn=connection)
 
-    state = await arkade.get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
-    expected_state = "ok" if change_state == "spendable" else "reconciliation_required"
-    assert state and state.state == expected_state
+    state = await get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
+    assert state is None
     outpoints = await connection.fetchone(
         "SELECT COUNT(*) AS count, COALESCE(SUM(amount_sat), 0) AS total "
         "FROM arkade_receive_outpoints WHERE account_id = :account_id",
@@ -634,7 +636,19 @@ async def test_renewal_preserves_ledger_and_requires_public_lineage(
             exit_control_block=data.exit_control_block,
         ),
     )
-    await store_maintenance(ACCOUNT_ID, plan, connection)
+    await connection.execute(
+        "INSERT INTO arkade_maintenance "
+        "(operation_id, account_id, plan_json, script, amount_sat, state) "
+        "VALUES (:operation_id, :account_id, :plan_json, :script, "
+        ":amount_sat, 'planned')",
+        {
+            "operation_id": plan.operation_id,
+            "account_id": ACCOUNT_ID,
+            "plan_json": plan.json(),
+            "script": plan.output.script,
+            "amount_sat": plan.output.amount_sat,
+        },
+    )
     ledger = 61000 if failure == "deficit" else 60000
     await connection.execute(
         "INSERT INTO balances (wallet_id, balance) " "VALUES (:wallet_id, :balance)",
@@ -661,9 +675,8 @@ async def test_renewal_preserves_ledger_and_requires_public_lineage(
     )
     evidence = [spent, old, renewed] + ([renewed] if failure == "duplicate" else [])
     await arkade.reconcile_arkade_receive(ACCOUNT_ID, evidence, conn=connection)
-    state = await arkade.get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
-    assert state
-    assert state.state == ("reconciliation_required" if failure else "ok")
+    state = await get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
+    assert state is None
     assert await connection.fetchone("SELECT balance FROM balances") == before
     assert not await connection.fetchone(
         "SELECT * FROM arkade_receive_outpoints WHERE txid = :txid",
@@ -671,8 +684,8 @@ async def test_renewal_preserves_ledger_and_requires_public_lineage(
     )
     # Restart/replay has exactly the same result, with no replacement income.
     await arkade.reconcile_arkade_receive(ACCOUNT_ID, evidence, conn=connection)
-    replay = await arkade.get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
-    assert replay and replay.state == state.state
+    replay = await get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
+    assert replay is None
 
 
 @pytest.mark.anyio
@@ -680,7 +693,9 @@ async def test_renewal_preserves_ledger_and_requires_public_lineage(
     "divergence",
     ["external_spend", "expiry", "height_expiry", "renewal", "missing"],
 )
-async def test_backing_divergence_holds_account(connection, ready_mode, divergence):
+async def test_backing_divergence_is_not_an_account_permission(
+    connection, ready_mode, divergence
+):
     request = await _ack(connection, await _create(connection))
     assert request.script
     received = ArkadeIndexerVtxo(
@@ -715,8 +730,8 @@ async def test_backing_divergence_holds_account(connection, ready_mode, divergen
 
     await arkade.reconcile_arkade_receive(ACCOUNT_ID, evidence, conn=connection)
 
-    state = await arkade.get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
-    assert state and state.state == "reconciliation_required"
+    state = await get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
+    assert state is None
 
 
 @pytest.mark.anyio
@@ -752,7 +767,7 @@ async def test_fresh_backing_fetch_includes_settled_change_script(
 
 
 @pytest.mark.anyio
-async def test_unattributed_state_is_sticky_and_terminal_flags_merge(
+async def test_receive_conflicts_stay_outpoint_scoped_and_terminal_flags_merge(
     connection, ready_mode
 ):
     unknown = ArkadeIndexerVtxo(
@@ -760,8 +775,8 @@ async def test_unattributed_state_is_sticky_and_terminal_flags_merge(
     )
     await arkade.reconcile_arkade_receive(ACCOUNT_ID, [unknown], conn=connection)
     await arkade.reconcile_arkade_receive(ACCOUNT_ID, [], conn=connection)
-    state = await arkade.get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
-    assert state and state.state == "reconciliation_required"
+    state = await get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
+    assert state is None
     await arkade.reconcile_arkade_receive(ACCOUNT_ID, [unknown], conn=connection)
     outpoint_count = await connection.fetchone(
         "SELECT COUNT(*) AS count FROM arkade_receive_outpoints "
@@ -822,8 +837,8 @@ async def test_unattributed_state_is_sticky_and_terminal_flags_merge(
     assert row["spent_by"] == spent.spent_by
     conflict = spent.copy(update={"spent_by": "ef" * 32})
     await arkade.reconcile_arkade_receive(ACCOUNT_ID, [conflict], conn=connection)
-    state = await arkade.get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
-    assert state and state.state == "reconciliation_required"
+    state = await get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
+    assert state is None
 
 
 @pytest.mark.anyio
@@ -851,8 +866,8 @@ async def test_cross_account_conflict_cannot_mutate_other_row(connection, ready_
         {"account_id": account_b, "txid": txid},
     )
     assert row and row["status"] == "valid"
-    state = await arkade.get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
-    assert state and state.state == "reconciliation_required"
+    state = await get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
+    assert state is None
 
 
 @pytest.mark.anyio
@@ -932,7 +947,9 @@ async def test_indexer_pages_use_pinned_page_parameters(
 
 
 @pytest.mark.anyio
-async def test_invalid_indexer_json_marks_required(connection, ready_mode, monkeypatch):
+async def test_invalid_indexer_json_does_not_write_account_state(
+    connection, ready_mode, monkeypatch
+):
     request = await _create(connection, idempotency_key="cc" * 16)
     await _ack(connection, request)
 
@@ -956,8 +973,8 @@ async def test_invalid_indexer_json_marks_required(connection, ready_mode, monke
     monkeypatch.setattr(arkade.httpx, "AsyncClient", lambda **_kwargs: Client())
     with pytest.raises(arkade.ArkadeReceiveError, match="INVALID_RESPONSE"):
         await arkade.fetch_arkade_indexer_vtxos(ACCOUNT_ID, connection)
-    state = await arkade.get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
-    assert state and state.state == "reconciliation_required"
+    state = await get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
+    assert state is None
 
 
 @pytest.mark.anyio
@@ -1192,8 +1209,8 @@ async def test_browser_funded_swap_attributes_spend_and_change(connection, ready
 
     await arkade.reconcile_arkade_receive(ACCOUNT_ID, [spent, change], conn=connection)
 
-    state = await arkade.get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
-    assert state and state.state == "ok"
+    state = await get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
+    assert state is None
     stored = await connection.fetchone(
         "SELECT change_index, change_script, change_amount_sat "
         "FROM arkade_outgoing_intents WHERE intent_id = :intent_id",
@@ -1240,16 +1257,16 @@ async def test_browser_funded_swap_attributes_spend_and_change(connection, ready
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
-    ("status", "observed_script", "required"),
+    ("status", "observed_script"),
     [
-        ("submitted", None, False),
-        ("settled", None, True),
-        ("submitted", "5120" + "a1" * 32, False),
-        ("submitted", "5120" + "a2" * 32, True),
+        ("submitted", None),
+        ("settled", None),
+        ("submitted", "5120" + "a1" * 32),
+        ("submitted", "5120" + "a2" * 32),
     ],
 )
 async def test_change_reconciliation_waits_for_verified_settlement(
-    connection, ready_mode, status, observed_script, required
+    connection, ready_mode, status, observed_script
 ):
     funding_txid = "a0" * 32
     intent_id = await _browser_funded_lightning_intent(
@@ -1271,16 +1288,15 @@ async def test_change_reconciliation_waits_for_verified_settlement(
         else []
     )
     await arkade.reconcile_arkade_receive(ACCOUNT_ID, evidence, conn=connection)
-    state = await arkade.get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
-    assert state is not None
-    assert (state.state == "reconciliation_required") is required
+    state = await get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
+    assert state is None
 
 
 @pytest.mark.anyio
 async def test_missing_terminal_change_holds_regardless_of_solvency(
     connection, ready_mode
 ):
-    """Detection is comprehensive; the signal is the operator's, not the user's."""
+    """A missing indexed change output does not create an account-wide hold."""
     funding_txid = "a0" * 32
     intent_id = await _browser_funded_lightning_intent(
         connection, funding_txid=funding_txid
@@ -1298,8 +1314,8 @@ async def test_missing_terminal_change_holds_regardless_of_solvency(
 
     await arkade.reconcile_arkade_receive(ACCOUNT_ID, [], conn=connection)
 
-    state = await arkade.get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
-    assert state and state.state == "reconciliation_required"
+    state = await get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
+    assert state is None
 
 
 @pytest.mark.anyio
@@ -1351,27 +1367,27 @@ async def test_indexer_queries_submitted_native_change(
 @pytest.mark.parametrize(
     "last_error", ["ARKADE_RECONCILIATION_REQUIRED", "ARKADE_UNATTRIBUTED_VALUE"]
 )
-async def test_transient_reconciliation_clears_with_clean_evidence(
+async def test_historical_account_diagnostic_is_ignored_by_receive_reconciliation(
     connection, ready_mode, last_error
 ):
-    """A recorded flag must not outlive the condition that raised it."""
-    await update_arkade_reconciliation(
-        ACCOUNT_ID,
-        state="reconciliation_required",
-        last_error=last_error,
-        conn=connection,
+    """Legacy flags stay stored but no longer gate or get rewritten."""
+    await connection.execute(
+        "INSERT INTO arkade_reconciliation_state "
+        "(account_id, state, last_error) VALUES "
+        "(:account_id, 'reconciliation_required', :last_error)",
+        {"account_id": ACCOUNT_ID, "last_error": last_error},
     )
 
     await arkade.reconcile_arkade_receive(ACCOUNT_ID, [], conn=connection)
 
-    state = await arkade.get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
-    assert state and state.state == "ok"
-    assert state.last_error is None
+    state = await get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
+    assert state and state.state == "reconciliation_required"
+    assert state.last_error == last_error
 
 
 @pytest.mark.anyio
-async def test_recorded_conflict_stays_reconciliation_required(connection, ready_mode):
-    """Conflicts are durable rows and survive the evidence that revealed them."""
+async def test_recorded_conflict_is_local_to_its_outpoint(connection, ready_mode):
+    """The durable monetary conflict remains attached to the receipt row."""
     await connection.execute(
         "INSERT INTO arkade_receive_outpoints "
         "(account_id, txid, vout, amount_sat, script, status) "
@@ -1381,14 +1397,20 @@ async def test_recorded_conflict_stays_reconciliation_required(connection, ready
 
     await arkade.reconcile_arkade_receive(ACCOUNT_ID, [], conn=connection)
 
-    state = await arkade.get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
-    assert state and state.state == "reconciliation_required"
-    assert state.last_error == "ARKADE_OUTPOINT_CONFLICT"
+    outpoint = await connection.fetchone(
+        "SELECT status FROM arkade_receive_outpoints WHERE txid = :txid",
+        {"txid": "77" * 32},
+    )
+    assert outpoint and outpoint["status"] == "conflict"
+    state = await get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
+    assert state is None
 
 
 @pytest.mark.anyio
-async def test_disputed_intent_stays_reconciliation_required(connection, ready_mode):
-    """Disputed intents are never re-checked, so they must hold the flag."""
+async def test_disputed_intent_does_not_write_account_permission(
+    connection, ready_mode
+):
+    """Aggregate outgoing history is not an account-wide spending gate."""
     now = datetime.now(timezone.utc)
     await connection.execute(
         "INSERT INTO arkade_outgoing_intents "
@@ -1407,9 +1429,8 @@ async def test_disputed_intent_stays_reconciliation_required(connection, ready_m
 
     await arkade.reconcile_arkade_receive(ACCOUNT_ID, [], conn=connection)
 
-    state = await arkade.get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
-    assert state and state.state == "reconciliation_required"
-    assert state.last_error == "ARKADE_LIGHTNING_EVIDENCE_CONTRADICTORY"
+    state = await get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
+    assert state is None
 
 
 async def _mark_request_reconciliation_required(connection, request):
@@ -1459,8 +1480,8 @@ async def test_marked_request_settles_once_its_condition_is_gone(
         request.native_request_id, conn=connection
     )
     assert stored is not None and stored.state == "settled"
-    state = await arkade.get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
-    assert state and state.state == "ok"
+    state = await get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
+    assert state is None
 
 
 @pytest.mark.anyio
@@ -1478,9 +1499,8 @@ async def test_marked_request_never_settles_on_a_conflicted_total(
         request.native_request_id, conn=connection
     )
     assert stored is not None and stored.state == "reconciliation_required"
-    state = await arkade.get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
-    assert state and state.state == "reconciliation_required"
-    assert state.last_error == "ARKADE_OUTPOINT_CONFLICT"
+    state = await get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
+    assert state is None
 
 
 @pytest.mark.anyio
@@ -1510,7 +1530,7 @@ async def test_acknowledged_request_does_not_settle_before_its_amount(
 
 
 @pytest.mark.anyio
-async def test_hold_writes_one_operator_audit_entry_on_transition(
+async def test_receive_conflict_does_not_write_operator_audit_or_account_state(
     connection, ready_mode
 ):
     """The operator is told once; the account holder is not told at all."""
@@ -1522,7 +1542,5 @@ async def test_hold_writes_one_operator_audit_entry_on_transition(
     await arkade.reconcile_arkade_receive(ACCOUNT_ID, [], conn=connection)
 
     audits = await connection.fetchall("SELECT * FROM audit")
-    assert len(audits) == 1
-    assert audits[0]["component"] == "arkade"
-    assert audits[0]["user_id"] == ACCOUNT_ID
-    assert audits[0]["request_method"] == "SYSTEM"
+    assert audits == []
+    assert await get_arkade_reconciliation(ACCOUNT_ID, conn=connection) is None

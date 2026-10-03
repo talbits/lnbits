@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 
 import lnbits.db as db_module
 from lnbits.core import migrations
+from lnbits.core.crud.arkade import get_arkade_reconciliation
 from lnbits.core.crud.payments import compare_and_set_arkade_payment_failed
 from lnbits.core.models import (
     ArkadeIndexerVtxo,
@@ -896,25 +897,14 @@ async def test_cross_account_reservation_rechecks_settled_receiver(
         amount_sat=42,
         script=script,
     )
-    settled = False
+    await arkade.reconcile_arkade_receive(
+        FOREIGN_ACCOUNT_ID, [evidence], conn=connection
+    )
 
-    async def backing(_account_id, **_kwargs):
-        nonlocal settled
-        if not settled:
-            settled = True
-            await arkade.reconcile_arkade_receive(
-                FOREIGN_ACCOUNT_ID, [evidence], conn=connection
-            )
-        return [
-            ArkadeIndexerVtxo(
-                txid="ff" * 32,
-                vout=0,
-                amount_sat=100,
-                script=script,
-            )
-        ]
+    async def unavailable(*args, **kwargs):
+        raise AssertionError("reservation must not fetch backing")
 
-    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", backing)
+    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", unavailable)
     intent = ArkadeOutgoingIntent(
         intent_id=arkade.arkade_internal_transfer_id(request.native_request_id),
         account_id=ACCOUNT_ID,
@@ -935,7 +925,6 @@ async def test_cross_account_reservation_rechecks_settled_receiver(
             receiver_native_request_id=request.native_request_id,
         )
 
-    assert settled
     sender_payment = await payments.get_payment_by_native_id(
         intent.intent_id, conn=connection
     )
@@ -1116,14 +1105,18 @@ async def test_reconcile_mapping_conflict_is_sticky_without_settlement(
 
     payment = await payments.get_payment_by_native_id(native_id, conn=connection)
     request = await arkade.get_arkade_receive_request(native_id, conn=connection)
-    reconciliation = await arkade.get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
+    reconciliation = await get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
     assert settled == []
     assert payment is not None
     assert request is not None
-    assert reconciliation is not None
+    assert reconciliation is None
     assert payment.status == PaymentState.PENDING.value
-    assert request.state == "reconciliation_required"
-    assert reconciliation.state == "reconciliation_required"
+    assert request.state == "acknowledged"
+    receipt = await connection.fetchone(
+        "SELECT status FROM arkade_receive_outpoints WHERE native_request_id = :id",
+        {"id": native_id},
+    )
+    assert receipt and receipt["status"] == "conflict"
 
 
 @pytest.mark.anyio

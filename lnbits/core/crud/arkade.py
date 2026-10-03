@@ -6,8 +6,8 @@ from lnbits.core.models import (
     ArkadeAccountBinding,
     ArkadeIndexerVtxo,
     ArkadeReceiveRequest,
-    ArkadeReconciliation,
 )
+from lnbits.core.models.arkade import ArkadeReconciliation
 from lnbits.db import Connection
 from lnbits.settings import settings
 
@@ -110,7 +110,7 @@ async def get_arkade_binding(
 async def get_arkade_ready_account_ids(
     conn: Connection | None = None,
 ) -> list[str]:
-    rows = await (conn or db).fetchall(
+    rows: list[dict] = await (conn or db).fetchall(
         "SELECT account_id FROM arkade_account_bindings WHERE state = 'ready'"
     )
     return [row["account_id"] for row in rows]
@@ -244,14 +244,14 @@ async def update_arkade_receive_acknowledgement(
     return bool(result.rowcount)
 
 
-async def mark_arkade_receive_request_reconciliation_required(
-    native_request_id: str, conn: Connection | None = None
-) -> None:
-    await (conn or db).execute(
-        "UPDATE arkade_receive_requests "
-        "SET state = 'reconciliation_required' "
-        "WHERE native_request_id = :native_request_id AND state <> 'settled'",
-        {"native_request_id": native_request_id},
+async def get_arkade_reconciliation(
+    account_id: str, conn: Connection | None = None
+) -> ArkadeReconciliation | None:
+    """Read a legacy account diagnostic; it no longer grants or blocks access."""
+    return await (conn or db).fetchone(
+        "SELECT * FROM arkade_reconciliation_state WHERE account_id = :account_id",
+        {"account_id": account_id},
+        ArkadeReconciliation,
     )
 
 
@@ -346,12 +346,13 @@ async def mark_arkade_receive_outpoints_conflict(
 async def get_arkade_receive_request_total(
     native_request_id: str, conn: Connection | None = None
 ) -> int:
-    row = await (conn or db).fetchone(
+    row: dict | None = await (conn or db).fetchone(
         "SELECT COALESCE(SUM(amount_sat), 0) AS total "
         "FROM arkade_receive_outpoints "
         "WHERE native_request_id = :request_id AND status = 'valid'",
         {"request_id": native_request_id},
     )
+    assert row is not None
     return int(row["total"])
 
 
@@ -391,54 +392,6 @@ async def mark_arkade_receive_outpoint_conflict(
         "WHERE txid = :txid AND vout = :vout AND account_id = :account_id",
         {"txid": txid, "vout": vout, "account_id": account_id},
     )
-
-
-async def get_arkade_reconciliation(
-    account_id: str, conn: Connection | None = None
-) -> ArkadeReconciliation | None:
-    return await (conn or db).fetchone(
-        "SELECT * FROM arkade_reconciliation_state WHERE account_id = :account_id",
-        {"account_id": account_id},
-        ArkadeReconciliation,
-    )
-
-
-async def update_arkade_reconciliation(
-    account_id: str,
-    *,
-    state: str,
-    last_error: str | None = None,
-    observed_at: datetime | None = None,
-    conn: Connection | None = None,
-) -> ArkadeReconciliation:
-    database = conn or db
-    now = datetime.now(timezone.utc)
-    observed_at = observed_at or now
-    await database.execute(
-        f"""
-        INSERT INTO arkade_reconciliation_state
-            (account_id, state, last_error, observed_at, updated_at)
-        VALUES (:account_id, :state, :last_error,
-                {database.timestamp_placeholder('observed_at')},
-                {database.timestamp_placeholder('updated_at')})
-        ON CONFLICT (account_id) DO UPDATE SET
-            state = excluded.state,
-            last_error = excluded.last_error,
-            observed_at = excluded.observed_at,
-            updated_at = excluded.updated_at
-        """,  # noqa: S608
-        {
-            "account_id": account_id,
-            "state": state,
-            "last_error": last_error,
-            "observed_at": observed_at,
-            "updated_at": now,
-        },
-    )
-    result = await get_arkade_reconciliation(account_id, conn=conn)
-    if not result:
-        raise RuntimeError("ARKADE_RECONCILIATION_UNAVAILABLE")
-    return result
 
 
 async def update_arkade_challenge(
@@ -575,7 +528,7 @@ async def ensure_arkade_wallet_deletion_allowed(
 ) -> None:
     if settings.lnbits_effective_installation_mode != "arkade_noncustodial":
         return
-    wallet = await (conn or db).fetchone(
+    wallet: dict | None = await (conn or db).fetchone(
         'SELECT "user", deleted FROM wallets WHERE id = :wallet',
         {"wallet": wallet_id},
     )
@@ -589,7 +542,7 @@ async def ensure_arkade_wallet_deletion_allowed(
     if not deleted:
         return
     database = conn or db
-    blocked = await database.fetchone(
+    blocked: dict | None = await database.fetchone(
         "SELECT CASE WHEN "
         "COALESCE((SELECT SUM(amount - ABS(fee)) FROM apipayments "
         "WHERE wallet_id = :wallet AND ((status = 'success' AND amount > 0) "
@@ -601,20 +554,20 @@ async def ensure_arkade_wallet_deletion_allowed(
         "('reserved', 'submitted', 'disputed')) "
         "OR EXISTS (SELECT 1 FROM arkade_receive_requests "
         "WHERE wallet_id = :wallet) "
-        "OR EXISTS (SELECT 1 FROM arkade_reconciliation_state "
-        "WHERE account_id = :account AND state = 'reconciliation_required') "
         "THEN 1 ELSE 0 END AS blocked",
-        {"wallet": wallet_id, "account": wallet["user"]},
+        {"wallet": wallet_id},
     )
+    assert blocked is not None
     if blocked["blocked"]:
         raise ValueError("ARKADE_WALLET_DELETION_BLOCKED")
     # Removal of an already inactive row still needs the money-state guards.
     if wallet["deleted"]:
         return
-    row = await (conn or db).fetchone(
+    row: dict | None = await (conn or db).fetchone(
         "SELECT COUNT(*) AS count FROM wallets "
         'WHERE "user" = :user AND deleted = false',
         {"user": wallet["user"]},
     )
+    assert row is not None
     if int(row["count"]) <= 1:
         raise ValueError("ARKADE_FINAL_WALLET_DELETION_BLOCKED")

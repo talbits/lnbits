@@ -309,6 +309,8 @@ async def lnurlwallet(request: Request, lightning: str = ""):
         memo=withdraw.defaultDescription or "lnurl wallet withdraw",
     )
     _, _, bolt11 = payment.lightning_identifiers
+    if not bolt11:
+        raise ValueError("Payment is missing Lightning BOLT11 invoice")
 
     try:
         await execute_withdraw(

@@ -7,7 +7,6 @@ ArkadeBindingState = Literal["pending", "ready"]
 ArkadeReceiveState = Literal[
     "pending", "acknowledged", "settled", "reconciliation_required"
 ]
-ArkadeReconciliationState = Literal["ok", "reconciliation_required"]
 
 
 class ArkadeAccountBinding(BaseModel):
@@ -124,8 +123,10 @@ class ArkadeIndexerVtxo(BaseModel):
 
 
 class ArkadeReconciliation(BaseModel):
+    """Read-only view of a legacy account diagnostic row."""
+
     account_id: str
-    state: ArkadeReconciliationState = "ok"
+    state: Literal["ok", "reconciliation_required"] = "ok"
     last_error: str | None = None
     observed_at: datetime | None = None
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -195,29 +196,12 @@ class ArkadeLightningFundingEvidence(BaseModel):
 
 
 class ArkadeLightningFailureReport(BaseModel):
-    """Browser-observed terminal claim failure for a funded Lightning swap."""
+    """Client diagnostic for a funded Lightning swap; not terminal evidence."""
 
     reason: str = Field(min_length=1, max_length=200, regex=r"^[A-Za-z0-9_.:\- ]+$")
 
     class Config:
         extra = "forbid"
-
-
-class ArkadeReconciliationResolveRequest(BaseModel):
-    """Operator request to clear a sticky account reconciliation flag."""
-
-    account_id: str = Field(min_length=1, max_length=64)
-    reason: str = Field(min_length=3, max_length=200, regex=r"^[A-Za-z0-9_.:\- ]+$")
-
-    class Config:
-        extra = "forbid"
-
-
-class ArkadeReconciliationResolveResponse(BaseModel):
-    account_id: str
-    previous_state: ArkadeReconciliationState
-    state: ArkadeReconciliationState
-    last_error: str | None = None
 
 
 class ArkadeOutgoingIntent(BaseModel):
@@ -355,10 +339,8 @@ class ArkadeBackingStatus(BaseModel):
     spendable_sat: int
     recoverable_sat: int
     expiring_sat: int
-    state: ArkadeReconciliationState
+    coverage: Literal["partial", "unknown"]
     last_error: str | None = None
-    maintenance: ArkadeMaintenancePlan | None = None
-    maintenance_inputs: list[ArkadeOutgoingSelectedInput] = Field(default_factory=list)
 
 
 class ArkadeOutgoingIntentResponse(BaseModel):

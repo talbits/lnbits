@@ -35,6 +35,7 @@ const VAULT_VERSION = 1
 const PBKDF2_ITERATIONS = 6e5
 const IDLE_TIMEOUT_MS = 15 * 60 * 1e3
 const MUTINYNET_CHECKPOINT_EXIT_DELAY_SECONDS = 512n
+const RENEWAL_THRESHOLD_MS = 3 * 24 * 60 * 60 * 1e3
 const HEX32 = /^[0-9a-f]{32}$/
 const HEX64 = /^[0-9a-f]{64}$/
 const NETWORK = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/
@@ -55,20 +56,13 @@ const OUTGOING_ERROR_CODES = /* @__PURE__ */ new Set([
   'ARKADE_OUTGOING_IDEMPOTENCY_CONFLICT',
   'ARKADE_OUTGOING_INDEXER_INVALID',
   'ARKADE_OUTGOING_INDEXER_UNAVAILABLE',
-  'ARKADE_OUTGOING_INPUT_CONFLICT',
-  'ARKADE_OUTGOING_INPUT_UNAVAILABLE',
-  'ARKADE_OUTGOING_INPUT_UNREGISTERED',
-  'ARKADE_OUTGOING_INPUT_VALUE_MISMATCH',
   'ARKADE_OUTGOING_INPUTS_INVALID',
-  'ARKADE_OUTGOING_INPUTS_MISSING',
   'ARKADE_OUTGOING_INVALID_REQUEST',
   'ARKADE_OUTGOING_NOT_ALLOWED',
   'ARKADE_OUTGOING_NOT_FOUND',
   'ARKADE_OUTGOING_OUTPUT_CONFLICT',
   'ARKADE_OUTGOING_OUTPUT_INVALID',
   'ARKADE_OUTGOING_UNAVAILABLE',
-  'ARKADE_BACKING_DEFICIT',
-  'ARKADE_BACKING_RECONCILIATION_REQUIRED',
   'ARKADE_DESCRIPTOR_REENROLLMENT_REQUIRED',
   'ARKADE_INSUFFICIENT_FUNDS',
   'ARKADE_TRANSACTION_ID_INVALID',
@@ -656,8 +650,9 @@ const lightningSwapManagerFor = async (accountId, wallet) => {
           void dropLightningPlanForSwap(accountId, swap.rfqId).catch(() => {})
         },
         onSwapFailed: (swap, error) => {
-          // Every thrown action reports here, including ones the manager
-          // retries; only the terminal failed swap is a server-visible state.
+          // Intermediate action errors can be retried by the manager. Report
+          // terminal failures as diagnostics; the funded plan stays for
+          // recovery until the server independently records settlement/refund.
           if (swap.state !== 'failed') {
             console.error(`Arkade Lightning swap ${swap.rfqId} error`, error)
             return
@@ -727,7 +722,18 @@ const restoreLightningSwaps = async (accountId, wallet) => {
 }
 const dropLightningPlanForSwap = async (accountId, rfqId) => {
   const record = await lightningPlanForSwap(accountId, rfqId)
-  if (record) await removeLightningJournalRecord(record.intentId)
+  if (!record) return
+  const response = (await LNbits.api.arkadeOutgoingIntent(record.intentId)).data
+  if (
+    response.account_id === record.accountId &&
+    response.intent_id === record.intentId &&
+    response.wallet_id === record.walletId &&
+    response.destination_kind === 'lightning' &&
+    response.swap_rfq_id === rfqId &&
+    response.arkade_txid === record.fundingArkTxid &&
+    ['settled', 'refunded'].includes(response.status)
+  )
+    await removeLightningJournalRecord(record.intentId)
 }
 const lightningPlanForSwap = async (accountId, rfqId) => {
   const records = await readLightningJournal(accountId)
@@ -735,8 +741,7 @@ const lightningPlanForSwap = async (accountId, rfqId) => {
     records.find(record => record.publicQuote.swap_rfq_id === rfqId) || null
   )
 }
-// One report per intent per page, but a failed report is retried: the manager
-// re-emits while the swap keeps failing to claim.
+// Avoid duplicate diagnostic posts for one intent during this page session.
 const reportedLightningFailures = new Set()
 const reportedFailureReason = error => {
   const message = typeof error?.message === 'string' ? error.message : ''
@@ -760,7 +765,6 @@ const reportLightningSwapFailure = async (accountId, swap, error) => {
     reportedLightningFailures.delete(record.intentId)
     throw reportError
   }
-  await removeLightningJournalRecord(record.intentId)
 }
 const lightningSwapFromPlan = (plan, now) => ({
   kind: 'lightning_send',
@@ -1089,6 +1093,8 @@ const getAllocationWallet = async (accountId, binding) => {
       binding.network === 'mutinynet'
         ? MUTINYNET_CHECKPOINT_EXIT_DELAY_SECONDS
         : void 0,
+    // ponytail: the SDK poll cannot enforce opt-in, zero-fee renewals; enable
+    // it when the SDK can enforce both without also settling boarding inputs.
     settlementConfig: false
   })
   allocationWalletKey = key
@@ -2808,46 +2814,20 @@ const unlock = async password => {
   resetIdleTimer()
   return activeBinding?.state === 'pending'
 }
-// Keep SDK autonomous settlement disabled: every renewal must first persist
-// public lineage in LNbits, otherwise its new output would look like income.
-const maintenanceStatement = (accountId, plan) =>
-  [
-    'action=lnbits-arkade-maintenance-v1',
-    `account_id=${accountId}`,
-    `operation_id=${plan.operation_id}`,
-    `inputs=${plan.inputs
-      .map(i => `${i.txid}:${i.vout}:${i.amount_sat}`)
-      .sort()
-      .join(',')}`,
-    `output=${plan.output.index}:${plan.output.script}:${plan.output.amount_sat}:${plan.output.child_xonly_pubkey}`
-  ].join('\n')
-let maintenanceInFlight = null
-const maintainVtxos = async approval => {
+let renewalInFlight = null
+const renewExpiringVtxos = async approval => {
   if (!approval?.approved) throw new Error('VTXO renewal needs approval')
-  if (maintenanceInFlight) return maintenanceInFlight
+  if (!identity || activeBinding?.state !== 'ready')
+    throw new Error('wallet is locked')
+  if (renewalInFlight) return renewalInFlight
   const work = async () => {
     const accountId = window.g.user.id
     const generation = unlockGeneration
     const fingerprint = outgoingBindingFingerprint(activeBinding)
     const wallet = await outgoingWallet(accountId, activeBinding)
-    const status = (await LNbits.api.request('GET', '/api/v1/arkade/backing'))
-      .data
-    let plan = status.maintenance
-    const selected = plan?.inputs || status.maintenance_inputs
-    if (!selected?.length) return status
-    const coins = await wallet.getVtxos({
-      withRecoverable: true,
-      withUnrolled: false
-    })
-    const inputs = selected.map(i =>
-      coins.find(
-        v => v.txid === i.txid && v.vout === i.vout && v.value === i.amount_sat
-      )
-    )
-    if (inputs.some(v => !v))
-      throw new Error(
-        'Renewal is awaiting SDK/indexer synchronization. Refresh before retrying.'
-      )
+    const manager = await wallet.getVtxoManager()
+    const inputs = await manager.getExpiringVtxos(RENEWAL_THRESHOLD_MS)
+    if (!inputs.length) return null
     const info = await wallet.arkProvider.getInfo()
     const fees = info.fees?.intentFee || {}
     if (
@@ -2858,37 +2838,23 @@ const maintainVtxos = async approval => {
       throw new Error(
         'Fee-bearing renewal is not supported yet. No funds were moved.'
       )
-    if (!plan) {
-      const [address] = await wallet.getNewAddresses({forceNew: true})
-      const output = outgoingChangeCommitment(wallet, address)
-      output.amount_sat = selected.reduce((sum, i) => sum + i.amount_sat, 0)
-      if (BigInt(output.amount_sat) < BigInt(info.dust))
-        throw new Error('Renewal amount is below the server dust limit')
-      plan = {operation_id: randomHex(16), inputs: selected, output}
-      plan.signature = bytesToHex(
-        await identity.signMessage(
-          await digest(maintenanceStatement(accountId, plan)),
-          'schnorr'
-        )
-      )
-    }
+    const inputTotal = inputs.reduce((total, input) => {
+      if (!Number.isSafeInteger(input.value) || input.value <= 0)
+        throw new Error('Arkade renewal input value is invalid')
+      return total + BigInt(input.value)
+    }, 0n)
+    const address = await wallet.getAddress()
     if (!outgoingContextIsLive(accountId, generation, fingerprint))
       throw new Error('wallet is locked')
-    await LNbits.api.request('POST', '/api/v1/arkade/maintenance', null, plan)
-    if (!outgoingContextIsLive(accountId, generation, fingerprint))
-      throw new Error('wallet is locked')
-    await wallet.settle({
+    return wallet.settle({
       inputs,
-      outputs: [
-        {address: plan.output.address, amount: BigInt(plan.output.amount_sat)}
-      ]
+      outputs: [{address, amount: inputTotal}]
     })
-    return (await LNbits.api.request('GET', '/api/v1/arkade/backing')).data
   }
-  maintenanceInFlight = work().finally(() => {
-    maintenanceInFlight = null
+  renewalInFlight = work().finally(() => {
+    renewalInFlight = null
   })
-  return maintenanceInFlight
+  return renewalInFlight
 }
 const lock = () => {
   unlockGeneration += 1
@@ -3013,8 +2979,8 @@ window.ArkadeEnrollment = {
   async binding() {
     return activeBinding
   },
-  async maintainVtxos(approval) {
-    return maintainVtxos(approval)
+  async renewExpiringVtxos(approval) {
+    return renewExpiringVtxos(approval)
   }
 }
 if (ARKADE_ENROLLMENT_TEST && window.__ARKADE_ENROLLMENT_TEST__) {
@@ -3028,6 +2994,9 @@ if (ARKADE_ENROLLMENT_TEST && window.__ARKADE_ENROLLMENT_TEST__) {
     window.__ARKADE_ENROLLMENT_TEST__.wallet = wallet
     unlockGeneration += 1
   }
+  window.ArkadeEnrollment.__reportLightningSwapFailure =
+    reportLightningSwapFailure
+  window.ArkadeEnrollment.__dropLightningPlanForSwap = dropLightningPlanForSwap
 }
 window.PageArkadeEnrollment = {
   template: '#page-arkade-enrollment',

@@ -22,7 +22,6 @@ from lnbits.core.services.notifications import (
     enqueue_admin_notification,
     send_payment_notification_in_background,
 )
-from lnbits.core.services.payments import check_pending_payments
 from lnbits.db import Filters
 from lnbits.settings import settings
 from lnbits.task_manager import task_manager
@@ -30,19 +29,6 @@ from lnbits.utils.cache import cache
 from lnbits.utils.exchange_rates import btc_price_from_aggregator, btc_rates
 
 audit_queue: asyncio.Queue[AuditEntry] = asyncio.Queue()
-
-
-async def reconcile_arkade_events():
-    """Reconcile pending Arkade payments once per registered task interval.
-
-    The reference wallet discovers Arkade activity by polling verified
-    evidence. The SDK's `/v1/txs` server-sent event stream is optional and
-    is not implemented by the Mutinynet server, so reconciliation must not
-    depend on it.
-    """
-    if settings.lnbits_effective_installation_mode != "arkade_noncustodial":
-        return
-    await check_pending_payments()
 
 
 async def dispatch_arkade_lightning_terminal_events() -> None:  # noqa: C901

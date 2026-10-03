@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 from time import time
 from typing import Any
 
@@ -1755,3 +1756,142 @@ async def m064_arkade_maintenance(db: Connection):
         "CREATE UNIQUE INDEX idx_arkade_maintenance_pending "
         "ON arkade_maintenance (account_id) WHERE state = 'planned'"
     )
+
+
+async def m065_arkade_receipt_facts_and_funded_failure_repair(db: Connection):
+    async with db.transaction():
+        await _m065_arkade_receipt_facts_and_funded_failure_repair(db)
+
+
+async def _m065_arkade_receipt_facts_and_funded_failure_repair(db: Connection):
+    """Remove exclusive input claims and reopen funded client-reported failures.
+
+    A failed funded intent is not terminal without independent public evidence.
+    Validate the entire repair set before any schema or payment mutation. An
+    invoice retry may already own the partial unique payment-hash index, in
+    which case an operator must reconcile the old physical spend before the
+    upgrade can safely proceed.
+    """
+    failed: list[dict] = await db.fetchall(
+        "SELECT intent_id, account_id, wallet_id, amount_msat, destination, "
+        "payment_hash, arkade_txid, settlement_ark_txid, refund_ark_txid "
+        "FROM arkade_outgoing_intents "
+        "WHERE destination_kind = 'lightning' AND arkade_txid IS NOT NULL "
+        "AND (status = 'failed' OR "
+        "(status = 'submitted' AND failure_reason IS NOT NULL)) "
+        "ORDER BY intent_id"
+    )
+    repaired: list[dict] = []
+    payment_hashes: dict[str, str] = {}
+    for intent in failed:
+        if intent["settlement_ark_txid"] or intent["refund_ark_txid"]:
+            raise RuntimeError(
+                "Migration 65 blocked: funded Arkade intent "
+                f"{intent['intent_id']} has terminal receipt evidence; "
+                "manual reconciliation is required before upgrade."
+            )
+        payment_hash = intent["payment_hash"]
+        if not payment_hash:
+            raise RuntimeError(
+                "Migration 65 blocked: funded Arkade intent "
+                f"{intent['intent_id']} has no payment hash; "
+                "manual reconciliation is required before upgrade."
+            )
+        previous = payment_hashes.get(payment_hash)
+        if previous:
+            raise RuntimeError(
+                "Migration 65 blocked: funded failed Arkade intents "
+                f"{previous} and {intent['intent_id']} share a payment hash; "
+                "manual reconciliation is required before upgrade."
+            )
+        payment_hashes[payment_hash] = intent["intent_id"]
+        collision: dict | None = await db.fetchone(
+            "SELECT intent_id FROM arkade_outgoing_intents "
+            "WHERE payment_hash = :payment_hash AND intent_id <> :intent_id "
+            "AND destination_kind = 'lightning' "
+            "AND status IN ('reserved', 'quote_ready', 'submitted', "
+            "'disputed', 'settled') "
+            "LIMIT 1",
+            {"payment_hash": payment_hash, "intent_id": intent["intent_id"]},
+        )
+        if collision:
+            raise RuntimeError(
+                "Migration 65 blocked: funded failed Arkade intent "
+                f"{intent['intent_id']} shares a payment hash with live/settled "
+                f"intent {collision['intent_id']}; manual reconciliation is "
+                "required before upgrade."
+            )
+        payment: dict | None = await db.fetchone(
+            "SELECT protocol, native_id, wallet_id, amount, fee, status, "
+            "arkade_address FROM apipayments WHERE native_id = :intent_id",
+            {"intent_id": intent["intent_id"]},
+        )
+        if (
+            not payment
+            or payment["protocol"] != "arkade"
+            or payment["native_id"] != intent["intent_id"]
+            or payment["wallet_id"] != intent["wallet_id"]
+            or int(payment["amount"]) != -int(intent["amount_msat"])
+            or int(payment["fee"]) != 0
+            or payment["arkade_address"] != intent["destination"]
+            or payment["status"] not in {"failed", "pending"}
+        ):
+            raise RuntimeError(
+                "Migration 65 blocked: funded Arkade intent "
+                f"{intent['intent_id']} has no matching pending/failed ledger "
+                "debit; manual reconciliation is required before upgrade."
+            )
+        repaired.append(intent)
+
+    await db.execute(f"""
+        CREATE TABLE arkade_outgoing_intent_inputs_new (
+            intent_id TEXT NOT NULL REFERENCES arkade_outgoing_intents (intent_id),
+            txid TEXT NOT NULL,
+            vout {db.big_int} NOT NULL CHECK (vout >= 0 AND vout <= 4294967295),
+            amount_sat {db.big_int} NOT NULL
+                CHECK (amount_sat > 0 AND amount_sat <= 2100000000000000),
+            claimed_at TIMESTAMP NOT NULL DEFAULT {db.timestamp_now},
+            PRIMARY KEY (intent_id, txid, vout)
+        )
+    """)
+    await db.execute("""
+        INSERT INTO arkade_outgoing_intent_inputs_new
+            (intent_id, txid, vout, amount_sat, claimed_at)
+        SELECT intent_id, txid, vout, amount_sat, claimed_at
+        FROM arkade_outgoing_intent_inputs
+    """)
+    await db.execute("DROP TABLE arkade_outgoing_intent_inputs")
+    await db.execute(
+        "ALTER TABLE arkade_outgoing_intent_inputs_new "
+        "RENAME TO arkade_outgoing_intent_inputs"
+    )
+
+    now = datetime.now(timezone.utc)
+    for intent in repaired:
+        await db.execute(
+            "UPDATE arkade_outgoing_intents SET status = 'submitted' "
+            "WHERE intent_id = :intent_id AND status = 'failed'",
+            {"intent_id": intent["intent_id"]},
+        )
+        await db.execute(
+            f"""
+            UPDATE apipayments SET status = 'pending', fee = 0,
+                updated_at = {db.timestamp_placeholder('updated_at')}
+            WHERE protocol = 'arkade' AND native_id = :intent_id
+              AND wallet_id = :wallet_id AND amount = :amount
+              AND arkade_address = :destination AND fee = 0
+              AND status = 'failed'
+            """,  # noqa: S608
+            {
+                "intent_id": intent["intent_id"],
+                "wallet_id": intent["wallet_id"],
+                "amount": -int(intent["amount_msat"]),
+                "destination": intent["destination"],
+                "updated_at": now,
+            },
+        )
+        await db.execute(
+            "DELETE FROM arkade_lightning_terminal_events "
+            "WHERE event_id = :intent_id AND terminal_state = 'failed'",
+            {"intent_id": intent["intent_id"]},
+        )

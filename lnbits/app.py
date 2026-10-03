@@ -46,7 +46,6 @@ from lnbits.core.tasks import (
     dispatch_arkade_lightning_terminal_events,
     notify_server_status,
     process_next_audit_entry,
-    reconcile_arkade_events,
     refresh_extension_cache,
 )
 from lnbits.core.wasm_ext.routes.register import (
@@ -590,14 +589,9 @@ def register_async_tasks() -> None:
         if settings.lnbits_effective_installation_mode == "arkade_noncustodial"
         else settings.lnbits_funding_source_pending_interval_seconds
     )
-    if settings.lnbits_effective_installation_mode == "arkade_noncustodial":
-        task_manager.create_permanent_task(
-            reconcile_arkade_events, interval=pending_interval
-        )
-    else:
-        task_manager.create_permanent_task(
-            check_pending_payments, interval=pending_interval
-        )
+    task_manager.create_permanent_task(
+        check_pending_payments, interval=pending_interval
+    )
     task_manager.create_permanent_task(
         dispatch_arkade_lightning_terminal_events,
         interval=pending_interval,

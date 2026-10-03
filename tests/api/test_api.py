@@ -18,7 +18,6 @@ from lnbits.core.models.payments import CreatePayment, PaymentState
 from lnbits.core.models.users import Account, UserExtra, UserLabel
 from lnbits.core.services.arkade import (
     ArkadeOutgoingError,
-    ArkadeReconciliationError,
     arkade_internal_transfer_id,
 )
 from lnbits.core.services.users import create_user_account
@@ -389,7 +388,7 @@ async def test_create_arkade_lightning_payment_tracks_intent_and_replay(
         mocker.AsyncMock(return_value=(intent, pending)),
     )
     headers = {**adminkey_headers_to, "Idempotency-Key": "ab" * 16}
-    body = {
+    body: dict = {
         "out": True,
         "unit": "sat",
         "amount": 42,
@@ -442,6 +441,28 @@ async def test_create_arkade_lightning_payment_tracks_intent_and_replay(
     assert replayed_body["browser_required"] is False
     assert reserve.await_count == 2
 
+    legacy_quotes: tuple[dict, ...] = (
+        {"quote": body["arkade_quote"]},
+        {"extra": {"arkade_quote": body["arkade_quote"]}},
+        body["arkade_quote"],
+    )
+    for legacy_quote in legacy_quotes:
+        legacy_body = {
+            "out": True,
+            "unit": "sat",
+            "amount": 42,
+            "bolt11": intent.bolt11,
+            **legacy_quote,
+        }
+        rejected = await client.post(
+            "/api/v1/payments",
+            json=legacy_body,
+            headers={**headers, "Idempotency-Key": "ef" * 16},
+        )
+        assert rejected.status_code == 400
+        assert rejected.json()["detail"] == "ARKADE_OUTGOING_INVALID_REQUEST"
+    assert reserve.await_count == 2
+
     missing_key = await client.post(
         "/api/v1/payments", json=body, headers=adminkey_headers_to
     )
@@ -484,59 +505,6 @@ async def test_update_arkade_payment_labels_uses_native_id(
     payment = await get_payment_by_native_id(native_id)
     assert payment is not None
     assert payment.labels == ["l6-test"]
-
-
-@pytest.mark.anyio
-async def test_resolve_arkade_reconciliation_is_admin_only(
-    client, user_headers_from, superuser_token, mocker: MockerFixture
-):
-    """Clearing the sticky flag is a deliberate admin action with a reason."""
-    previous = SimpleNamespace(
-        state="reconciliation_required", last_error="ARKADE_LIGHTNING_SWAP_FAILED"
-    )
-    resolved = SimpleNamespace(state="ok", last_error=None)
-    resolve = mocker.patch(
-        "lnbits.core.views.arkade_api.resolve_arkade_reconciliation",
-        AsyncMock(return_value=(previous, resolved)),
-    )
-    body = {"account_id": "00" * 16, "reason": "manual review complete"}
-
-    denied = await client.post(
-        "/api/v1/arkade/reconciliation/resolve",
-        json=body,
-        headers=user_headers_from,
-    )
-    assert denied.status_code == 403
-    resolve.assert_not_awaited()
-
-    admin_headers = {"Authorization": f"Bearer {superuser_token}"}
-    response = await client.post(
-        "/api/v1/arkade/reconciliation/resolve", json=body, headers=admin_headers
-    )
-    assert response.status_code == 200
-    assert response.json() == {
-        "account_id": "00" * 16,
-        "previous_state": "reconciliation_required",
-        "state": "ok",
-        "last_error": None,
-    }
-    resolve.assert_awaited_once_with(
-        "00" * 16, "manual review complete", actor_id=mocker.ANY
-    )
-
-    empty_reason = await client.post(
-        "/api/v1/arkade/reconciliation/resolve",
-        json={"account_id": "00" * 16, "reason": ""},
-        headers=admin_headers,
-    )
-    assert empty_reason.status_code == 400
-
-    resolve.side_effect = ArkadeReconciliationError("ARKADE_RECONCILIATION_NOT_FOUND")
-    unknown = await client.post(
-        "/api/v1/arkade/reconciliation/resolve", json=body, headers=admin_headers
-    )
-    assert unknown.status_code == 404
-    assert unknown.json()["detail"] == "ARKADE_RECONCILIATION_NOT_FOUND"
 
 
 @pytest.mark.anyio
@@ -1162,14 +1130,14 @@ async def test_check_pending_payment_does_not_expose_preimage(
     response = await client.get(f"/api/v1/payments/{payment_hash}")
     assert response.status_code < 300
     assert response.json()["paid"] is False
-    assert response.json()["preimage"] is None
+    assert response.json().get("preimage") is None
 
     # same for an invalid key
     response = await client.get(
         f"/api/v1/payments/{payment_hash}", headers={"X-Api-Key": "invalid_key"}
     )
     assert response.json()["paid"] is False
-    assert response.json()["preimage"] is None
+    assert response.json().get("preimage") is None
 
     # a valid key of a different (non-owning) wallet scopes the lookup
     # to that wallet and therefore yields 404, leaking nothing at all
@@ -1189,7 +1157,7 @@ async def test_check_pending_payment_does_not_expose_preimage(
     await asyncio.sleep(2)
     response = await client.get(f"/api/v1/payments/{expired_hash}")
     assert response.json()["paid"] is False
-    assert response.json()["preimage"] is None
+    assert response.json().get("preimage") is None
 
     # after payment the preimage is exposed again as proof of payment
     response = await client.post(

@@ -29,6 +29,7 @@ from lnbits.db import Filter, Filters
 from lnbits.exceptions import InvoiceError, PaymentError
 from lnbits.fiat.base import FiatInvoiceResponse, FiatPaymentStatus
 from lnbits.settings import Settings
+from lnbits.wallets import get_funding_source
 from lnbits.wallets.fake import FakeWallet
 
 pytestmark = pytest.mark.anyio
@@ -220,7 +221,9 @@ async def test_cash_validation_creates_and_settles_with_owner_admin_key(
         "lnbits.utils.exchange_rates.get_fiat_rate_satoshis",
         mocker.AsyncMock(return_value=1000),
     )
-    backend = mocker.patch("lnbits.core.services.payments.get_funding_source")
+    funding_source = get_funding_source()
+    create_invoice = mocker.patch.object(funding_source, "create_invoice")
+    pay_invoice = mocker.patch.object(funding_source, "pay_invoice")
     notify = mocker.patch(
         "lnbits.core.views.fiat_api.task_manager.internal_invoice_queue.put_nowait"
     )
@@ -243,7 +246,9 @@ async def test_cash_validation_creates_and_settles_with_owner_admin_key(
     assert receipt.extra["fiat_amount"] == 12.34
     assert receipt.extra["fiat_currency"] == "GBP"
     assert receipt.extra["internal_memo"] == "Till receipt"
-    backend.assert_not_called()
+    # Background status polling may use the backend; cash must never fund/pay.
+    create_invoice.assert_not_called()
+    pay_invoice.assert_not_called()
     notify.assert_called_once()
     assert notify.call_args.args[0].success
     payments = await get_payments(wallet_id=wallet.id)

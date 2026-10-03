@@ -10,7 +10,6 @@ from fastapi import (
     Header,
     HTTPException,
     Query,
-    Request,
 )
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
@@ -101,45 +100,13 @@ from .arkade_api import _public_outgoing_error
 payment_router = APIRouter(prefix="/api/v1/payments", tags=["Payments"])
 
 
-async def _arkade_lightning_quote_input(
-    invoice_data: CreateInvoice, request: Request
+def _arkade_lightning_quote_input(
+    invoice_data: CreateInvoice,
 ) -> ArkadeLightningQuoteInput:
-    payload = await request.json()
-    quote_data = payload.get("arkade_quote") or payload.get("quote")
-    if not isinstance(quote_data, dict):
-        quote_data = (invoice_data.extra or {}).get("arkade_quote")
-    if not isinstance(quote_data, dict):
-        quote_data = payload
-
-    profile = quote_data.get("profile")
-    if not isinstance(profile, dict):
-        profile = {}
-
-    def value(*names: str):
-        for name in names:
-            if name in quote_data:
-                return quote_data[name]
-        return None
-
-    data = {
-        "bolt11": invoice_data.bolt11,
-        "payment_hash": payload.get("payment_hash") or value("payment_hash"),
-        "amount_msat": payload.get("amount_msat")
-        or (
-            invoice_data.amount * 1000
-            if invoice_data.amount is not None and invoice_data.unit == "sat"
-            else value("amount_msat")
-        ),
-        "max_fee_msat": payload.get("max_fee_msat") or value("max_fee_msat"),
-        "quote_pair": value("quote_pair", "pair"),
-        "quote_from_amount_sat": value("quote_from_amount_sat", "from_amount"),
-        "quote_to_amount_sat": value("quote_to_amount_sat", "to_amount"),
-        "quote_valid_until": value("quote_valid_until", "valid_until"),
-        "refund_locktime": value("refund_locktime"),
-        "solver_pubkey": value("solver_pubkey") or profile.get("solver_pubkey"),
-        "swap_rfq_id": value("swap_rfq_id", "rfq_id"),
-        "lockup_address": value("lockup_address") or profile.get("lockup_address"),
-    }
+    data = dict(invoice_data.arkade_quote or {})
+    data["bolt11"] = invoice_data.bolt11
+    if invoice_data.amount is not None and invoice_data.unit == "sat":
+        data["amount_msat"] = invoice_data.amount * 1000
     try:
         return ArkadeLightningQuoteInput.parse_obj(data)
     except ValidationError:
@@ -214,6 +181,7 @@ async def _create_arkade_outgoing_payment(  # noqa: C901
         or invoice_data.amount > 2_100_000_000_000_000
     ):
         raise HTTPException(HTTPStatus.BAD_REQUEST, "ARKADE_OUTGOING_AMOUNT_INVALID")
+    receiver_payment: Payment | None
     destination = invoice_data.arkade_address or ""
     receive_request = await get_arkade_receive_request_by_destination(destination)
     if receive_request and receive_request.account_id == key_info.wallet.user:
@@ -510,7 +478,6 @@ async def api_all_payments_paginated(
     },
 )
 async def api_payments_create(
-    request: Request,
     invoice_data: CreateInvoice,
     key_info: BaseWalletTypeInfo = Depends(require_base_invoice_key),
     idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
@@ -522,7 +489,7 @@ async def api_payments_create(
         and invoice_data.bolt11
         and invoice_data.arkade_address is None
     ):
-        quote = await _arkade_lightning_quote_input(invoice_data, request)
+        quote = _arkade_lightning_quote_input(invoice_data)
         return await _create_arkade_lightning_payment(
             invoice_data, key_info, idempotency_key, quote
         )

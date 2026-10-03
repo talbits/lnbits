@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import json
 import re
 from datetime import datetime, timedelta, timezone
 from secrets import token_hex
@@ -32,25 +31,21 @@ from lnbits.core.crud.arkade import (
     get_arkade_receive_request_by_script,
     get_arkade_receive_request_total,
     get_arkade_receive_requests,
-    get_arkade_reconciliation,
     mark_arkade_receive_outpoint_conflict,
     mark_arkade_receive_outpoints_conflict,
-    mark_arkade_receive_request_reconciliation_required,
     settle_arkade_receive_request,
     update_arkade_challenge,
     update_arkade_receive_acknowledgement,
     update_arkade_receive_outpoint,
     update_arkade_receive_outpoint_attribution,
-    update_arkade_reconciliation,
 )
 from lnbits.core.crud.arkade_lightning_events import (
     TerminalState,
     create_arkade_lightning_terminal_event,
 )
 from lnbits.core.crud.arkade_maintenance import (
+    historical_maintenance_outpoints,
     maintenance_rows,
-    reconcile_maintenance,
-    store_maintenance,
 )
 from lnbits.core.crud.arkade_outgoing import (
     authorize_arkade_outgoing_intent,
@@ -61,6 +56,7 @@ from lnbits.core.crud.arkade_outgoing import (
     get_arkade_submitted_outgoing_intents,
     get_expired_arkade_outgoing_reservations,
     mark_arkade_outgoing_intent_quote_ready,
+    record_arkade_lightning_failure_report,
     record_arkade_lightning_funding_input,
     refund_arkade_lightning_intent,
     release_arkade_outgoing_intent,
@@ -68,17 +64,12 @@ from lnbits.core.crud.arkade_outgoing import (
     settle_arkade_outgoing_intent_verified,
 )
 from lnbits.core.crud.arkade_outgoing import (
-    fail_arkade_lightning_intent as fail_arkade_lightning_intent_crud,
-)
-from lnbits.core.crud.arkade_outgoing import (
     submit_arkade_lightning_intent as submit_arkade_lightning_intent_crud,
 )
-from lnbits.core.crud.audit import create_audit_entry
 from lnbits.core.crud.payments import (
     compare_and_set_arkade_payment_failed,
     compare_and_set_payment_success,
     create_payment,
-    fail_arkade_lightning_payment,
     get_payment_by_native_id,
     refund_arkade_lightning_payment,
     settle_arkade_lightning_payment,
@@ -103,16 +94,10 @@ from lnbits.core.models import (
     ArkadeOutgoingSelectedInput,
     ArkadeReceiveAcknowledgement,
     ArkadeReceiveRequest,
-    ArkadeReconciliation,
-    AuditEntry,
     Payment,
     PaymentState,
 )
-from lnbits.core.models.arkade import (
-    ArkadeBackingStatus,
-    ArkadeLightningQuoteInput,
-    ArkadeMaintenancePlan,
-)
+from lnbits.core.models.arkade import ArkadeBackingStatus, ArkadeLightningQuoteInput
 from lnbits.core.models.payments import CreatePayment
 from lnbits.core.models.users import Account
 from lnbits.db import SQLITE, Connection
@@ -170,10 +155,6 @@ class ArkadeReceiveError(ValueError):
 
 
 class ArkadeOutgoingError(ValueError):
-    pass
-
-
-class ArkadeReconciliationError(ValueError):
     pass
 
 
@@ -382,22 +363,6 @@ def _is_database_busy(exc: OperationalError) -> bool:
     )
 
 
-async def _arkade_backing_msat(account_id: str) -> int:
-    """Read public spendable backing before entering the reservation transaction."""
-    evidence = await fetch_arkade_indexer_vtxos(account_id, spendable_only=True)
-    unique_vtxos: dict[tuple[str, int], ArkadeIndexerVtxo] = {}
-    for vtxo in evidence:
-        key = (vtxo.txid, vtxo.vout)
-        if key in unique_vtxos and unique_vtxos[key] != vtxo:
-            raise ArkadeOutgoingError("ARKADE_INDEXER_INVALID_RESPONSE")
-        unique_vtxos[key] = vtxo
-    return sum(
-        vtxo.amount_sat * 1000
-        for vtxo in unique_vtxos.values()
-        if _is_spendable_vtxo(vtxo)
-    )
-
-
 async def reserve_arkade_outgoing_intent(  # noqa: C901
     account_id: str,
     intent: ArkadeOutgoingIntent,
@@ -448,16 +413,12 @@ async def reserve_arkade_outgoing_intent(  # noqa: C901
     if existing_intent or existing_payment:
         return _existing_outgoing_pair(intent, existing_intent, existing_payment)
 
-    # The public observation must not share the reservation transaction.
-    backing_msat = await _arkade_backing_msat(account_id)
-
     try:
         async with db.reuse_conn(conn) if conn else db.connect() as database:
             async with database.transaction():
                 return await _reserve_arkade_outgoing_intent(
                     account_id,
                     intent,
-                    backing_msat,
                     database,
                     receiver_account_id=receiver_account_id,
                     receiver_native_request_id=receiver_native_request_id,
@@ -471,7 +432,6 @@ async def reserve_arkade_outgoing_intent(  # noqa: C901
 async def _reserve_arkade_outgoing_intent(  # noqa: C901
     account_id: str,
     intent: ArkadeOutgoingIntent,
-    backing_msat: int,
     conn: Connection,
     *,
     receiver_account_id: str | None = None,
@@ -513,9 +473,6 @@ async def _reserve_arkade_outgoing_intent(  # noqa: C901
             or receiver_request.native_request_id != receiver_native_request_id
         ):
             raise ArkadeOutgoingError("ARKADE_TRANSFER_RECEIVER_INVALID")
-    # Deliberately not gated on the account's reconciliation flag: solvency is
-    # enforced by the backing-deficit check below, so a flagged account whose
-    # spendable VTXOs still cover its obligations must stay able to pay.
     wallet = await get_wallet(intent.wallet_id, conn=conn)
     if not wallet or wallet.id != intent.wallet_id or wallet.user != account_id:
         raise ArkadeOutgoingError("ARKADE_WALLET_NOT_OWNED")
@@ -557,41 +514,18 @@ async def _reserve_arkade_outgoing_intent(  # noqa: C901
     # already committed. The balances view (m025/m054) debits the principals of
     # its open intents but not their fee caps, so subtracting those reserves is
     # what stops one coin pool from backing two sends at once.
-    obligations = await conn.fetchone(
+    obligations: dict | None = await conn.fetchone(
         "SELECT COALESCE(SUM(max_fee_msat), 0) AS fees_msat "
         "FROM arkade_outgoing_intents "
         "WHERE wallet_id = :wallet_id "
         "AND status IN ('reserved', 'quote_ready', 'submitted', 'disputed')",
         {"wallet_id": intent.wallet_id},
     )
+    assert obligations is not None
     obligation_msat = intent.amount_msat + intent.max_fee_msat
     settleable_msat = wallet.balance_msat - int(obligations["fees_msat"])
     if settleable_msat < obligation_msat:
         raise ArkadeOutgoingError("ARKADE_INSUFFICIENT_FUNDS")
-    balances = await conn.fetchone(
-        "SELECT COALESCE(SUM(b.balance), 0) AS balance_msat "
-        "FROM wallets w LEFT JOIN balances b ON b.wallet_id = w.id "
-        'WHERE w."user" = :account_id',
-        {"account_id": account_id},
-    )
-    reservations = await conn.fetchone(
-        "SELECT COALESCE(SUM(max_fee_msat), 0) AS fees_msat "
-        "FROM arkade_outgoing_intents "
-        "WHERE account_id = :account_id "
-        "AND status IN ('reserved', 'quote_ready', 'submitted', 'disputed')",
-        {"account_id": account_id},
-    )
-    # The balances view already nets every open intent's principal, so adding
-    # principals again - including this intent's - would count them twice and
-    # refuse every exactly backed account, which is the L5 blocker. Only the
-    # outstanding fee reserves are still unspent, and the per-wallet check above
-    # already proved this wallet holds its own principal and fee.
-    gross_obligations_msat = int(balances["balance_msat"]) + int(
-        reservations["fees_msat"]
-    )
-    if gross_obligations_msat > backing_msat:
-        raise ArkadeOutgoingError("ARKADE_BACKING_DEFICIT")
-
     created_intent = await create_arkade_outgoing_intent(intent, conn=conn)
     payment = await create_payment(
         None,
@@ -707,11 +641,10 @@ async def reserve_arkade_lightning_intent(  # noqa: C901
     if quote.refund_locktime < int(now.timestamp()) + LIGHTNING_REFUND_HEADROOM_SECONDS:
         raise ArkadeOutgoingError("ARKADE_OUTGOING_OUTPUT_INVALID")
     try:
-        backing_msat = await _arkade_backing_msat(account_id)
         async with db.reuse_conn(conn) if conn else db.connect() as database:
             async with database.transaction():
                 reserved, payment = await _reserve_arkade_outgoing_intent(
-                    account_id, intent, backing_msat, database
+                    account_id, intent, database
                 )
                 if reserved.status == "reserved":
                     marked = await mark_arkade_outgoing_intent_quote_ready(
@@ -816,7 +749,12 @@ async def submit_arkade_lightning_intent(  # noqa: C901
                 scripts=[lockup_script],
             )
         except ArkadeReceiveError as exc:
-            raise _authorize_indexer_error(exc) from None
+            code = (
+                "ARKADE_OUTGOING_INDEXER_UNAVAILABLE"
+                if str(exc) == "ARKADE_INDEXER_UNAVAILABLE"
+                else "ARKADE_OUTGOING_INDEXER_INVALID"
+            )
+            raise ArkadeOutgoingError(code) from None
         # The lockup's SPEND state does not gate recording the funding. A
         # browser can die between funding and submit, and by the time it
         # retries the solver may already have claimed the lockup; a claimed
@@ -1154,13 +1092,6 @@ def _outgoing_claim_key(item: ArkadeOutgoingIntentInput) -> tuple[str, int]:
     return item.txid, item.vout
 
 
-def _authorize_indexer_error(exc: ArkadeReceiveError) -> ArkadeOutgoingError:
-    code = str(exc)
-    if code == "ARKADE_INDEXER_INVALID_RESPONSE":
-        return ArkadeOutgoingError("ARKADE_OUTGOING_INDEXER_INVALID")
-    return ArkadeOutgoingError("ARKADE_OUTGOING_INDEXER_UNAVAILABLE")
-
-
 def _is_spendable_vtxo(vtxo: ArkadeIndexerVtxo) -> bool:
     return not (
         vtxo.is_spent
@@ -1173,50 +1104,6 @@ def _is_spendable_vtxo(vtxo: ArkadeIndexerVtxo) -> bool:
             and vtxo.expires_at <= datetime.now(timezone.utc)
         )
     )
-
-
-def _validate_outgoing_evidence(  # noqa: C901
-    selected: list[ArkadeOutgoingSelectedInput],
-    evidence: list[ArkadeIndexerVtxo],
-    scripts: set[str],
-    amount_msat: int,
-    change_amount_sat: int | None = None,
-) -> None:
-    selected_by_key: dict[tuple[str, int], ArkadeOutgoingSelectedInput] = {}
-    for item in selected:
-        key = _outgoing_input_key(item)
-        if key in selected_by_key:
-            raise ArkadeOutgoingError("ARKADE_OUTGOING_INPUTS_INVALID")
-        selected_by_key[key] = item
-
-    observed: dict[tuple[str, int], ArkadeIndexerVtxo] = {}
-    for vtxo in evidence:
-        key = (vtxo.txid, vtxo.vout)
-        if key in observed and observed[key] != vtxo:
-            raise ArkadeOutgoingError("ARKADE_OUTGOING_INDEXER_INVALID")
-        observed[key] = vtxo
-    if set(selected_by_key) - set(observed):
-        raise ArkadeOutgoingError("ARKADE_OUTGOING_INPUTS_MISSING")
-    if set(observed) - set(selected_by_key):
-        raise ArkadeOutgoingError("ARKADE_OUTGOING_INDEXER_INVALID")
-
-    total_sat = 0
-    for item in selected:
-        vtxo = observed.get(_outgoing_input_key(item))
-        if not vtxo:
-            raise ArkadeOutgoingError("ARKADE_OUTGOING_INPUTS_MISSING")
-        if vtxo.amount_sat != item.amount_sat:
-            raise ArkadeOutgoingError("ARKADE_OUTGOING_INPUT_VALUE_MISMATCH")
-        if not _is_spendable_vtxo(vtxo):
-            raise ArkadeOutgoingError("ARKADE_OUTGOING_INPUT_UNAVAILABLE")
-        if vtxo.script.lower() not in scripts:
-            raise ArkadeOutgoingError("ARKADE_OUTGOING_INPUT_UNREGISTERED")
-        total_sat += vtxo.amount_sat
-    expected_sat = amount_msat // 1000 + (change_amount_sat or 0)
-    if total_sat < expected_sat:
-        raise ArkadeOutgoingError("ARKADE_INSUFFICIENT_FUNDS")
-    if total_sat > expected_sat:
-        raise ArkadeOutgoingError("ARKADE_OUTGOING_OUTPUT_INVALID")
 
 
 def _same_outgoing_outputs(
@@ -1284,14 +1171,7 @@ def _validate_owned_change(
             binding.server_pubkey,
             ARKADE_HRPS[binding.network],
         )
-        verify_receive_exit_membership(
-            ArkadeReceiveAcknowledgement.construct(
-                child_xonly_pubkey=change.child_xonly_pubkey,
-                script=change.script.lower(),
-                exit_tapleaf=change.exit_tapleaf,
-                exit_control_block=change.exit_control_block,
-            )
-        )
+        verify_receive_exit_membership(change)
     except (AttributeError, EmbitError, TypeError, ValueError, ArkadeReceiveError):
         raise ArkadeOutgoingError("ARKADE_OUTGOING_OUTPUT_INVALID") from None
 
@@ -1313,7 +1193,7 @@ async def authorize_arkade_outgoing(  # noqa: C901
     destination_script: str | None = None,
     change: ArkadeOutgoingChangeCommitment | None = None,
 ) -> ArkadeOutgoingIntentResponse:
-    """Validate public VTXO evidence and CAS a reservation to submitted."""
+    """Record immutable outputs and input receipt facts before SDK submission."""
     if settings.lnbits_effective_installation_mode != "arkade_noncustodial":
         raise ArkadeOutgoingError("ARKADE_OUTGOING_UNAVAILABLE")
     if not 1 <= len(selected) <= 100:
@@ -1350,39 +1230,6 @@ async def authorize_arkade_outgoing(  # noqa: C901
             raise ArkadeOutgoingError("ARKADE_OUTGOING_IDEMPOTENCY_CONFLICT")
         if len({_outgoing_input_key(item) for item in selected}) != len(selected):
             raise ArkadeOutgoingError("ARKADE_OUTGOING_INPUTS_INVALID")
-
-        receive_requests = await get_arkade_receive_requests(account_id, conn=conn)
-        scripts = {
-            request.script.lower() for request in receive_requests if request.script
-        }
-        # Verified change remains owned by this account after a native send.
-        changes: list[dict[str, str]] = await (conn or db).fetchall(
-            "SELECT change_script FROM arkade_outgoing_intents "
-            "WHERE account_id = :account_id AND status = 'settled' "
-            "AND change_script IS NOT NULL",
-            {"account_id": account_id},
-        )
-        scripts.update(row["change_script"].lower() for row in changes)
-        scripts.update(
-            row["script"]
-            for row in await maintenance_rows(account_id, conn)
-            if row["state"] == "verified"
-        )
-        if not scripts:
-            raise ArkadeOutgoingError("ARKADE_OUTGOING_INPUT_UNREGISTERED")
-        try:
-            evidence = await fetch_arkade_indexer_vtxos_for_outpoints(
-                account_id, [_outgoing_input_key(item) for item in selected]
-            )
-        except ArkadeReceiveError as exc:
-            raise _authorize_indexer_error(exc) from None
-        _validate_outgoing_evidence(
-            selected,
-            evidence,
-            scripts,
-            intent.amount_msat,
-            change.amount_sat if change else None,
-        )
 
         async with db.reuse_conn(conn) if conn else db.connect() as database:
             async with database.transaction():
@@ -1463,12 +1310,9 @@ async def authorize_arkade_outgoing(  # noqa: C901
                     )
                 except ValueError as exc:
                     code = str(exc)
-                    if code in {
-                        "ARKADE_INPUT_ALREADY_CLAIMED",
-                        "ARKADE_INTENT_MISMATCH",
-                    }:
+                    if code == "ARKADE_OUTGOING_INPUT_FACT_CONFLICT":
                         raise ArkadeOutgoingError(
-                            "ARKADE_OUTGOING_INPUT_CONFLICT"
+                            "ARKADE_OUTGOING_IDEMPOTENCY_CONFLICT"
                         ) from None
                     if code == "ARKADE_INTENT_INVALID_TRANSITION":
                         raise ArkadeOutgoingError(code) from None
@@ -1864,7 +1708,7 @@ def _tagged_hash(tag: str, payload: bytes) -> bytes:
 
 
 def verify_receive_exit_membership(  # noqa: C901
-    data: ArkadeReceiveAcknowledgement,
+    data: ArkadeReceiveAcknowledgement | ArkadeOutgoingChangeCommitment,
 ) -> None:
     """Bind the SDK-provided DefaultVtxo exit leaf to the submitted output.
 
@@ -2138,9 +1982,9 @@ async def _acknowledge_arkade_receive(  # noqa: C901
     )
     verify_receive_proof(data)
     verify_receive_exit_membership(data)
-    result = request
+    result: ArkadeReceiveRequest | None = request
     if request.state == "pending":
-        collision = await conn.fetchone(
+        collision: dict | None = await conn.fetchone(
             "SELECT 1 FROM arkade_outgoing_intents "
             "WHERE account_id = :account_id AND "
             "((change_index = :index) OR change_script = :script)",
@@ -2167,6 +2011,7 @@ async def _acknowledge_arkade_receive(  # noqa: C901
             result = await get_arkade_receive_request(data.native_request_id, conn=conn)
             if not result:
                 raise ArkadeReceiveError("ARKADE_RECEIVE_UNAVAILABLE")
+    assert result is not None
     payment = await get_payment_by_native_id(result.native_request_id, conn=conn)
     if payment:
         if (
@@ -2260,7 +2105,7 @@ def parse_indexer_vtxos(body: object) -> list[ArkadeIndexerVtxo]:  # noqa: C901
             for txid in raw_commitment_txids
         ):
             raise ArkadeReceiveError("ARKADE_INDEXER_INVALID_RESPONSE")
-        terminal_ids = {}
+        terminal_ids: dict[str, str | None] = {}
         for wire_name, field_name in (
             ("spentBy", "spent_by"),
             ("settledBy", "settled_by"),
@@ -2339,7 +2184,7 @@ async def fetch_arkade_indexer_vtxos(  # noqa: C901
     if scripts is None:
         requests = await get_arkade_receive_requests(account_id, conn=conn)
         scripts = sorted({request.script for request in requests if request.script})
-        changes = await (conn or db).fetchall(
+        changes: list[dict] = await (conn or db).fetchall(
             "SELECT change_script AS script FROM arkade_outgoing_intents "
             "WHERE account_id = :account_id "
             "AND status IN ('submitted', 'settled', 'disputed') "
@@ -2395,12 +2240,6 @@ async def fetch_arkade_indexer_vtxos(  # noqa: C901
                     page_index = page["next"]
     except httpx.HTTPError as exc:
         raise ArkadeReceiveError("ARKADE_INDEXER_UNAVAILABLE") from exc
-    except ArkadeReceiveError as exc:
-        if str(exc) == "ARKADE_INDEXER_INVALID_RESPONSE":
-            await _mark_receive_reconciliation_required(
-                account_id, "ARKADE_INDEXER_INVALID_RESPONSE", conn=conn
-            )
-        raise
     return result
 
 
@@ -2931,16 +2770,6 @@ async def reconcile_arkade_lightning_intent(  # noqa: C901
                     conn=database,
                 ):
                     raise ArkadeReceiveError("ARKADE_OUTGOING_CORRUPT")
-                reconciliation = await get_arkade_reconciliation(
-                    account_id, conn=database
-                )
-                if (
-                    not reconciliation
-                    or reconciliation.state != "reconciliation_required"
-                ):
-                    await update_arkade_reconciliation(
-                        account_id, state="ok", conn=database
-                    )
             elif verdict.status == ArkadeLightningEvidenceStatus.REFUNDED:
                 assert verdict.ark_txid is not None
                 if not await refund_arkade_lightning_intent(
@@ -2986,27 +2815,9 @@ async def reconcile_arkade_lightning_intent(  # noqa: C901
                             status="valid",
                             conn=database,
                         )
-                reconciliation = await get_arkade_reconciliation(
-                    account_id, conn=database
-                )
-                if (
-                    not reconciliation
-                    or reconciliation.state != "reconciliation_required"
-                ):
-                    await update_arkade_reconciliation(
-                        account_id, state="ok", conn=database
-                    )
             else:
                 if not await dispute_arkade_outgoing_intent(intent_id, conn=database):
                     raise ArkadeReceiveError("ARKADE_OUTGOING_CORRUPT")
-                await update_arkade_reconciliation(
-                    account_id,
-                    state="reconciliation_required",
-                    # The column holds a fixed code set; the evidence prose is
-                    # for the log, not for this enum.
-                    last_error="ARKADE_LIGHTNING_EVIDENCE_CONTRADICTORY",
-                    conn=database,
-                )
                 logger.warning(
                     f"Arkade Lightning intent {intent_id} disputed: "
                     f"{verdict.reason or 'contradictory evidence'}"
@@ -3026,13 +2837,7 @@ async def fail_arkade_lightning_intent(  # noqa: C901
     reason: str,
     conn: Connection | None = None,
 ) -> ArkadeOutgoingIntentResponse:
-    """Record a browser-reported claim failure as a terminal failed(reason) swap.
-
-    The claim callback lives in the user's wallet, so a swap whose claim was
-    attempted and kept failing is only observable there; the server refuses a
-    contradictory verdict path for it (that stays `disputed`) and keeps the
-    account flagged for reconciliation with the same reason.
-    """
+    """Keep a browser claim error diagnostic until chain evidence resolves it."""
     if settings.lnbits_effective_installation_mode != "arkade_noncustodial":
         raise ArkadeOutgoingError("ARKADE_OUTGOING_UNAVAILABLE")
     reason = reason.strip()
@@ -3048,12 +2853,12 @@ async def fail_arkade_lightning_intent(  # noqa: C901
             binding = await get_arkade_binding(account_id, conn=database)
             if not binding or binding.state != "ready":
                 raise ArkadeOutgoingError("ARKADE_ENROLLMENT_REQUIRED")
-            if intent.status == "failed" and intent.failure_reason != reason:
+            if intent.failure_reason and intent.failure_reason != reason:
                 raise ArkadeOutgoingError("ARKADE_OUTGOING_IDEMPOTENCY_CONFLICT")
-            if intent.status not in {"submitted", "failed"}:
+            if intent.status != "submitted":
                 raise ArkadeOutgoingError("ARKADE_INTENT_INVALID_TRANSITION")
-            if intent.status == "submitted":
-                if not await fail_arkade_lightning_intent_crud(
+            if not intent.failure_reason:
+                if not await record_arkade_lightning_failure_report(
                     intent_id,
                     reason,
                     account_id=account_id,
@@ -3061,30 +2866,16 @@ async def fail_arkade_lightning_intent(  # noqa: C901
                     conn=database,
                 ):
                     raise ArkadeOutgoingError("ARKADE_OUTGOING_CORRUPT")
-                if not await fail_arkade_lightning_payment(
-                    intent_id,
-                    account_id=account_id,
-                    wallet_id=intent.wallet_id,
-                    amount_msat=intent.amount_msat,
-                    arkade_address=intent.destination,
-                    conn=database,
-                ):
-                    raise ArkadeOutgoingError("ARKADE_OUTGOING_CORRUPT")
-                await update_arkade_reconciliation(
-                    account_id,
-                    state="reconciliation_required",
-                    # Fixed code for the account flag; the reported reason is
-                    # kept on the intent itself.
-                    last_error="ARKADE_LIGHTNING_SWAP_FAILED",
-                    conn=database,
-                )
             current = await get_arkade_outgoing_intent(intent_id, conn=database)
             payment = await get_payment_by_native_id(intent_id, conn=database)
-            if not current or not payment:
+            if (
+                not current
+                or current.status != "submitted"
+                or not payment
+                or payment.status != PaymentState.PENDING.value
+                or not _outgoing_payment_matches(payment, current)
+            ):
                 raise ArkadeOutgoingError("ARKADE_OUTGOING_CORRUPT")
-            await create_arkade_lightning_terminal_event(
-                intent_id, "failed", payment, database
-            )
             inputs = await get_arkade_outgoing_intent_inputs(intent_id, conn=database)
     return _outgoing_response(current, binding, inputs)
 
@@ -3174,143 +2965,35 @@ async def reconcile_arkade_outgoing_intent(  # noqa: C901
     return evidence
 
 
-async def _mark_receive_reconciliation_required(
-    account_id: str,
-    reason: str,
-    request_id: str | None = None,
-    conn: Connection | None = None,
-) -> None:
-    if request_id:
-        await mark_arkade_receive_request_reconciliation_required(request_id, conn=conn)
-    await update_arkade_reconciliation(
-        account_id,
-        state="reconciliation_required",
-        last_error=reason,
-        conn=conn,
-    )
-
-
-def maintenance_statement(account_id: str, plan: ArkadeMaintenancePlan) -> str:
-    inputs = ",".join(sorted(f"{i.txid}:{i.vout}:{i.amount_sat}" for i in plan.inputs))
-    o = plan.output
-    return "\n".join(
-        [
-            "action=lnbits-arkade-maintenance-v1",
-            f"account_id={account_id}",
-            f"operation_id={plan.operation_id}",
-            f"inputs={inputs}",
-            f"output={o.index}:{o.script}:{o.amount_sat}:{o.child_xonly_pubkey}",
-        ]
-    )
-
-
-async def register_arkade_maintenance(  # noqa: C901
-    account_id: str, plan: ArkadeMaintenancePlan
-) -> None:
-    if settings.lnbits_effective_installation_mode != "arkade_noncustodial":
-        raise ArkadeOutgoingError("ARKADE_OUTGOING_UNAVAILABLE")
-    await require_arkade_ready(account_id)
-    binding = await get_arkade_binding(account_id)
-    if not binding:
-        raise ArkadeOutgoingError("ARKADE_ENROLLMENT_REQUIRED")
-    _validate_owned_change(binding, plan.output)
-    try:
-        valid = PublicKeyXOnly(
-            bytes.fromhex(binding.identity_xonly_pubkey or "")
-        ).verify(
-            bytes.fromhex(plan.signature),
-            hashlib.sha256(
-                maintenance_statement(account_id, plan).encode("ascii")
-            ).digest(),
-        )
-    except ValueError:
-        valid = False
-    if not valid:
-        raise ArkadeOutgoingError("ARKADE_RECEIVE_INVALID_PROOF")
-    keys = {(i.txid, i.vout) for i in plan.inputs}
-    if (
-        len(keys) != len(plan.inputs)
-        or sum(i.amount_sat for i in plan.inputs) != plan.output.amount_sat
-    ):
-        raise ArkadeOutgoingError("ARKADE_OUTGOING_INPUTS_INVALID")
-    evidence = await fetch_arkade_indexer_vtxos(account_id)
-    observed = {(v.txid, v.vout): v for v in evidence}
-    async with db.connect() as conn:
-        async with conn.transaction():
-            await conn.execute(
-                "UPDATE arkade_account_bindings SET account_id = account_id "
-                "WHERE account_id = :id",
-                {"id": account_id},
-            )
-            rows = await maintenance_rows(account_id, conn)
-            existing = next(
-                (r for r in rows if r["operation_id"] == plan.operation_id), None
-            )
-            if existing:
-                if ArkadeMaintenancePlan.parse_raw(existing["plan_json"]) != plan:
-                    raise ArkadeOutgoingError("ARKADE_OUTGOING_IDEMPOTENCY_CONFLICT")
-                return
-            state = await get_arkade_reconciliation(account_id, conn)
-            if (
-                state
-                and state.state != "ok"
-                and state.last_error != "ARKADE_RECONCILIATION_REQUIRED"
-            ):
-                raise ArkadeOutgoingError("ARKADE_BACKING_RECONCILIATION_REQUIRED")
-            live = await conn.fetchone(
-                "SELECT COUNT(*) AS count FROM arkade_outgoing_intents "
-                "WHERE account_id = :id "
-                "AND status IN ('reserved', 'quote_ready', 'submitted', 'disputed')",
-                {"id": account_id},
-            )
-            if live["count"] or any(r["state"] == "planned" for r in rows):
-                raise ArkadeOutgoingError("ARKADE_OUTGOING_BUSY")
-            if any(v.script == plan.output.script for v in evidence):
-                raise ArkadeOutgoingError("ARKADE_OUTGOING_OUTPUT_CONFLICT")
-            for i in plan.inputs:
-                v = observed.get((i.txid, i.vout))
-                if (
-                    not v
-                    or v.amount_sat != i.amount_sat
-                    or v.is_spent
-                    or v.settled_by
-                    or v.is_unrolled
-                ):
-                    raise ArkadeOutgoingError("ARKADE_OUTGOING_INPUT_UNAVAILABLE")
-                prior = await conn.fetchone(
-                    "SELECT operation_id FROM arkade_maintenance_inputs "
-                    "WHERE txid = :txid AND vout = :vout",
-                    {"txid": i.txid, "vout": i.vout},
-                )
-                if prior:
-                    raise ArkadeOutgoingError("ARKADE_OUTGOING_INPUT_CONFLICT")
-            try:
-                await store_maintenance(account_id, plan, conn)
-            except IntegrityError as exc:
-                raise ArkadeOutgoingError("ARKADE_OUTGOING_INPUT_CONFLICT") from exc
-            await update_arkade_reconciliation(
-                account_id,
-                state="reconciliation_required",
-                last_error="ARKADE_RECONCILIATION_REQUIRED",
-                conn=conn,
-            )
-
-
 async def get_arkade_backing_status(account_id: str) -> ArkadeBackingStatus:
     if settings.lnbits_effective_installation_mode != "arkade_noncustodial":
         raise ArkadeOutgoingError("ARKADE_OUTGOING_UNAVAILABLE")
     await require_arkade_ready(account_id)
-    evidence = await fetch_arkade_indexer_vtxos(account_id)
-    async with db.connect() as conn:
-        async with conn.transaction():
-            payments = await reconcile_arkade_receive(account_id, evidence, conn=conn)
-            state = await get_arkade_reconciliation(account_id, conn)
+    try:
+        evidence = await fetch_arkade_indexer_vtxos(account_id)
+    except ArkadeReceiveError as exc:
+        async with db.connect() as conn:
             balances = await conn.fetchone(
                 "SELECT COALESCE(SUM(b.balance), 0) AS total FROM balances b "
                 'JOIN wallets w ON w.id = b.wallet_id WHERE w."user" = :id',
                 {"id": account_id},
             )
-            rows = await maintenance_rows(account_id, conn)
+        return ArkadeBackingStatus(
+            ledger_msat=int(balances["total"]),
+            spendable_sat=0,
+            recoverable_sat=0,
+            expiring_sat=0,
+            coverage="unknown",
+            last_error=str(exc),
+        )
+    async with db.connect() as conn:
+        async with conn.transaction():
+            payments = await reconcile_arkade_receive(account_id, evidence, conn=conn)
+            balances = await conn.fetchone(
+                "SELECT COALESCE(SUM(b.balance), 0) AS total FROM balances b "
+                'JOIN wallets w ON w.id = b.wallet_id WHERE w."user" = :id',
+                {"id": account_id},
+            )
     for payment in payments:
         task_manager.invoice_queue.put_nowait(payment)
     # Settlement outputs have settledBy; they are historical, not recoverable.
@@ -3329,112 +3012,8 @@ async def get_arkade_backing_status(account_id: str) -> ArkadeBackingStatus:
             and v.expires_at
             and v.expires_at <= now + timedelta(days=3)
         ),
-        state=state.state if state else "ok",
-        last_error=state.last_error if state else None,
-        maintenance=next(
-            (
-                ArkadeMaintenancePlan.parse_raw(r["plan_json"])
-                for r in rows
-                if r["state"] == "planned"
-            ),
-            None,
-        ),
-        maintenance_inputs=[
-            ArkadeOutgoingSelectedInput(
-                txid=v.txid, vout=v.vout, amount_sat=v.amount_sat
-            )
-            for v in owned
-            if not _is_spendable_vtxo(v)
-            or (v.expires_at and v.expires_at <= now + timedelta(days=3))
-        ][:100],
+        coverage="partial",
     )
-
-
-async def resolve_arkade_reconciliation(
-    account_id: str,
-    reason: str,
-    *,
-    actor_id: str,
-) -> tuple[ArkadeReconciliation, ArkadeReconciliation]:
-    """Clear a sticky reconciliation flag as a deliberate operator action.
-
-    Returns the previous and the resulting state; an account that is already
-    `ok` (or has no state row yet) is left untouched except for the binding
-    check that proves the account is an enrolled one.
-    """
-    async with db.connect() as conn:
-        async with conn.transaction():
-            previous = await get_arkade_reconciliation(account_id, conn=conn)
-            if not previous:
-                if not await get_arkade_binding(account_id, conn=conn):
-                    raise ArkadeReconciliationError("ARKADE_RECONCILIATION_NOT_FOUND")
-                previous = ArkadeReconciliation(account_id=account_id)
-            if previous.state == "ok":
-                return previous, previous
-            resolved = await update_arkade_reconciliation(
-                account_id, state="ok", last_error=None, conn=conn
-            )
-            await create_audit_entry(
-                AuditEntry(
-                    component="arkade",
-                    user_id=actor_id,
-                    path="/api/v1/arkade/reconciliation/resolve",
-                    request_method="POST",
-                    request_details=json.dumps(
-                        {
-                            "account_id": account_id,
-                            "reason": reason,
-                            "previous_state": previous.state,
-                            "last_error": previous.last_error,
-                        }
-                    ),
-                    response_code="200",
-                    duration=0.0,
-                ),
-                conn=conn,
-            )
-            return previous, resolved
-
-
-def _arkade_backing_diverged(vtxo: ArkadeIndexerVtxo, claim: dict | None) -> bool:
-    # A verified spend no longer needs this historical input as backing.
-    if vtxo.is_spent and claim and claim["status"] == "settled":
-        expected_txid = claim["arkade_txid"]
-        if claim["destination_kind"] == "lightning":
-            expected_txid = (
-                claim["settlement_ark_txid"]
-                or claim["refund_ark_txid"]
-                or expected_txid
-            )
-        return (
-            int(claim["amount_sat"]) != vtxo.amount_sat
-            or expected_txid != vtxo.arkade_txid
-        )
-    if (
-        vtxo.is_swept
-        or vtxo.is_unrolled
-        or vtxo.settled_by
-        or vtxo.expires_at_height is not None
-        or (
-            vtxo.expires_at is not None
-            and vtxo.expires_at <= datetime.now(timezone.utc)
-        )
-    ):
-        return True
-    if not vtxo.is_spent:
-        return False
-    if not claim or int(claim["amount_sat"]) != vtxo.amount_sat:
-        return True
-    if claim["status"] == "disputed":
-        return True
-    if claim["status"] != "settled":
-        return False
-    expected_txid = claim["arkade_txid"]
-    if claim["destination_kind"] == "lightning":
-        expected_txid = (
-            claim["settlement_ark_txid"] or claim["refund_ark_txid"] or expected_txid
-        )
-    return expected_txid != vtxo.arkade_txid
 
 
 async def reconcile_arkade_receive(  # noqa: C901
@@ -3446,187 +3025,63 @@ async def reconcile_arkade_receive(  # noqa: C901
     if settings.lnbits_effective_installation_mode != "arkade_noncustodial":
         raise ArkadeReceiveError("ARKADE_RECEIVE_UNAVAILABLE")
     await require_arkade_ready(account_id, conn=conn)
-    previous_state = await get_arkade_reconciliation(account_id, conn=conn)
-    # Every guard below re-derives from the current evidence and rows, so the
-    # previous state is not inherited: inheriting it latched transient
-    # conditions (an unattributed VTXO seen before its receive request was
-    # recorded, for example) and locked the account permanently.
-    required = False
-    last_error: str | None = None
+    database = conn or db
     observed: dict[tuple[str, int], ArkadeIndexerVtxo] = {}
+    conflicting: set[tuple[str, int]] = set()
     for vtxo in evidence:
         key = (vtxo.txid, vtxo.vout)
         if key in observed and observed[key] != vtxo:
-            logger.warning(
-                f"Arkade reconciliation hold for account {account_id}: "
-                "indexer returned conflicting vtxos for one outpoint"
-            )
-            required = True
-            last_error = "ARKADE_RECONCILIATION_REQUIRED"
+            conflicting.add(key)
         observed[key] = vtxo
-    database = conn or db
-    # One solvency verdict for the whole pass: recorded ledger against the
-    # spendable backing we can prove. Lineage drift below only matters when it
-    # leaves value unaccounted for; on a fully backed account it is history.
-    ledger_msat = int(
-        (
-            await database.fetchone(
-                "SELECT COALESCE(SUM(b.balance), 0) AS total FROM balances b "
-                'JOIN wallets w ON w.id = b.wallet_id WHERE w."user" = :id',
-                {"id": account_id},
+    for key in conflicting:
+        existing = await get_arkade_receive_outpoint(*key, conn=conn)
+        variants = [v for v in evidence if (v.txid, v.vout) == key]
+        if existing and existing["account_id"] == account_id:
+            await mark_arkade_receive_outpoint_conflict(*key, account_id, conn=conn)
+        for vtxo in variants:
+            request = await get_arkade_receive_request_by_script(
+                account_id, vtxo.script, conn=conn
             )
-        )["total"]
-    )
-    unbacked = ledger_msat > sum(
-        v.amount_sat * 1000 for v in evidence if _is_spendable_vtxo(v)
-    )
-
-    def hold(guard: str) -> str:
-        """Raise the account flag, naming the guard that did it.
-
-        `last_error` is a fixed enum shared by every guard, so the code alone
-        made it impossible to tell which check is holding an account. The
-        guard name goes to the log, and the transition to the operator audit
-        trail, but never to the account holder: this is an operator concern,
-        like the LNbits watchdog on the funding source, not something a user
-        can act on.
-        """
-        nonlocal required, last_error
-        logger.warning(f"Arkade reconciliation hold for account {account_id}: {guard}")
-        required = True
-        last_error = "ARKADE_RECONCILIATION_REQUIRED"
-        return last_error
-
-    consumed, maintenance_outputs, restored = await reconcile_maintenance(
+            if request:
+                await mark_arkade_receive_outpoints_conflict(
+                    request.native_request_id, conn=conn
+                )
+        if not existing and variants:
+            first = variants[0]
+            request = await get_arkade_receive_request_by_script(
+                account_id, first.script, conn=conn
+            )
+            await create_arkade_receive_outpoint(
+                account_id=account_id,
+                native_request_id=request.native_request_id if request else None,
+                vtxo=first,
+                status="conflict",
+                conn=conn,
+            )
+    consumed, maintenance_outputs = await historical_maintenance_outpoints(
         account_id, evidence, database
     )
-    if (
-        restored
-        and previous_state
-        and previous_state.last_error == "ARKADE_RECONCILIATION_REQUIRED"
-    ):
-        # Re-run every guard; a completed renewal only permits reconsidering
-        # generic backing divergence, never another class of sticky conflict.
-        required = False
-        last_error = None
-    claims = await database.fetchall(
-        "SELECT i.txid, i.vout, i.amount_sat, o.status, o.arkade_txid, "
-        "o.destination_kind, o.settlement_ark_txid, o.refund_ark_txid "
-        "FROM arkade_outgoing_intent_inputs i "
-        "JOIN arkade_outgoing_intents o ON o.intent_id = i.intent_id "
-        "WHERE o.account_id = :account_id "
-        "AND o.status IN ('submitted', 'settled', 'disputed')",
-        {"account_id": account_id},
-    )
-    claims_by_outpoint = {(row["txid"], int(row["vout"])): row for row in claims}
-    # A browser-funded swap is funded by the client's own SDK send, not by the
-    # authorized outgoing flow, so nothing journals which wallet VTXO that
-    # funding spent or where the change went. Attribute both from the observed
-    # evidence: a spend by one of our own funding transactions is expected, and
-    # output 1 of that funding transaction is this account's change.
-    funding_intents = await database.fetchall(
-        "SELECT intent_id, arkade_txid, change_script, change_amount_sat "
+    funding_intents: list[dict] = await database.fetchall(
+        "SELECT arkade_txid "
         "FROM arkade_outgoing_intents "
         "WHERE account_id = :account_id AND arkade_txid IS NOT NULL "
         "AND status IN ('submitted', 'settled', 'disputed')",
         {"account_id": account_id},
     )
     own_funding_txids = {
-        row["arkade_txid"]: row
-        for row in funding_intents
-        if row["arkade_txid"] is not None
+        row["arkade_txid"] for row in funding_intents if row["arkade_txid"] is not None
     }
-    known_outpoints = await database.fetchall(
-        "SELECT txid, vout FROM arkade_receive_outpoints "
-        "WHERE account_id = :account_id",
-        {"account_id": account_id},
-    )
-    for row in known_outpoints:
-        key = (row["txid"], int(row["vout"]))
-        if key in consumed:
-            continue
-        vtxo = observed.get(key)
-        claim = claims_by_outpoint.get(key)
-        if (
-            claim is None
-            and vtxo is not None
-            and vtxo.is_spent
-            and vtxo.arkade_txid in own_funding_txids
-        ):
-            # Our own browser-funded swap consumed this VTXO.
-            continue
-        if not vtxo:
-            hold("recorded receive outpoint is no longer indexed")
-            continue
-        if _arkade_backing_diverged(vtxo, claim):
-            hold("recorded receive outpoint diverged")
-    changes = await database.fetchall(
-        "SELECT status, arkade_txid, change_script, change_amount_sat "
-        "FROM arkade_outgoing_intents "
-        "WHERE account_id = :account_id "
-        "AND status IN ('submitted', 'settled', 'disputed') "
-        "AND arkade_txid IS NOT NULL",
-        {"account_id": account_id},
-    )
     change_outpoints: set[tuple[str, int]] = set()
-    for row in changes:
-        recorded = (
-            row["change_script"] is not None and row["change_amount_sat"] is not None
-        )
-        key = (row["arkade_txid"], 1)
-        if key in consumed:
-            continue
-        vtxo = observed.get(key)
-        if vtxo is None:
-            # Submitted change may not be indexed yet, and a terminal change can
-            # leave the indexer entirely once it expires and is swept. That is
-            # history, not a solvency problem: spendable backing against the
-            # ledger is checked below and is what actually protects funds. Hold
-            # nothing on it, or an account stays flagged forever.
-            if recorded and row["status"] != "submitted":
-                hold("outgoing change is no longer indexed")
-            continue
-        change_outpoints.add(key)
-        if not recorded:
-            # Browser-funded swaps do not journal their change, and the change
-            # index is the wallet derivation index the client chose (it is
-            # unique per account), so it cannot be derived here. Treat output 1
-            # of the funding transaction as this account's change: skip it from
-            # the unattributed check instead of inventing an index.
-            continue
-        if vtxo.is_spent and vtxo.arkade_txid in own_funding_txids:
-            # Our own later funding spent this change; already explained.
-            continue
-        if (
-            vtxo.script != row["change_script"]
-            or vtxo.amount_sat != int(row["change_amount_sat"])
-            or _arkade_backing_diverged(vtxo, claims_by_outpoint.get(key))
-        ):
-            hold("outgoing change does not match the recorded output")
-    settled_payments: list[Payment] = []
-    for key in maintenance_outputs - consumed:
-        vtxo = observed.get(key)
-        if not vtxo:
-            hold("maintenance output is no longer indexed")
-            continue
-        if _arkade_backing_diverged(vtxo, claims_by_outpoint.get(key)):
-            hold("maintenance output diverged")
-    if any(r["state"] == "planned" for r in await maintenance_rows(account_id, conn)):
-        required = True
-        last_error = last_error or "ARKADE_RECONCILIATION_REQUIRED"
-    # The recorded ledger must never exceed the spendable backing we can prove.
-    # Only checked once a renewal has completed, or on an account that is
-    # already flagged: while a renewal is in flight the old inputs are spent
-    # and the new outputs are not indexed yet, so a healthy account is
-    # genuinely over-credit for a pass. Re-checking a flagged account keeps the
-    # verdict stable across replays instead of clearing it on the next pass.
-    already_flagged = bool(
-        previous_state and previous_state.state == "reconciliation_required"
+    change_outpoints.update(
+        (txid, 1) for txid in own_funding_txids if (txid, 1) in observed
     )
-    if unbacked and (restored or already_flagged):
-        hold("ledger exceeds verified spendable backing")
+    settled_payments: list[Payment] = []
     for vtxo in evidence:
-        if (vtxo.txid, vtxo.vout) in change_outpoints | consumed | maintenance_outputs:
+        key = (vtxo.txid, vtxo.vout)
+        if (
+            key in conflicting
+            or key in change_outpoints | consumed | maintenance_outputs
+        ):
             continue
         request = await get_arkade_receive_request_by_script(
             account_id, vtxo.script, conn=conn
@@ -3638,11 +3093,11 @@ async def reconcile_arkade_receive(  # noqa: C901
                 and vtxo.spent_by
                 and existing["spent_by"] != vtxo.spent_by
             ):
-                required = True
-                last_error = "ARKADE_OUTPOINT_TERMINAL_CONFLICT"
                 await mark_arkade_receive_outpoint_conflict(
                     vtxo.txid, vtxo.vout, account_id, conn=conn
                 )
+                continue
+            if existing["status"] == "conflict":
                 continue
             if (
                 existing["account_id"] == account_id
@@ -3664,8 +3119,6 @@ async def reconcile_arkade_receive(  # noqa: C901
                 or existing["native_request_id"]
                 != (request.native_request_id if request else None)
             ):
-                required = True
-                last_error = "ARKADE_OUTPOINT_CONFLICT"
                 await mark_arkade_receive_outpoint_conflict(
                     vtxo.txid, vtxo.vout, account_id, conn=conn
                 )
@@ -3673,8 +3126,6 @@ async def reconcile_arkade_receive(  # noqa: C901
             await update_arkade_receive_outpoint(vtxo, conn=conn)
             continue
         if not request:
-            required = True
-            last_error = "ARKADE_UNATTRIBUTED_VALUE"
             created = await create_arkade_receive_outpoint(
                 account_id=account_id,
                 native_request_id=None,
@@ -3689,7 +3140,6 @@ async def reconcile_arkade_receive(  # noqa: C901
                 if winner and _outpoint_matches(winner, account_id, None, vtxo):
                     await update_arkade_receive_outpoint(vtxo, conn=conn)
                 else:
-                    last_error = "ARKADE_OUTPOINT_CONFLICT"
                     await mark_arkade_receive_outpoint_conflict(
                         vtxo.txid, vtxo.vout, account_id, conn=conn
                     )
@@ -3708,8 +3158,6 @@ async def reconcile_arkade_receive(  # noqa: C901
             ):
                 await update_arkade_receive_outpoint(vtxo, conn=conn)
             else:
-                required = True
-                last_error = "ARKADE_OUTPOINT_CONFLICT"
                 await mark_arkade_receive_outpoint_conflict(
                     vtxo.txid, vtxo.vout, account_id, conn=conn
                 )
@@ -3719,17 +3167,8 @@ async def reconcile_arkade_receive(  # noqa: C901
             request.native_request_id, conn=conn
         )
         if total > request.amount_sat:
-            # Durable: the request was over-received. Re-derived every pass.
-            required = True
-            last_error = "ARKADE_RECEIVE_AMOUNT_CONFLICT"
             await mark_arkade_receive_outpoints_conflict(
                 request.native_request_id, conn=conn
-            )
-            await _mark_receive_reconciliation_required(
-                account_id,
-                "ARKADE_RECEIVE_AMOUNT_CONFLICT",
-                request.native_request_id,
-                conn,
             )
             continue
         if total != request.amount_sat:
@@ -3738,9 +3177,6 @@ async def reconcile_arkade_receive(  # noqa: C901
             # the amount). Nothing to settle either way: re-evaluate next pass
             # instead of recording a request as settled without its amount.
             continue
-        # Fully received. A request previously marked reconciliation_required is
-        # re-evaluated here rather than skipped, so a condition that has since
-        # resolved can settle instead of latching the account forever.
         address = request.address
         payment = await get_payment_by_native_id(request.native_request_id, conn=conn)
         if payment:
@@ -3752,15 +3188,8 @@ async def reconcile_arkade_receive(  # noqa: C901
                 or not address
                 or payment.arkade_address != address
             ):
-                reason = hold("receive payment does not match its request")
                 await mark_arkade_receive_outpoints_conflict(
                     request.native_request_id, conn=conn
-                )
-                await _mark_receive_reconciliation_required(
-                    account_id,
-                    reason,
-                    request.native_request_id,
-                    conn,
                 )
                 continue
             if payment.status in {
@@ -3782,21 +3211,13 @@ async def reconcile_arkade_receive(  # noqa: C901
                         request.native_request_id, conn=conn
                     )
                     if not current or current.status != PaymentState.SUCCESS.value:
-                        reason = hold("receive payment could not be settled")
-                        await _mark_receive_reconciliation_required(
-                            account_id,
-                            reason,
-                            request.native_request_id,
-                            conn,
+                        await mark_arkade_receive_outpoints_conflict(
+                            request.native_request_id, conn=conn
                         )
                         continue
             elif payment.status != PaymentState.SUCCESS.value:
-                reason = hold("receive payment is neither settleable nor successful")
-                await _mark_receive_reconciliation_required(
-                    account_id,
-                    reason,
-                    request.native_request_id,
-                    conn,
+                await mark_arkade_receive_outpoints_conflict(
+                    request.native_request_id, conn=conn
                 )
                 continue
         if request.state != "settled":
@@ -3804,57 +3225,4 @@ async def reconcile_arkade_receive(  # noqa: C901
             await settle_arkade_receive_request(
                 request.native_request_id, now, conn=conn
             )
-    # Recorded conflicts are durable facts that evidence may stop re-reporting
-    # once the offending VTXO leaves the indexer, so they are read back rather
-    # than re-derived. Everything else clears once its cause is gone. Checked
-    # last so the specific terminal reason wins over a generic guard.
-    conflicts = await database.fetchone(
-        "SELECT COUNT(*) AS count FROM arkade_receive_outpoints "
-        "WHERE account_id = :account_id AND status = 'conflict'",
-        {"account_id": account_id},
-    )
-    if conflicts and conflicts["count"]:
-        required = True
-        last_error = "ARKADE_OUTPOINT_CONFLICT"
-    disputed = await database.fetchone(
-        "SELECT COUNT(*) AS count FROM arkade_outgoing_intents "
-        "WHERE account_id = :account_id AND status = 'disputed'",
-        {"account_id": account_id},
-    )
-    if disputed and disputed["count"]:
-        required = True
-        last_error = "ARKADE_LIGHTNING_EVIDENCE_CONTRADICTORY"
-    state = "reconciliation_required" if required else "ok"
-    await update_arkade_reconciliation(
-        account_id,
-        state=state,
-        last_error=last_error if required else None,
-        conn=conn,
-    )
-    # Only on the transition, so a standing condition does not write an audit
-    # entry every pass. The account holder is not told: this is the operator's
-    # signal, mirroring the funding-source watchdog.
-    was_flagged = bool(
-        previous_state and previous_state.state == "reconciliation_required"
-    )
-    if required and not was_flagged:
-        await create_audit_entry(
-            AuditEntry(
-                component="arkade",
-                user_id=account_id,
-                path="/arkade/reconciliation",
-                request_method="SYSTEM",
-                request_details=json.dumps(
-                    {
-                        "account_id": account_id,
-                        "state": state,
-                        "last_error": last_error,
-                        "ledger_msat": ledger_msat,
-                    }
-                ),
-                response_code="409",
-                duration=0.0,
-            ),
-            conn=conn,
-        )
     return settled_payments

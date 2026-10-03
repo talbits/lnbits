@@ -69,7 +69,7 @@ async def test_payment_identity_migration_preserves_legacy_and_rejects_mixed(
     legacy_connection: Connection,
 ):
     await migrations.m054_add_payment_protocol_identity(legacy_connection)
-    row = await legacy_connection.fetchone(
+    row: dict | None = await legacy_connection.fetchone(
         "SELECT protocol, native_id, checking_id, payment_hash, bolt11, arkade_address "
         "FROM apipayments WHERE checking_id = 'legacy-checking'"
     )
@@ -129,6 +129,8 @@ async def test_payment_identity_crud_defaults_and_pending_arkade(
     assert arkade.payment_hash is None
     assert arkade.bolt11 is None
     assert arkade.arkade_address is None
+    with pytest.raises(ValueError, match="not a Lightning payment"):
+        _ = arkade.lightning_identifiers
     stored = await get_payment_by_native_id("crud-native-1", conn=legacy_connection)
     assert stored is not None
     assert stored.native_id == arkade.native_id
@@ -172,7 +174,7 @@ async def test_payment_identity_migration_rolls_back_on_failure(
     with pytest.raises(RuntimeError, match="injected migration failure"):
         await migrations.m054_add_payment_protocol_identity(legacy_connection)
 
-    row = await legacy_connection.fetchone(
+    row: dict | None = await legacy_connection.fetchone(
         "SELECT checking_id, payment_hash, bolt11 "
         "FROM apipayments WHERE checking_id = 'legacy-checking'"
     )
@@ -181,5 +183,5 @@ async def test_payment_identity_migration_rolls_back_on_failure(
         "payment_hash": "legacy-hash",
         "bolt11": "legacy-bolt11",
     }
-    view_row = await legacy_connection.fetchone("SELECT * FROM balances")
+    view_row: dict | None = await legacy_connection.fetchone("SELECT * FROM balances")
     assert view_row is not None

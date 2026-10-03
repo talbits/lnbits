@@ -46,7 +46,7 @@ def _require_active_transaction(conn: Connection) -> Connection:
 
 
 async def _check_wallet_account(conn: Connection, intent: ArkadeOutgoingIntent) -> None:
-    wallet = await conn.fetchone(
+    wallet: dict | None = await conn.fetchone(
         'SELECT w.id FROM wallets w JOIN accounts a ON a.id = w."user" '
         "WHERE w.id = :wallet_id AND a.id = :account_id",
         {"wallet_id": intent.wallet_id, "account_id": intent.account_id},
@@ -248,26 +248,42 @@ async def mark_arkade_outgoing_intent_quote_ready(
     return bool(result.rowcount)
 
 
-async def claim_arkade_outgoing_inputs(
+async def record_arkade_outgoing_input_facts(
     inputs: list[ArkadeOutgoingIntentInput], conn: Connection
 ) -> list[ArkadeOutgoingIntentInput]:
-    connection = _require_active_transaction(conn)
+    database = _require_active_transaction(conn)
     if not inputs:
         return []
     if any(item.intent_id != inputs[0].intent_id for item in inputs):
         raise ValueError("ARKADE_INTENT_MISMATCH")
     if len({(item.txid, item.vout) for item in inputs}) != len(inputs):
-        raise ValueError("ARKADE_INPUT_ALREADY_CLAIMED")
+        raise ValueError("ARKADE_OUTGOING_INPUT_FACT_CONFLICT")
 
-    await connection.execute("SAVEPOINT arkade_outgoing_input_claims")
-    try:
-        result = await _claim_arkade_outgoing_inputs(inputs, connection)
-    except BaseException:
-        await connection.execute("ROLLBACK TO SAVEPOINT arkade_outgoing_input_claims")
-        await connection.execute("RELEASE SAVEPOINT arkade_outgoing_input_claims")
-        raise
-    await connection.execute("RELEASE SAVEPOINT arkade_outgoing_input_claims")
-    return result
+    intent = await get_arkade_outgoing_intent(inputs[0].intent_id, conn=database)
+    if not intent:
+        raise ValueError("ARKADE_INTENT_NOT_FOUND")
+    if intent.status != "reserved":
+        raise ValueError("ARKADE_INTENT_NOT_RESERVED")
+    for item in inputs:
+        existing: dict | None = await database.fetchone(
+            "SELECT amount_sat FROM arkade_outgoing_intent_inputs "
+            "WHERE intent_id = :intent_id AND txid = :txid AND vout = :vout",
+            item.dict(),
+        )
+        if existing and int(existing["amount_sat"]) != item.amount_sat:
+            raise ValueError("ARKADE_OUTGOING_INPUT_FACT_CONFLICT")
+    for item in inputs:
+        await database.execute(
+            f"""
+            INSERT INTO arkade_outgoing_intent_inputs
+                (intent_id, txid, vout, amount_sat, claimed_at)
+            VALUES (:intent_id, :txid, :vout, :amount_sat,
+                {database.timestamp_placeholder('claimed_at')})
+            ON CONFLICT (intent_id, txid, vout) DO NOTHING
+            """,  # noqa: S608
+            item.dict(),
+        )
+    return await get_arkade_outgoing_intent_inputs(inputs[0].intent_id, conn=database)
 
 
 async def authorize_arkade_outgoing_intent(
@@ -280,7 +296,7 @@ async def authorize_arkade_outgoing_intent(
     change_amount_sat: int | None = None,
 ) -> ArkadeOutgoingIntent:
     database = _require_active_transaction(conn)
-    await claim_arkade_outgoing_inputs(inputs, conn=database)
+    await record_arkade_outgoing_input_facts(inputs, conn=database)
     if destination_script is not None:
         result = await database.execute(
             "UPDATE arkade_outgoing_intents SET "
@@ -310,62 +326,6 @@ async def authorize_arkade_outgoing_intent(
     if not intent:
         raise ValueError("ARKADE_INTENT_UNAVAILABLE")
     return intent
-
-
-async def _claim_arkade_outgoing_inputs(
-    inputs: list[ArkadeOutgoingIntentInput], conn: Connection
-) -> list[ArkadeOutgoingIntentInput]:
-    await conn.execute(
-        "UPDATE arkade_outgoing_intents SET intent_id = intent_id "
-        "WHERE intent_id = :intent_id",
-        {"intent_id": inputs[0].intent_id},
-    )
-    intent = await get_arkade_outgoing_intent(inputs[0].intent_id, conn=conn)
-    if not intent:
-        raise ValueError("ARKADE_INTENT_NOT_FOUND")
-    if intent.status != "reserved":
-        raise ValueError("ARKADE_INTENT_NOT_RESERVED")
-
-    existing_by_outpoint: dict[tuple[str, int], dict] = {}
-    for item in inputs:
-        existing = await conn.fetchone(
-            "SELECT intent_id, amount_sat FROM arkade_outgoing_intent_inputs "
-            "WHERE txid = :txid AND vout = :vout",
-            {"txid": item.txid, "vout": item.vout},
-        )
-        if existing:
-            if (
-                existing["intent_id"] != item.intent_id
-                or int(existing["amount_sat"]) != item.amount_sat
-            ):
-                raise ValueError("ARKADE_INPUT_ALREADY_CLAIMED")
-            existing_by_outpoint[(item.txid, item.vout)] = existing
-
-    for item in inputs:
-        if (item.txid, item.vout) in existing_by_outpoint:
-            continue
-        result = await conn.execute(
-            f"""
-            INSERT INTO arkade_outgoing_intent_inputs
-                (intent_id, txid, vout, amount_sat, claimed_at)
-            VALUES (:intent_id, :txid, :vout, :amount_sat,
-                {conn.timestamp_placeholder('claimed_at')})
-            ON CONFLICT DO NOTHING
-            """,  # noqa: S608
-            item.dict(),
-        )
-        if not result.rowcount:
-            existing = await conn.fetchone(
-                "SELECT intent_id, amount_sat FROM arkade_outgoing_intent_inputs "
-                "WHERE txid = :txid AND vout = :vout",
-                {"txid": item.txid, "vout": item.vout},
-            )
-            if not existing or (
-                existing["intent_id"] != item.intent_id
-                or int(existing["amount_sat"]) != item.amount_sat
-            ):
-                raise ValueError("ARKADE_INPUT_ALREADY_CLAIMED")
-    return await get_arkade_outgoing_intent_inputs(inputs[0].intent_id, conn=conn)
 
 
 async def _transition_arkade_outgoing_intent(  # noqa: C901
@@ -443,7 +403,7 @@ async def submit_arkade_outgoing_intent(
     intent = await get_arkade_outgoing_intent(intent_id, conn=database)
     if not intent:
         raise ValueError("ARKADE_INTENT_NOT_FOUND")
-    inputs = await database.fetchone(
+    inputs: dict | None = await database.fetchone(
         "SELECT COUNT(*) AS count, COALESCE(SUM(amount_sat), 0) AS amount_sat "
         "FROM arkade_outgoing_intent_inputs WHERE intent_id = :intent_id",
         {"intent_id": intent_id},
@@ -720,7 +680,7 @@ async def refund_arkade_lightning_intent(
     return bool(result.rowcount)
 
 
-async def fail_arkade_lightning_intent(
+async def record_arkade_lightning_failure_report(
     intent_id: str,
     reason: str,
     *,
@@ -728,36 +688,32 @@ async def fail_arkade_lightning_intent(
     wallet_id: str,
     conn: Connection,
 ) -> bool:
-    """CAS a submitted Lightning intent to failed(reason) in the caller's tx."""
+    """Store a client claim error without changing the funded intent state."""
     database = _require_active_transaction(conn)
     intent = await _get_lightning_terminal_intent(
         intent_id, account_id, wallet_id, database
     )
-    if intent.status == "failed":
-        if (
-            intent.failure_reason == reason
-            and intent.actual_fee_msat is None
-            and intent.settlement_ark_txid is None
-            and intent.refund_ark_txid is None
-        ):
-            return False
-        raise ValueError("ARKADE_LIGHTNING_TERMINAL_CONFLICT")
     if (
         intent.status != "submitted"
         or intent.settlement_ark_txid
         or intent.refund_ark_txid
     ):
         raise ValueError("ARKADE_INTENT_INVALID_TRANSITION")
+    if intent.failure_reason:
+        if intent.failure_reason != reason:
+            raise ValueError("ARKADE_OUTGOING_IDEMPOTENCY_CONFLICT")
+        return False
     now = datetime.now(timezone.utc)
     result = await database.execute(
         f"""
         UPDATE arkade_outgoing_intents
-        SET status = 'failed', failure_reason = :reason,
+        SET failure_reason = :reason,
             failed_at = {database.timestamp_placeholder('failed_at')},
             updated_at = {database.timestamp_placeholder('updated_at')}
         WHERE intent_id = :intent_id AND account_id = :account_id
           AND wallet_id = :wallet_id AND destination_kind = 'lightning'
-          AND status = 'submitted' AND settlement_ark_txid IS NULL
+          AND status = 'submitted' AND failure_reason IS NULL
+          AND settlement_ark_txid IS NULL
           AND refund_ark_txid IS NULL
         """,  # noqa: S608
         {

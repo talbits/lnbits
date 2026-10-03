@@ -1,4 +1,3 @@
-import hashlib
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -15,14 +14,17 @@ from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 
 import lnbits.db as db_module
 from lnbits.core import migrations
+from lnbits.core.crud.arkade_lightning_events import (
+    create_arkade_lightning_terminal_event,
+)
 from lnbits.core.crud.arkade_outgoing import (
     authorize_arkade_outgoing_intent,
-    claim_arkade_outgoing_inputs,
     create_arkade_outgoing_intent,
     dispute_arkade_outgoing_intent,
     get_arkade_outgoing_intent,
     get_arkade_outgoing_intent_inputs,
     get_arkade_submitted_outgoing_intents,
+    record_arkade_outgoing_input_facts,
     refund_arkade_lightning_intent,
     release_arkade_outgoing_intent,
     settle_arkade_lightning_intent,
@@ -39,7 +41,6 @@ from lnbits.core.crud.payments import (
 from lnbits.core.models.arkade import (
     ArkadeLightningFundingEvidence,
     ArkadeLightningQuoteInput,
-    ArkadeMaintenancePlan,
     ArkadeOutgoingChangeCommitment,
     ArkadeOutgoingEvidenceResult,
     ArkadeOutgoingIntent,
@@ -180,6 +181,7 @@ async def connection(monkeypatch):
         await migrations.m062_extend_arkade_reconciliation_errors(connection)
         await migrations.m064_arkade_maintenance(connection)
         await migrations.m063_arkade_outgoing_retryable_invoice(connection)
+        await migrations.m065_arkade_receipt_facts_and_funded_failure_repair(connection)
         yield connection
     await engine.dispose()
 
@@ -307,83 +309,6 @@ def _change():
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize(
-    "failure", [None, "signature", "foreign_output", "fee", "spent", "conflict"]
-)
-async def test_maintenance_authorization_is_signed_owned_and_durable(
-    connection, monkeypatch, failure
-):
-    monkeypatch.setattr(
-        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
-    )
-    key = PrivateKey.from_int(2)
-    await connection.execute(
-        "UPDATE arkade_account_bindings SET identity_xonly_pubkey = :key",
-        {"key": key.public_key_xonly.format().hex()},
-    )
-
-    @asynccontextmanager
-    async def use_connection():
-        yield connection
-
-    monkeypatch.setattr(arkade.db, "connect", use_connection)
-    evidence = [_observed(amount_sat=40)]
-    if failure == "spent":
-        evidence[0] = evidence[0].copy(update={"is_spent": True})
-    monkeypatch.setattr(
-        arkade, "fetch_arkade_indexer_vtxos", AsyncMock(return_value=evidence)
-    )
-    output = _change().copy(update={"amount_sat": 39 if failure == "fee" else 40})
-    if failure == "foreign_output":
-        output = output.copy(update={"index": 1})
-    plan = ArkadeMaintenancePlan(
-        operation_id="e0" * 16, inputs=_selected(), output=output, signature="00" * 64
-    )
-    signature = key.sign_schnorr(
-        hashlib.sha256(
-            arkade.maintenance_statement(ACCOUNT_ID, plan).encode("ascii")
-        ).digest()
-    ).hex()
-    plan = plan.copy(
-        update={"signature": "00" * 64 if failure == "signature" else signature}
-    )
-    if failure == "conflict":
-        await arkade.update_arkade_reconciliation(
-            ACCOUNT_ID,
-            state="reconciliation_required",
-            last_error="ARKADE_LIGHTNING_EVIDENCE_CONTRADICTORY",
-            conn=connection,
-        )
-    if failure:
-        with pytest.raises(arkade.ArkadeOutgoingError):
-            await arkade.register_arkade_maintenance(ACCOUNT_ID, plan)
-        assert not await connection.fetchone("SELECT * FROM arkade_maintenance")
-    else:
-        await arkade.register_arkade_maintenance(ACCOUNT_ID, plan)
-        await arkade.register_arkade_maintenance(ACCOUNT_ID, plan)
-        assert (
-            await connection.fetchone(
-                "SELECT COUNT(*) AS count FROM arkade_maintenance"
-            )
-        )["count"] == 1
-        state = await arkade.get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
-        assert state and state.state == "reconciliation_required"
-        changed = plan.copy(update={"inputs": _selected("98" * 32)})
-        changed = changed.copy(
-            update={
-                "signature": key.sign_schnorr(
-                    hashlib.sha256(
-                        arkade.maintenance_statement(ACCOUNT_ID, changed).encode(
-                            "ascii"
-                        )
-                    ).digest()
-                ).hex()
-            }
-        )
-        with pytest.raises(arkade.ArkadeOutgoingError, match="IDEMPOTENCY_CONFLICT"):
-            await arkade.register_arkade_maintenance(ACCOUNT_ID, changed)
-
-
 def _observed(
     txid: str = "97" * 32,
     amount_sat: int = 40,
@@ -540,13 +465,14 @@ async def test_reservation_debits_and_replays_atomically(connection, monkeypatch
 
 
 @pytest.mark.anyio
-async def test_reservation_rejects_logical_and_backing_shortfalls(
+async def test_reservation_enforces_logical_balance_without_backing_lookup(
     connection, monkeypatch
 ):
     monkeypatch.setattr(
         settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
     )
-    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", _backing)
+    backing = AsyncMock(side_effect=AssertionError("reservation scanned backing"))
+    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", backing)
     await _credit(connection, WALLET_ID, 5_000)
     with pytest.raises(arkade.ArkadeOutgoingError, match="INSUFFICIENT_FUNDS"):
         await arkade.reserve_arkade_outgoing_intent(
@@ -554,17 +480,18 @@ async def test_reservation_rejects_logical_and_backing_shortfalls(
         )
 
     await _credit(connection, WALLET_ID, 20_000)
-    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", _low_backing)
-    with pytest.raises(arkade.ArkadeOutgoingError, match="BACKING_DEFICIT"):
-        await arkade.reserve_arkade_outgoing_intent(
-            ACCOUNT_ID,
-            _intent(amount_msat=10_000).copy(update={"intent_id": "66" * 16}),
-            conn=connection,
-        )
+    intent, payment = await arkade.reserve_arkade_outgoing_intent(
+        ACCOUNT_ID,
+        _intent(amount_msat=10_000).copy(update={"intent_id": "66" * 16}),
+        conn=connection,
+    )
+    assert intent.status == "reserved"
+    assert payment.status == PaymentState.PENDING
+    backing.assert_not_awaited()
 
 
 @pytest.mark.anyio
-async def test_lightning_reservation_rejects_account_over_commitment(
+async def test_lightning_reservation_enforces_wallet_balance_including_fee_reserve(
     connection, monkeypatch
 ):
     """The fee cap is part of the obligation and cannot exceed the wallet."""
@@ -572,10 +499,7 @@ async def test_lightning_reservation_rejects_account_over_commitment(
         settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
     )
 
-    async def backing(_account_id, **kwargs):
-        assert kwargs.get("spendable_only") is True
-        return [_observed(amount_sat=10_020)]
-
+    backing = AsyncMock(side_effect=AssertionError("reservation scanned backing"))
     monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", backing)
     monkeypatch.setattr(arkade.bolt11, "decode", lambda _bolt11: _LightningInvoice())
     # Exactly the 5,000 sat invoice without room for its 20 sat fee cap.
@@ -588,24 +512,20 @@ async def test_lightning_reservation_rejects_account_over_commitment(
             connection,
             idempotency_key="07" * 16,
         )
-    # A second wallet cannot make the first one solvent either, but the
-    # account-wide guard still refuses to promise more than the VTXOs back.
+    # The selected wallet can cover amount and fee reservation; account-wide
+    # balances and the advisory coin snapshot do not determine permission.
     await _credit(connection, WALLET_ID, 20_000)
     await _credit(connection, SECOND_WALLET_ID, 1_000_000)
-
-    async def tight_backing(_account_id, **kwargs):
-        assert kwargs.get("spendable_only") is True
-        return [_observed(amount_sat=5_000)]
-
-    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", tight_backing)
-    with pytest.raises(arkade.ArkadeOutgoingError, match="^ARKADE_BACKING_DEFICIT$"):
-        await arkade.reserve_arkade_lightning_intent(
-            ACCOUNT_ID,
-            WALLET_ID,
-            _lightning_quote(),
-            connection,
-            idempotency_key="07" * 16,
-        )
+    intent, payment = await arkade.reserve_arkade_lightning_intent(
+        ACCOUNT_ID,
+        WALLET_ID,
+        _lightning_quote(),
+        connection,
+        idempotency_key="07" * 16,
+    )
+    assert intent.status == "quote_ready"
+    assert payment.status == PaymentState.PENDING
+    backing.assert_not_awaited()
 
 
 @pytest.mark.anyio
@@ -620,19 +540,13 @@ async def test_lightning_reservation_enforces_user_fee_cap(
         settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
     )
 
-    async def backing(_account_id, **kwargs):
-        assert kwargs.get("spendable_only") is True
-        return [_observed(amount_sat=amount_sat + 2 * fee_sat + 1)]
-
-    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", backing)
     monkeypatch.setattr(
         arkade.bolt11,
         "decode",
         lambda _bolt11: _LightningInvoice(amount_msat=amount_sat * 1000),
     )
-    # Credit funds the invoice, its fee and one spare satoshi; the observed
-    # backing adds a second fee reserve beyond that, so only the amounts
-    # rejected below can consume it.
+    # The wallet balance covers the invoice and cap; only invalid quote caps
+    # should be rejected.
     await _credit(connection, WALLET_ID, (amount_sat + fee_sat + 1) * 1000)
     quote = _lightning_quote(
         amount_msat=amount_sat * 1000,
@@ -670,10 +584,10 @@ async def test_lightning_reservation_enforces_user_fee_cap(
 
 
 @pytest.mark.anyio
-async def test_reservation_accepts_exactly_backed_native_account(
+async def test_reservation_debits_and_replays_logical_native_balance(
     connection, monkeypatch
 ):
-    """The live L5 blocker: pending debits must not be counted twice."""
+    """A replay returns the same logical reservation without a second debit."""
     monkeypatch.setattr(
         settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
     )
@@ -710,10 +624,10 @@ async def test_reservation_accepts_exactly_backed_native_account(
 
 
 @pytest.mark.anyio
-async def test_reservation_accepts_exactly_backed_lightning_send(
+async def test_reservation_uses_logical_lightning_balance_and_fee_reserve(
     connection, monkeypatch
 ):
-    """The live L5 blocker, on the Lightning path: exact backing must reserve."""
+    """The selected wallet funds the invoice and its fee reserve atomically."""
     monkeypatch.setattr(
         settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
     )
@@ -724,7 +638,7 @@ async def test_reservation_accepts_exactly_backed_lightning_send(
 
     monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", backing)
     monkeypatch.setattr(arkade.bolt11, "decode", _lightning_decoder("31"))
-    # Exact backing: the wallet holds precisely the invoice plus its fee cap.
+    # The wallet holds precisely the invoice plus its fee cap.
     await _credit(connection, WALLET_ID, 5_015_000)
 
     reserved, payment = await arkade.reserve_arkade_lightning_intent(
@@ -753,8 +667,8 @@ async def test_reservation_accepts_exactly_backed_lightning_send(
     assert replay == reserved
     assert replay_payment == payment
 
-    # The funded amount is committed, so the same wallet cannot fund another
-    # send from the same exact backing.
+    # The funded amount and fee reserve are committed, so the wallet cannot
+    # reserve the same balance twice.
     with pytest.raises(arkade.ArkadeOutgoingError, match="^ARKADE_INSUFFICIENT_FUNDS$"):
         await arkade.reserve_arkade_lightning_intent(
             ACCOUNT_ID,
@@ -862,8 +776,10 @@ async def test_lightning_replay_after_quote_window_returns_recorded_pair(
 
 
 @pytest.mark.anyio
-async def test_failed_report_terminates_submitted_intent_once(connection, monkeypatch):
-    """A browser-reported claim failure is terminal, flagged and delivered once."""
+async def test_failed_report_is_diagnostic_and_keeps_funded_debit_pending(
+    connection, monkeypatch
+):
+    """A browser report cannot release a funded payment without proof."""
     monkeypatch.setattr(
         settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
     )
@@ -895,45 +811,198 @@ async def test_failed_report_terminates_submitted_intent_once(connection, monkey
         ACCOUNT_ID, reserved.intent_id, "claim_attempt_failed", conn=connection
     )
 
-    assert result.status == "failed"
+    assert result.status == "submitted"
     assert result.failure_reason == "claim_attempt_failed"
     assert result.failed_at is not None
     stored = await get_arkade_outgoing_intent(reserved.intent_id, conn=connection)
-    assert stored and stored.status == "failed"
+    assert stored and stored.status == "submitted"
     assert stored.failure_reason == "claim_attempt_failed"
     failed_payment = await get_payment_by_native_id(reserved.intent_id, conn=connection)
     assert failed_payment is not None
-    assert failed_payment.status == PaymentState.FAILED.value
+    assert failed_payment.status == PaymentState.PENDING.value
     assert failed_payment.fee == 0
     reconciliation = await connection.fetchone(
         "SELECT state, last_error FROM arkade_reconciliation_state "
         "WHERE account_id = :account_id",
         {"account_id": ACCOUNT_ID},
     )
-    assert reconciliation is not None
-    assert reconciliation["state"] == "reconciliation_required"
-    assert reconciliation["last_error"] == "ARKADE_LIGHTNING_SWAP_FAILED"
+    assert reconciliation is None
     events = await connection.fetchall(
         "SELECT event_id, terminal_state FROM arkade_lightning_terminal_events"
     )
-    assert len(events) == 1
-    assert events[0]["event_id"] == reserved.intent_id
-    assert events[0]["terminal_state"] == "failed"
+    assert events == []
 
     replay = await arkade.fail_arkade_lightning_intent(
         ACCOUNT_ID, reserved.intent_id, "claim_attempt_failed", conn=connection
     )
-    assert replay.status == "failed"
+    assert replay.status == "submitted"
     events = await connection.fetchall(
         "SELECT event_id FROM arkade_lightning_terminal_events"
     )
-    assert len(events) == 1
+    assert events == []
     with pytest.raises(
         arkade.ArkadeOutgoingError, match="^ARKADE_OUTGOING_IDEMPOTENCY_CONFLICT$"
     ):
         await arkade.fail_arkade_lightning_intent(
             ACCOUNT_ID, reserved.intent_id, "different_reason", conn=connection
         )
+
+
+async def _seed_legacy_funded_failure(connection, monkeypatch, idempotency_key):
+    monkeypatch.setattr(
+        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
+    )
+    created = await _submitted_lightning_intent(
+        connection, monkeypatch, idempotency_key
+    )
+    intent = await get_arkade_outgoing_intent(created.intent_id, conn=connection)
+    assert intent and intent.arkade_txid
+    now = datetime.now(timezone.utc)
+    async with connection.transaction():
+        await connection.execute(
+            "UPDATE arkade_outgoing_intents SET status = 'failed', "
+            "arkade_txid = :arkade_txid, failed_at = :now, "
+            "failure_reason = 'legacy_browser_failure' "
+            "WHERE intent_id = :intent_id",
+            {
+                "intent_id": intent.intent_id,
+                "arkade_txid": intent.arkade_txid,
+                "now": now,
+            },
+        )
+        await connection.execute(
+            "UPDATE apipayments SET status = 'failed' "
+            "WHERE protocol = 'arkade' AND native_id = :intent_id",
+            {"intent_id": intent.intent_id},
+        )
+        await connection.execute(
+            "INSERT INTO arkade_lightning_terminal_events "
+            "(event_id, terminal_state, payment_payload, next_attempt_at) "
+            "VALUES (:intent_id, 'failed', '{}', :now)",
+            {"intent_id": intent.intent_id, "now": now},
+        )
+    return intent
+
+
+@pytest.mark.anyio
+async def test_m065_reopens_legacy_funded_failure_and_allows_proven_terminal_event(
+    connection, monkeypatch
+):
+    intent = await _seed_legacy_funded_failure(connection, monkeypatch, "81" * 16)
+
+    await migrations.m065_arkade_receipt_facts_and_funded_failure_repair(connection)
+
+    reopened = await get_arkade_outgoing_intent(intent.intent_id, conn=connection)
+    pending = await get_payment_by_native_id(intent.intent_id, conn=connection)
+    assert reopened and reopened.status == "submitted"
+    assert reopened.failure_reason == "legacy_browser_failure"
+    assert reopened.failed_at is not None
+    assert pending and pending.status == PaymentState.PENDING.value and pending.fee == 0
+    assert (
+        await connection.fetchone(
+            "SELECT event_id FROM arkade_lightning_terminal_events "
+            "WHERE event_id = :intent_id AND terminal_state = 'failed'",
+            {"intent_id": intent.intent_id},
+        )
+        is None
+    )
+
+    async with connection.transaction():
+        assert await settle_arkade_lightning_intent(
+            intent.intent_id,
+            "ef" * 32,
+            account_id=ACCOUNT_ID,
+            wallet_id=WALLET_ID,
+            conn=connection,
+        )
+        assert await settle_arkade_lightning_payment(
+            intent.intent_id,
+            account_id=ACCOUNT_ID,
+            wallet_id=WALLET_ID,
+            amount_msat=intent.amount_msat,
+            arkade_address=intent.destination,
+            conn=connection,
+        )
+        payment = await get_payment_by_native_id(intent.intent_id, conn=connection)
+        assert payment is not None
+        event = await create_arkade_lightning_terminal_event(
+            intent.intent_id, "settled", payment, connection
+        )
+    assert event.terminal_state == "settled"
+
+
+@pytest.mark.anyio
+async def test_m065_duplicate_retry_collision_fails_without_mutating_legacy_failure(
+    connection, monkeypatch
+):
+    intent = await _seed_legacy_funded_failure(connection, monkeypatch, "82" * 16)
+    await connection.execute(
+        "CREATE UNIQUE INDEX legacy_global_input_claim "
+        "ON arkade_outgoing_intent_inputs (txid, vout)"
+    )
+    await connection.execute(
+        "INSERT INTO arkade_outgoing_intents "
+        "(intent_id, account_id, wallet_id, amount_msat, max_fee_msat, "
+        "destination, destination_kind, status, payment_hash, expires_at) "
+        "SELECT :retry_id, account_id, wallet_id, amount_msat, max_fee_msat, "
+        "destination, destination_kind, 'reserved', payment_hash, expires_at "
+        "FROM arkade_outgoing_intents WHERE intent_id = :intent_id",
+        {"intent_id": intent.intent_id, "retry_id": "99" * 16},
+    )
+
+    with pytest.raises(RuntimeError, match="shares a payment hash with live/settled"):
+        await migrations.m065_arkade_receipt_facts_and_funded_failure_repair(connection)
+
+    failed = await get_arkade_outgoing_intent(intent.intent_id, conn=connection)
+    failed_payment = await get_payment_by_native_id(intent.intent_id, conn=connection)
+    old_event = await connection.fetchone(
+        "SELECT terminal_state FROM arkade_lightning_terminal_events "
+        "WHERE event_id = :intent_id",
+        {"intent_id": intent.intent_id},
+    )
+    input_index = await connection.fetchone(
+        "SELECT name FROM sqlite_master WHERE type = 'index' "
+        "AND name = 'legacy_global_input_claim'"
+    )
+    assert failed and failed.status == "failed"
+    assert failed_payment and failed_payment.status == PaymentState.FAILED.value
+    assert old_event and old_event["terminal_state"] == "failed"
+    assert input_index is not None
+
+
+@pytest.mark.anyio
+async def test_m065_rolls_back_schema_and_ledger_repair_on_database_error(
+    connection, monkeypatch
+):
+    intent = await _seed_legacy_funded_failure(connection, monkeypatch, "83" * 16)
+    await connection.execute(
+        "CREATE UNIQUE INDEX legacy_global_input_claim "
+        "ON arkade_outgoing_intent_inputs (txid, vout)"
+    )
+    await connection.execute(
+        "CREATE TRIGGER injected_m065_failure BEFORE UPDATE OF status ON apipayments "
+        f"WHEN OLD.native_id = '{intent.intent_id}' "
+        "BEGIN SELECT RAISE(ABORT, 'injected migration failure'); END"
+    )
+
+    with pytest.raises(Exception, match="injected migration failure"):
+        await migrations.m065_arkade_receipt_facts_and_funded_failure_repair(connection)
+
+    failed = await get_arkade_outgoing_intent(intent.intent_id, conn=connection)
+    failed_payment = await get_payment_by_native_id(intent.intent_id, conn=connection)
+    old_event = await connection.fetchone(
+        "SELECT terminal_state FROM arkade_lightning_terminal_events "
+        "WHERE event_id = :intent_id",
+        {"intent_id": intent.intent_id},
+    )
+    input_index = await connection.fetchone(
+        "SELECT name FROM sqlite_master WHERE type = 'index' "
+        "AND name = 'legacy_global_input_claim'"
+    )
+    assert failed and failed.status == "failed"
+    assert failed_payment and failed_payment.status == PaymentState.FAILED.value
+    assert old_event and old_event["terminal_state"] == "failed"
+    assert input_index is not None
 
 
 @pytest.mark.anyio
@@ -1228,67 +1297,20 @@ async def test_pending_check_expires_unfunded_reservation(connection, monkeypatc
 
 
 @pytest.mark.anyio
-async def test_reconciliation_resolve_clears_flag_once_and_audits(
+async def test_reservation_ignores_legacy_reconciliation_diagnostic(
     connection, monkeypatch
 ):
-    """Only a deliberate operator action clears a sticky flag."""
-    await arkade.update_arkade_reconciliation(
-        ACCOUNT_ID,
-        state="reconciliation_required",
-        last_error="ARKADE_LIGHTNING_SWAP_FAILED",
-        conn=connection,
-    )
-
-    @asynccontextmanager
-    async def use_connection():
-        yield connection
-
-    monkeypatch.setattr(arkade.db, "connect", use_connection)
-
-    previous, resolved = await arkade.resolve_arkade_reconciliation(
-        ACCOUNT_ID, "operator cleared after manual review", actor_id=ACCOUNT_ID
-    )
-
-    assert previous.state == "reconciliation_required"
-    assert previous.last_error == "ARKADE_LIGHTNING_SWAP_FAILED"
-    assert resolved.state == "ok"
-    assert resolved.last_error is None
-    stored = await arkade.get_arkade_reconciliation(ACCOUNT_ID, conn=connection)
-    assert stored and stored.state == "ok" and stored.last_error is None
-    audits = await connection.fetchall("SELECT * FROM audit")
-    assert len(audits) == 1
-    assert audits[0]["component"] == "arkade"
-    assert audits[0]["user_id"] == ACCOUNT_ID
-    assert "manual review" in audits[0]["request_details"]
-    assert "ARKADE_LIGHTNING_SWAP_FAILED" in audits[0]["request_details"]
-
-    previous_ok, resolved_ok = await arkade.resolve_arkade_reconciliation(
-        ACCOUNT_ID, "already resolved", actor_id=ACCOUNT_ID
-    )
-    assert previous_ok.state == "ok" and resolved_ok.state == "ok"
-    assert len(await connection.fetchall("SELECT * FROM audit")) == 1
-
-    with pytest.raises(arkade.ArkadeReconciliationError, match="NOT_FOUND"):
-        await arkade.resolve_arkade_reconciliation(
-            "cc" * 16, "unknown account", actor_id=ACCOUNT_ID
-        )
-
-
-@pytest.mark.anyio
-async def test_reservation_allows_held_backing_when_still_solvent(
-    connection, monkeypatch
-):
-    """A reconciliation flag must not block a payment the backing still covers."""
+    """Historical account diagnostics no longer grant payment permission."""
     monkeypatch.setattr(
         settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
     )
     monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", _backing)
     await _credit(connection, WALLET_ID, 20_000)
-    await arkade.update_arkade_reconciliation(
-        ACCOUNT_ID,
-        state="reconciliation_required",
-        last_error="ARKADE_RECONCILIATION_REQUIRED",
-        conn=connection,
+    await connection.execute(
+        "INSERT INTO arkade_reconciliation_state "
+        "(account_id, state, last_error) VALUES "
+        "(:account_id, 'reconciliation_required', 'ARKADE_RECONCILIATION_REQUIRED')",
+        {"account_id": ACCOUNT_ID},
     )
 
     intent, _payment = await arkade.reserve_arkade_outgoing_intent(
@@ -1431,16 +1453,13 @@ async def test_reservation_counts_account_obligations_once(connection, monkeypat
         conn=connection,
     )
     monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", _low_backing)
-    with pytest.raises(arkade.ArkadeOutgoingError, match="BACKING_DEFICIT"):
-        await arkade.reserve_arkade_outgoing_intent(
-            ACCOUNT_ID,
-            _intent().copy(
-                update={
-                    "intent_id": "66" * 16,
-                }
-            ),
-            conn=connection,
-        )
+    reserved, payment = await arkade.reserve_arkade_outgoing_intent(
+        ACCOUNT_ID,
+        _intent().copy(update={"intent_id": "66" * 16}),
+        conn=connection,
+    )
+    assert reserved.status == "reserved"
+    assert payment.status == PaymentState.PENDING.value
 
 
 @pytest.mark.anyio
@@ -1461,15 +1480,13 @@ async def test_reservation_rejects_partial_pair(connection, monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_reservation_rejects_conflicting_backing_duplicates(
-    connection, monkeypatch
-):
+async def test_reservation_does_not_gate_on_backing_snapshot(connection, monkeypatch):
     monkeypatch.setattr(
         settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
     )
 
-    async def conflicting(_account_id, **_kwargs):
-        return [
+    backing = AsyncMock(
+        return_value=[
             arkade.ArkadeIndexerVtxo(
                 txid="96" * 32, vout=0, amount_sat=10, script="aa"
             ),
@@ -1477,45 +1494,15 @@ async def test_reservation_rejects_conflicting_backing_duplicates(
                 txid="96" * 32, vout=0, amount_sat=20, script="aa"
             ),
         ]
-
-    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", conflicting)
-    await _credit(connection, WALLET_ID, 20_000)
-    with pytest.raises(arkade.ArkadeOutgoingError, match="INVALID_RESPONSE"):
-        await arkade.reserve_arkade_outgoing_intent(
-            ACCOUNT_ID, _intent(), conn=connection
-        )
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize("state", ["unrolled", "settled", "expired", "height_expired"])
-async def test_reservation_excludes_non_spendable_backing(
-    connection, monkeypatch, state
-):
-    monkeypatch.setattr(
-        settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
     )
-
-    async def backing(_account_id, **kwargs):
-        assert kwargs == {"spendable_only": True}
-        flags = {
-            "is_unrolled": state == "unrolled",
-            "settled_by": "66" * 32 if state == "settled" else None,
-            "expires_at": (
-                datetime.now(timezone.utc) - timedelta(seconds=1)
-                if state == "expired"
-                else None
-            ),
-            "expires_at_height": 123 if state == "height_expired" else None,
-        }
-        return [_observed(**flags)]
-
     monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", backing)
-    await _credit(connection, WALLET_ID, 10_000)
-    with pytest.raises(arkade.ArkadeOutgoingError, match="BACKING_DEFICIT"):
-        await arkade.reserve_arkade_outgoing_intent(
-            ACCOUNT_ID, _intent(), conn=connection
-        )
-    assert not await get_arkade_outgoing_intent(INTENT_ID, conn=connection)
+    await _credit(connection, WALLET_ID, 20_000)
+    intent, payment = await arkade.reserve_arkade_outgoing_intent(
+        ACCOUNT_ID, _intent(), conn=connection
+    )
+    assert intent.status == "reserved"
+    assert payment.status == PaymentState.PENDING.value
+    backing.assert_not_awaited()
 
 
 @pytest.mark.anyio
@@ -1607,12 +1594,12 @@ async def test_forward_only_transitions(connection):
         await create_arkade_outgoing_intent(_intent(), conn=connection)
         with pytest.raises(ValueError, match="INPUTS_REQUIRED"):
             await submit_arkade_outgoing_intent(INTENT_ID, "33" * 32, connection)
-        await claim_arkade_outgoing_inputs(
+        await record_arkade_outgoing_input_facts(
             [input_row.copy(update={"amount_sat": 9})], conn=connection
         )
         with pytest.raises(ValueError, match="INPUTS_INSUFFICIENT"):
             await submit_arkade_outgoing_intent(INTENT_ID, "33" * 32, connection)
-        await claim_arkade_outgoing_inputs(
+        await record_arkade_outgoing_input_facts(
             [input_row.copy(update={"txid": "56" * 32, "amount_sat": 1})],
             conn=connection,
         )
@@ -1634,7 +1621,7 @@ async def test_forward_only_transitions(connection):
         await create_arkade_outgoing_intent(
             _intent().copy(update={"intent_id": over_id}), conn=connection
         )
-        await claim_arkade_outgoing_inputs(
+        await record_arkade_outgoing_input_facts(
             [input_row.copy(update={"intent_id": over_id, "txid": "66" * 32})],
             conn=connection,
         )
@@ -1651,7 +1638,7 @@ async def test_forward_only_transitions(connection):
         await create_arkade_outgoing_intent(
             _intent().copy(update={"intent_id": released_id}), conn=connection
         )
-        await claim_arkade_outgoing_inputs([released_input], conn=connection)
+        await record_arkade_outgoing_input_facts([released_input], conn=connection)
         assert await release_arkade_outgoing_intent(released_id, connection)
     released = await get_arkade_outgoing_intent(released_id, conn=connection)
     assert released and released.status == "released"
@@ -1662,7 +1649,7 @@ async def test_forward_only_transitions(connection):
 async def test_dispute_and_release_are_forward_only(connection):
     async with connection.transaction():
         await create_arkade_outgoing_intent(_intent(), conn=connection)
-        await claim_arkade_outgoing_inputs(
+        await record_arkade_outgoing_input_facts(
             [
                 ArkadeOutgoingIntentInput(
                     intent_id=INTENT_ID,
@@ -1683,7 +1670,9 @@ async def test_dispute_and_release_are_forward_only(connection):
 
 
 @pytest.mark.anyio
-async def test_input_claims_are_unique_across_intents(connection):
+async def test_input_facts_are_idempotent_per_intent_not_exclusive(
+    connection,
+):
     other_id = "44" * 16
     input_row = ArkadeOutgoingIntentInput(
         intent_id=INTENT_ID, txid="55" * 32, vout=0, amount_sat=10
@@ -1693,38 +1682,37 @@ async def test_input_claims_are_unique_across_intents(connection):
         await create_arkade_outgoing_intent(
             _intent().copy(update={"intent_id": other_id}), conn=connection
         )
-        claimed = await claim_arkade_outgoing_inputs([input_row], conn=connection)
-        assert len(claimed) == 1
-        assert isinstance(claimed[0].claimed_at, datetime)
-        retry = await claim_arkade_outgoing_inputs([input_row], conn=connection)
-        assert retry[0].dict(exclude={"claimed_at"}) == claimed[0].dict(
+        recorded = await record_arkade_outgoing_input_facts(
+            [input_row], conn=connection
+        )
+        assert len(recorded) == 1
+        assert isinstance(recorded[0].claimed_at, datetime)
+        retry = await record_arkade_outgoing_input_facts([input_row], conn=connection)
+        assert retry[0].dict(exclude={"claimed_at"}) == recorded[0].dict(
             exclude={"claimed_at"}
         )
-        with pytest.raises(ValueError, match="ALREADY_CLAIMED"):
-            await claim_arkade_outgoing_inputs(
+        with pytest.raises(ValueError, match="INPUT_FACT_CONFLICT"):
+            await record_arkade_outgoing_input_facts(
                 [input_row.copy(update={"amount_sat": 11})], conn=connection
             )
-        with pytest.raises(ValueError, match="ALREADY_CLAIMED"):
-            await claim_arkade_outgoing_inputs(
-                [input_row.copy(update={"intent_id": other_id})], conn=connection
-            )
 
-        other_input = input_row.copy(update={"intent_id": other_id, "txid": "77" * 32})
-        assert await claim_arkade_outgoing_inputs([other_input], conn=connection)
-        new_input = input_row.copy(update={"txid": "66" * 32})
-        with pytest.raises(ValueError, match="ALREADY_CLAIMED"):
-            await claim_arkade_outgoing_inputs(
-                [new_input, other_input.copy(update={"intent_id": INTENT_ID})],
+        other_input = input_row.copy(update={"intent_id": other_id})
+        other_facts = await record_arkade_outgoing_input_facts(
+            [other_input], conn=connection
+        )
+        assert len(other_facts) == 1
+        assert await get_arkade_outgoing_intent_inputs(INTENT_ID, conn=connection)
+        assert await get_arkade_outgoing_intent_inputs(other_id, conn=connection)
+
+        with pytest.raises(ValueError, match="INPUT_FACT_CONFLICT"):
+            await record_arkade_outgoing_input_facts(
+                [input_row, input_row.copy(update={"amount_sat": 11})],
                 conn=connection,
             )
-        assert not await connection.fetchone(
-            "SELECT 1 FROM arkade_outgoing_intent_inputs WHERE txid = :txid",
-            {"txid": new_input.txid},
-        )
 
         assert await submit_arkade_outgoing_intent(INTENT_ID, "33" * 32, connection)
         with pytest.raises(ValueError, match="NOT_RESERVED"):
-            await claim_arkade_outgoing_inputs([input_row], conn=connection)
+            await record_arkade_outgoing_input_facts([input_row], conn=connection)
 
 
 @pytest.mark.anyio
@@ -1790,11 +1778,9 @@ async def test_authorize_exact_inputs_and_submitted_replay(
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize(
-    "previous_status,owned", [("settled", True), ("submitted", False)]
-)
-async def test_authorize_spending_previous_change(
-    connection, monkeypatch, previous_status, owned
+@pytest.mark.parametrize("previous_status", ["settled", "submitted"])
+async def test_authorize_does_not_require_registered_input(
+    connection, monkeypatch, previous_status
 ):
     monkeypatch.setattr(
         settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
@@ -1824,26 +1810,14 @@ async def test_authorize_spending_previous_change(
 
     monkeypatch.setattr(arkade, "get_arkade_receive_requests", registered)
     monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos_for_outpoints", exact)
-    if owned:
-        result = await arkade.authorize_arkade_outgoing(
-            ACCOUNT_ID,
-            INTENT_ID,
-            _selected(amount_sat=10),
-            conn=connection,
-            destination_script=DESTINATION_SCRIPT,
-        )
-        assert result.status == "submitted"
-    else:
-        with pytest.raises(
-            arkade.ArkadeOutgoingError, match="ARKADE_OUTGOING_INPUT_UNREGISTERED"
-        ):
-            await arkade.authorize_arkade_outgoing(
-                ACCOUNT_ID,
-                INTENT_ID,
-                _selected(amount_sat=10),
-                conn=connection,
-                destination_script=DESTINATION_SCRIPT,
-            )
+    result = await arkade.authorize_arkade_outgoing(
+        ACCOUNT_ID,
+        INTENT_ID,
+        _selected(amount_sat=10),
+        conn=connection,
+        destination_script=DESTINATION_SCRIPT,
+    )
+    assert result.status == "submitted"
 
 
 async def _submitted_intent(connection):
@@ -2012,82 +1986,31 @@ async def test_reconcile_outgoing_keeps_pending_or_disputes(
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("case", "expected"),
-    [
-        ("duplicate", "ARKADE_OUTGOING_INPUTS_INVALID"),
-        ("missing", "ARKADE_OUTGOING_INPUTS_MISSING"),
-        ("extra", "ARKADE_OUTGOING_INDEXER_INVALID"),
-        ("conflicting", "ARKADE_OUTGOING_INDEXER_INVALID"),
-        ("value", "ARKADE_OUTGOING_INPUT_VALUE_MISMATCH"),
-        ("spent", "ARKADE_OUTGOING_INPUT_UNAVAILABLE"),
-        ("swept", "ARKADE_OUTGOING_INPUT_UNAVAILABLE"),
-        ("unrolled", "ARKADE_OUTGOING_INPUT_UNAVAILABLE"),
-        ("settled", "ARKADE_OUTGOING_INPUT_UNAVAILABLE"),
-        ("expired", "ARKADE_OUTGOING_INPUT_UNAVAILABLE"),
-        ("height_expired", "ARKADE_OUTGOING_INPUT_UNAVAILABLE"),
-        ("script", "ARKADE_OUTGOING_INPUT_UNREGISTERED"),
-        ("underfunded", "ARKADE_INSUFFICIENT_FUNDS"),
-    ],
-)
-async def test_authorize_rejects_public_evidence_cases(  # noqa: C901
-    connection, monkeypatch, case, expected
+async def test_authorize_records_input_facts_without_coin_permissions(
+    connection, monkeypatch
 ):
     monkeypatch.setattr(
         settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
     )
-    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", _backing)
     await _credit(connection, WALLET_ID, 20_000)
     await arkade.reserve_arkade_outgoing_intent(ACCOUNT_ID, _intent(), conn=connection)
+    indexer = AsyncMock(side_effect=AssertionError("authorization queried coin state"))
+    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos_for_outpoints", indexer)
+    monkeypatch.setattr(arkade, "get_arkade_receive_requests", indexer)
 
-    async def registered(_account_id, conn=None):
-        return [SimpleNamespace(script="aa")]
-
-    selected = _selected(amount_sat=9 if case == "underfunded" else 40)
-    observed = [_observed(amount_sat=9 if case == "underfunded" else 40)]
-    if case == "duplicate":
-        selected = selected * 2
-    elif case == "missing":
-        observed = []
-    elif case == "extra":
-        observed.append(_observed(txid="96" * 32))
-    elif case == "conflicting":
-        observed.append(_observed(script="bb"))
-    elif case == "value":
-        observed = [_observed(amount_sat=41)]
-    elif case == "spent":
-        observed = [_observed(is_spent=True)]
-    elif case == "swept":
-        observed = [_observed(is_swept=True)]
-    elif case == "unrolled":
-        observed = [_observed(is_unrolled=True)]
-    elif case == "settled":
-        observed = [_observed(settled_by="66" * 32)]
-    elif case == "expired":
-        observed = [
-            _observed(expires_at=datetime.now(timezone.utc) - timedelta(seconds=1))
-        ]
-    elif case == "height_expired":
-        observed = [_observed(expires_at_height=123)]
-    elif case == "script":
-        observed = [_observed(script="bb")]
-    monkeypatch.setattr(arkade, "get_arkade_receive_requests", registered)
-    monkeypatch.setattr(
-        arkade,
-        "fetch_arkade_indexer_vtxos_for_outpoints",
-        AsyncMock(return_value=observed),
+    result = await arkade.authorize_arkade_outgoing(
+        ACCOUNT_ID,
+        INTENT_ID,
+        _selected(amount_sat=40),
+        conn=connection,
+        destination_script=DESTINATION_SCRIPT,
     )
-    with pytest.raises(arkade.ArkadeOutgoingError, match=expected):
-        await arkade.authorize_arkade_outgoing(
-            ACCOUNT_ID,
-            INTENT_ID,
-            selected,
-            conn=connection,
-            destination_script=DESTINATION_SCRIPT,
-        )
-    current = await get_arkade_outgoing_intent(INTENT_ID, conn=connection)
-    assert current and current.status == "reserved"
-    assert not await get_arkade_outgoing_intent_inputs(INTENT_ID, conn=connection)
+
+    assert result.status == "submitted"
+    assert [(item.txid, item.vout, item.amount_sat) for item in result.inputs] == [
+        ("97" * 32, 0, 40)
+    ]
+    indexer.assert_not_awaited()
 
 
 @pytest.mark.anyio
@@ -2140,11 +2063,12 @@ async def test_authorize_rejects_corrupt_payment_pair(
 
 
 @pytest.mark.anyio
-async def test_authorize_competing_claim_rolls_back(connection, monkeypatch):
+async def test_authorize_allows_cross_intent_input_fact_overlap(
+    connection, monkeypatch
+):
     monkeypatch.setattr(
         settings, "lnbits_effective_installation_mode", "arkade_noncustodial"
     )
-    monkeypatch.setattr(arkade, "fetch_arkade_indexer_vtxos", _backing)
     await _credit(connection, WALLET_ID, 20_000)
     await arkade.reserve_arkade_outgoing_intent(ACCOUNT_ID, _intent(), conn=connection)
     competing_id = "44" * 16
@@ -2155,26 +2079,18 @@ async def test_authorize_competing_claim_rolls_back(connection, monkeypatch):
         await create_arkade_outgoing_intent(
             _intent().copy(update={"intent_id": competing_id}), conn=connection
         )
-        await claim_arkade_outgoing_inputs([competing_input], conn=connection)
+        await record_arkade_outgoing_input_facts([competing_input], conn=connection)
 
-    async def registered(_account_id, conn=None):
-        return [SimpleNamespace(script="aa")]
-
-    monkeypatch.setattr(arkade, "get_arkade_receive_requests", registered)
-    monkeypatch.setattr(
-        arkade,
-        "fetch_arkade_indexer_vtxos_for_outpoints",
-        AsyncMock(return_value=[_observed(amount_sat=10)]),
+    result = await arkade.authorize_arkade_outgoing(
+        ACCOUNT_ID,
+        INTENT_ID,
+        _selected(amount_sat=10),
+        conn=connection,
+        destination_script=DESTINATION_SCRIPT,
     )
-    with pytest.raises(arkade.ArkadeOutgoingError, match="INPUT_CONFLICT"):
-        await arkade.authorize_arkade_outgoing(
-            ACCOUNT_ID,
-            INTENT_ID,
-            _selected(amount_sat=10),
-            conn=connection,
-            destination_script=DESTINATION_SCRIPT,
-        )
-    assert not await get_arkade_outgoing_intent_inputs(INTENT_ID, conn=connection)
+    assert result.status == "submitted"
+    assert len(result.inputs) == 1
+    assert await get_arkade_outgoing_intent_inputs(competing_id, conn=connection)
 
 
 @pytest.mark.anyio
@@ -2201,7 +2117,7 @@ async def test_authorize_crud_rejects_false_transition(connection, monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_authorize_requires_descriptor_before_indexer_work(
+async def test_authorize_requires_descriptor_for_output_commitment(
     connection, monkeypatch
 ):
     monkeypatch.setattr(
@@ -2258,14 +2174,6 @@ async def test_authorize_expired_intent_fails_closed(connection, monkeypatch):
             conn=connection,
             destination_script=DESTINATION_SCRIPT,
         )
-
-
-def test_outgoing_evidence_requires_exact_destination_and_change_amount():
-    selected = _selected(amount_sat=40)
-    evidence = [_observed(amount_sat=40)]
-    arkade._validate_outgoing_evidence(selected, evidence, {"aa"}, 10_000, 30)
-    with pytest.raises(arkade.ArkadeOutgoingError, match="OUTPUT_INVALID"):
-        arkade._validate_outgoing_evidence(selected, evidence, {"aa"}, 10_000, 29)
 
 
 @pytest.mark.anyio
@@ -2988,26 +2896,12 @@ async def test_lightning_terminal_intent_and_payment_cas_are_atomic_and_isolated
     assert settled.actual_fee_msat == 1_000
     assert settled_payment and settled_payment.status == PaymentState.SUCCESS
     assert settled_payment.fee == -1_000
-    claim = await connection.fetchone(
-        "SELECT i.txid, i.vout, i.amount_sat, o.status, o.arkade_txid, "
-        "o.destination_kind, o.settlement_ark_txid, o.refund_ark_txid "
-        "FROM arkade_outgoing_intent_inputs i "
-        "JOIN arkade_outgoing_intents o ON o.intent_id = i.intent_id "
-        "WHERE i.intent_id = :intent_id",
-        {"intent_id": intent.intent_id},
+    receipt_facts = await get_arkade_outgoing_intent_inputs(
+        intent.intent_id, conn=connection
     )
-    assert claim and not arkade._arkade_backing_diverged(
-        arkade.ArkadeIndexerVtxo(
-            txid=claim["txid"],
-            vout=claim["vout"],
-            amount_sat=claim["amount_sat"],
-            script=CHANGE_SCRIPT,
-            is_spent=True,
-            spent_by="bb" * 32,
-            arkade_txid="66" * 32,
-        ),
-        claim,
-    )
+    assert [(item.txid, item.vout, item.amount_sat) for item in receipt_facts] == [
+        ("55" * 32, 0, intent.quote_from_amount_sat)
+    ]
     balance = await connection.fetchone(
         "SELECT balance FROM balances WHERE wallet_id = :wallet_id",
         {"wallet_id": WALLET_ID},
@@ -3297,31 +3191,16 @@ async def test_lightning_reconcile_claim_is_atomic_and_idempotent(
     payment = await get_payment_by_native_id(intent.intent_id, conn=connection)
     assert settled and settled.status == "settled"
     assert payment and payment.status == PaymentState.SUCCESS
-    claim = await connection.fetchone(
-        "SELECT i.txid, i.vout, i.amount_sat, o.status, o.arkade_txid, "
-        "o.destination_kind, o.settlement_ark_txid, o.refund_ark_txid "
-        "FROM arkade_outgoing_intent_inputs i "
-        "JOIN arkade_outgoing_intents o ON o.intent_id = i.intent_id "
-        "WHERE i.intent_id = :intent_id",
-        {"intent_id": intent.intent_id},
+    receipt_facts = await get_arkade_outgoing_intent_inputs(
+        intent.intent_id, conn=connection
     )
-    assert claim and not arkade._arkade_backing_diverged(
-        arkade.ArkadeIndexerVtxo(
-            txid=claim["txid"],
-            vout=claim["vout"],
-            amount_sat=claim["amount_sat"],
-            script=CHANGE_SCRIPT,
-            is_spent=True,
-            spent_by="bb" * 32,
-            arkade_txid="66" * 32,
-        ),
-        claim,
-    )
+    assert len(receipt_facts) == 1
+    assert receipt_facts[0].amount_sat == intent.quote_from_amount_sat
     reconciliation = await connection.fetchone(
         "SELECT state FROM arkade_reconciliation_state WHERE account_id = :account_id",
         {"account_id": ACCOUNT_ID},
     )
-    assert reconciliation and reconciliation["state"] == "ok"
+    assert reconciliation is None
     assert (
         await connection.fetchone(
             "SELECT COUNT(*) AS count FROM arkade_lightning_terminal_events"
@@ -3376,7 +3255,7 @@ async def test_lightning_reconcile_refund_and_contradiction(connection, monkeypa
     )
     assert disputed and disputed.status == "disputed"
     assert payment and payment.status == PaymentState.PENDING
-    assert state and state["state"] == "reconciliation_required"
+    assert state is None
 
 
 @pytest.mark.anyio

@@ -156,7 +156,7 @@ window.PageWallet = {
       arkadeBacking: null,
       arkadeBackingDialog: false,
       arkadeBackingError: '',
-      arkadeMaintenanceBusy: false,
+      arkadeRenewalBusy: false,
       arkadeAutoRenew: false,
       arkadeBackingTimer: null,
       formattedFiatAmount: 0,
@@ -331,17 +331,13 @@ window.PageWallet = {
           await LNbits.api.request('GET', '/api/v1/arkade/backing')
         ).data
         this.arkadeBackingError = ''
-        if (
-          this.arkadeAutoRenew &&
-          this.arkadeBacking.expiring_sat > 0 &&
-          !this.arkadeBacking.maintenance &&
-          !this.arkadeMaintenanceBusy
-        )
-          await this.maintainArkadeVtxos(true)
       } catch {
+        this.arkadeBacking = null
         this.arkadeBackingError =
-          'Backing could not be verified. Refresh before paying.'
+          'The backing estimate is unavailable. Sending still uses your wallet balance.'
       }
+      if (this.arkadeAutoRenew && !this.arkadeRenewalBusy)
+        await this.renewArkadeVtxos(true)
     },
     async enableArkadeAutoRenew(value) {
       if (value) {
@@ -366,8 +362,8 @@ window.PageWallet = {
       )
       if (value) void this.refreshArkadeBacking()
     },
-    async maintainArkadeVtxos(automatic = false) {
-      if (this.arkadeMaintenanceBusy) return
+    async renewArkadeVtxos(automatic = false) {
+      if (this.arkadeRenewalBusy) return
       if (!automatic) {
         const approved = await new Promise(resolve => {
           this.$q
@@ -383,25 +379,31 @@ window.PageWallet = {
         })
         if (!approved) return
       }
-      this.arkadeMaintenanceBusy = true
+      this.arkadeRenewalBusy = true
       try {
-        this.arkadeBacking = await window.ArkadeEnrollment.maintainVtxos({
+        const txid = await window.ArkadeEnrollment.renewExpiringVtxos({
           approved: true
         })
-        this.arkadeBackingError = ''
-        this.$q.notify({
-          type: 'info',
-          message: this.arkadeBacking.maintenance
-            ? 'Settlement submitted; awaiting backing verification.'
-            : 'Arkade backing refreshed.'
-        })
+        if (txid) {
+          this.arkadeBackingError = ''
+          if (!automatic)
+            this.$q.notify({
+              type: 'info',
+              message: 'Zero-fee Arkade renewal submitted.'
+            })
+        } else if (!automatic) {
+          this.$q.notify({
+            type: 'info',
+            message: 'No expiring VTXOs need renewal.'
+          })
+        }
       } catch (error) {
         this.arkadeBackingError =
           error?.response?.data?.detail ||
           error.message ||
           'Recovery needs another attempt.'
       } finally {
-        this.arkadeMaintenanceBusy = false
+        this.arkadeRenewalBusy = false
       }
     },
     showWalletTotalBreakdown() {

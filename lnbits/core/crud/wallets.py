@@ -86,7 +86,7 @@ async def force_delete_wallet(wallet_id: str, conn: Connection | None = None) ->
     await ensure_arkade_wallet_deletion_allowed(wallet_id, conn=conn)
     clear_wallet_id_cache(wallet_id)
     if settings.lnbits_effective_installation_mode == "arkade_noncustodial":
-        mapped = await (conn or db).fetchone(
+        mapped: dict | None = await (conn or db).fetchone(
             "SELECT 1 FROM arkade_receive_requests "
             "WHERE wallet_id = :wallet LIMIT 1",
             {"wallet": wallet_id},
@@ -121,7 +121,9 @@ async def remove_deleted_wallets(conn: Connection | None = None) -> None:
     if settings.lnbits_effective_installation_mode != "arkade_noncustodial":
         await (conn or db).execute("DELETE FROM wallets WHERE deleted = true")
         return
-    wallets = await (conn or db).fetchall("SELECT id FROM wallets WHERE deleted = true")
+    wallets: list[dict] = await (conn or db).fetchall(
+        "SELECT id FROM wallets WHERE deleted = true"
+    )
     for wallet in wallets:
         try:
             await ensure_arkade_wallet_deletion_allowed(wallet["id"], conn=conn)
@@ -141,7 +143,7 @@ async def delete_unused_wallets(
 ) -> None:
     delta = int(time()) - time_delta
     if settings.lnbits_effective_installation_mode == "arkade_noncustodial":
-        wallets = await (conn or db).fetchall(
+        wallets: list[dict] = await (conn or db).fetchall(
             "SELECT id FROM wallets WHERE deleted = true AND ("
             "SELECT COUNT(*) FROM apipayments WHERE wallet_id = wallets.id"
             ") = 0 AND (updated_at < :delta OR (updated_at IS NULL "
@@ -238,7 +240,7 @@ async def get_wallets(
         query += " AND deleted = :deleted "
     if wallet_type is not None:
         query += " AND wallet_type = :wallet_type "
-    wallets = await (conn or db).fetchall(
+    wallets: list[Wallet] = await (conn or db).fetchall(
         query,
         {
             "user": user_id,
@@ -284,7 +286,7 @@ async def get_wallets_ids(
     query = """SELECT * FROM wallets WHERE "user" = :user"""
     if deleted is not None:
         query += " AND deleted = :deleted "
-    wallets = await (conn or db).fetchall(
+    wallets: list[Wallet] = await (conn or db).fetchall(
         query,
         {"user": user_id, "deleted": deleted},
         Wallet,

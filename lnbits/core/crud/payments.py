@@ -596,69 +596,6 @@ async def refund_arkade_lightning_payment(
     return bool(result.rowcount)
 
 
-async def fail_arkade_lightning_payment(
-    native_id: str,
-    *,
-    account_id: str,
-    wallet_id: str,
-    amount_msat: int,
-    arkade_address: str,
-    conn: Connection,
-) -> bool:
-    """CAS a pending Lightning payment to failed after a reported claim failure."""
-    database = _require_payment_transaction(conn)
-    if amount_msat <= 0:
-        raise ValueError("ARKADE_LIGHTNING_PAYMENT_INVALID")
-    binding = await _get_lightning_terminal_binding(
-        native_id,
-        account_id=account_id,
-        wallet_id=wallet_id,
-        status="failed",
-        conn=database,
-    )
-    if (
-        binding["amount_msat"] != amount_msat
-        or binding["destination"] != arkade_address
-    ):
-        raise ValueError("ARKADE_LIGHTNING_PAYMENT_BINDING_MISMATCH")
-    payment = await get_payment_by_native_id(native_id, conn=database)
-    if not payment:
-        raise ValueError("ARKADE_PAYMENT_NOT_FOUND")
-    if (
-        payment.protocol != "arkade"
-        or payment.native_id != native_id
-        or payment.wallet_id != wallet_id
-        or payment.amount != -amount_msat
-        or payment.arkade_address != arkade_address
-    ):
-        raise ValueError("ARKADE_LIGHTNING_PAYMENT_BINDING_MISMATCH")
-    if payment.status == "failed":
-        if payment.fee == 0:
-            return False
-        raise ValueError("ARKADE_LIGHTNING_PAYMENT_CONFLICT")
-    if payment.status != "pending" or payment.fee != 0:
-        raise ValueError("ARKADE_LIGHTNING_PAYMENT_INVALID_TRANSITION")
-    result = await database.execute(
-        f"""
-        UPDATE apipayments
-        SET status = 'failed', fee = 0,
-            updated_at = {database.timestamp_placeholder('updated_at')}
-        WHERE protocol = 'arkade' AND native_id = :native_id
-          AND wallet_id = :wallet_id AND amount = :amount
-          AND arkade_address = :arkade_address AND fee = 0
-          AND status = 'pending'
-        """,  # noqa: S608
-        {
-            "native_id": native_id,
-            "wallet_id": wallet_id,
-            "amount": -amount_msat,
-            "arkade_address": arkade_address,
-            "updated_at": datetime.now(timezone.utc),
-        },
-    )
-    return bool(result.rowcount)
-
-
 async def compare_and_set_arkade_payment_failed(
     payment: Payment, conn: Connection | None = None
 ) -> bool:

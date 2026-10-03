@@ -161,7 +161,7 @@ async def load_disabled_extension_list() -> None:
 
 async def _table_exists(conn: Connection, table: str) -> bool:
     if conn.type == SQLITE:
-        row = await conn.fetchone(
+        row: dict | None = await conn.fetchone(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = :table",
             {"table": table},
         )
@@ -190,7 +190,7 @@ def check_installation_mode(
 
 async def get_installation_mode(conn: Connection) -> InstallationMode:
     try:
-        rows = await conn.fetchall("SELECT id, mode FROM installation_mode")
+        rows: list[dict] = await conn.fetchall("SELECT id, mode FROM installation_mode")
     except SQLAlchemyError as exc:
         raise RuntimeError(INSTALLATION_MODE_CORRUPT) from exc
     if len(rows) != 1 or rows[0]["id"] != 1:
@@ -210,7 +210,9 @@ async def initialize_installation_mode(
     table_exists = await _table_exists(conn, "installation_mode")
     if table_exists:
         try:
-            rows = await conn.fetchall("SELECT id, mode FROM installation_mode")
+            rows: list[dict] = await conn.fetchall(
+                "SELECT id, mode FROM installation_mode"
+            )
         except SQLAlchemyError as exc:
             raise RuntimeError(INSTALLATION_MODE_CORRUPT) from exc
         if rows:

@@ -309,6 +309,8 @@ async def create_fiat_invoice(
         raise InvoiceError("No fiat provider found.", status="failed")
 
     _, payment_hash, _ = internal_payment.lightning_identifiers
+    if not payment_hash:
+        raise ValueError("Payment is missing Lightning payment hash")
     fiat_invoice = await fiat_provider.create_invoice(
         amount=invoice_data.amount,
         payment_hash=payment_hash,
@@ -391,6 +393,8 @@ async def create_wallet_invoice(wallet_id: str, data: CreateInvoice) -> Payment:
         try:
             check_callback_url(data.lnurl_withdraw.callback)
             _, _, bolt11 = payment.lightning_identifiers
+            if not bolt11:
+                raise ValueError("Payment is missing Lightning BOLT11 invoice")
             await lnurl_withdraw(
                 data.lnurl_withdraw,
                 bolt11,
@@ -894,6 +898,8 @@ async def check_payment_status(payment: Payment) -> PaymentStatus:
             return PaymentStatus(paid=fiat_status.paid)
         return PaymentPendingStatus()
     checking_id, _, _ = payment.lightning_identifiers
+    if not checking_id:
+        raise ValueError("Payment is missing Lightning checking ID")
     funding_source = get_funding_source()
     if payment.is_out:
         status = await funding_source.get_payment_status(checking_id)
@@ -996,6 +1002,10 @@ async def _pay_internal_invoice(
     # perform additional checks on the internal payment
     # the payment hash is not enough to make sure that this is the same invoice
     checking_id, _, _ = internal_payment.lightning_identifiers
+    if not checking_id:
+        raise PaymentError(
+            "Internal payment is missing Lightning checking ID.", status="failed"
+        )
     internal_invoice = await get_standalone_payment(
         checking_id, incoming=True, conn=conn
     )
@@ -1005,7 +1015,11 @@ async def _pay_internal_invoice(
 
     amount_msat = create_payment_model.amount_msat
     _, _, internal_bolt11 = internal_invoice.lightning_identifiers
-    if internal_invoice.amount != abs(amount_msat) or internal_bolt11 != bolt11.lower():
+    if (
+        not internal_bolt11
+        or internal_invoice.amount != abs(amount_msat)
+        or internal_bolt11 != bolt11.lower()
+    ):
         raise PaymentError("Invalid invoice. Bolt11 changed.", status="failed")
 
     fee_reserve_total_msat = fee_reserve_total(amount_msat, internal=True)
@@ -1312,6 +1326,10 @@ async def _check_fiat_invoice_limits(
 
 async def settle_hold_invoice(payment: Payment, preimage: str) -> InvoiceResponse:
     _, payment_hash, _ = payment.lightning_identifiers
+    if not payment_hash:
+        raise InvoiceError(
+            "Payment is missing Lightning payment hash.", status="failed"
+        )
     if verify_preimage(preimage, payment_hash) is False:
         raise InvoiceError("Invalid preimage.", status="failed")
 
@@ -1332,6 +1350,10 @@ async def settle_hold_invoice(payment: Payment, preimage: str) -> InvoiceRespons
 
 async def cancel_hold_invoice(payment: Payment) -> InvoiceResponse:
     _, payment_hash, _ = payment.lightning_identifiers
+    if not payment_hash:
+        raise InvoiceError(
+            "Payment is missing Lightning payment hash.", status="failed"
+        )
     funding_source = get_funding_source()
     response = await funding_source.cancel_hold_invoice(payment_hash=payment_hash)
 

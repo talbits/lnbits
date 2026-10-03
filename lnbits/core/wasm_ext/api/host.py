@@ -364,9 +364,12 @@ class ExtensionHostAPI:
             ),
         )
         checking_id, payment_hash, bolt11 = payment.lightning_identifiers
+        payment_request = payment.payment_request or bolt11
+        if not checking_id or not payment_hash or not payment_request:
+            raise ValueError("Payment is missing Lightning invoice identifiers")
         return CreateInvoiceResponse(
             payment_hash=payment_hash,
-            payment_request=payment.payment_request or bolt11,
+            payment_request=payment_request,
             checking_id=checking_id,
         )
 
@@ -425,9 +428,12 @@ class ExtensionHostAPI:
             ),
         )
         checking_id, payment_hash, bolt11 = payment.lightning_identifiers
+        payment_request = payment.payment_request or bolt11
+        if not checking_id or not payment_hash or not payment_request:
+            raise ValueError("Payment is missing Lightning invoice identifiers")
         return CreateInvoiceResponse(
             payment_hash=payment_hash,
-            payment_request=payment.payment_request or bolt11,
+            payment_request=payment_request,
             checking_id=checking_id,
         )
 

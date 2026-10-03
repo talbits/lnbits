@@ -8,6 +8,7 @@ from embit.psbt import PSBT
 from embit.script import Script, Witness
 from embit.transaction import Transaction, TransactionInput, TransactionOutput
 
+from lnbits.core.models.arkade import ArkadeIndexerVtxo
 from lnbits.core.services.arkade import _TAPROOT_UNSPENDABLE_KEY, _tagged_hash
 from lnbits.core.services.arkade_evidence import (
     ArkadeLightningEvidenceIntent,
@@ -70,7 +71,21 @@ def _vtxo(**updates):
         "arkade_txid": ARK_TXID,
     }
     value.update(updates)
-    return value
+    return ArkadeIndexerVtxo(**value)
+
+
+def _fixture_vtxo(record):
+    value = record["indexer"]["vtxo"]
+    txid, vout = value["outpoint"].split(":vout")
+    return ArkadeIndexerVtxo(
+        txid=txid,
+        vout=int(vout),
+        amount_sat=value["valueSats"],
+        script=record["lockupScriptHex"],
+        is_spent=bool(value["spentByCheckpointTxid"]),
+        spent_by=value["spentByCheckpointTxid"],
+        arkade_txid=value["arkTxid"],
+    )
 
 
 def _control(leaf: bytes, sibling: bytes = b"\x33" * 32) -> bytes:
@@ -197,7 +212,7 @@ def test_real_open_fixture_stays_non_terminal():
             amount_msat=1_000_000,
             max_fee_msat=1,
         ),
-        [refund["indexer"]["vtxo"]],
+        [_fixture_vtxo(refund)],
         {},
     )
     assert verdict.status is ArkadeLightningEvidenceStatus.PENDING
@@ -211,7 +226,7 @@ def test_missing_indexer_data_is_unknown_pending():
 
 def test_real_claim_fixture_without_stored_psbt_stays_pending():
     claim = REAL_FIXTURE["claim"]
-    vtxo = claim["indexer"]["vtxo"]
+    vtxo = _fixture_vtxo(claim)
     verdict = verify_arkade_lightning_terminal_evidence(
         _intent(
             payment_hash=claim["paymentHash"],
@@ -382,3 +397,17 @@ def test_malformed_psbt_is_contradictory():
         terminal_psbts={ARK_TXID: "not-base64"},
     )
     assert verdict.status is ArkadeLightningEvidenceStatus.CONTRADICTORY
+
+
+def test_internal_evidence_boundary_rejects_fixture_dialects():
+    intent = _intent()
+    malformed = verify_arkade_lightning_terminal_evidence(
+        intent, [{"txid": LOCKUP_TXID, "valueSats": 105}], {}  # type: ignore[list-item]
+    )
+    assert malformed.status is ArkadeLightningEvidenceStatus.CONTRADICTORY
+    assert malformed.reason == "malformed indexer or intent data"
+    unsupported = verify_arkade_lightning_terminal_evidence(
+        intent, [_vtxo(script=intent.lockup_script)], ["not-base64"]  # type: ignore[arg-type]
+    )
+    assert unsupported.status is ArkadeLightningEvidenceStatus.CONTRADICTORY
+    assert unsupported.reason == "malformed checkpoint evidence"

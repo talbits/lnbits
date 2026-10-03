@@ -181,7 +181,7 @@ async def test_outgoing_api_failed_report_contract(monkeypatch):
     app = _app(Account(id=ACCOUNT_ID))
     failed = AsyncMock(
         return_value=_response().copy(
-            update={"status": "failed", "failure_reason": "claim_attempt_failed"}
+            update={"status": "submitted", "failure_reason": "claim_attempt_failed"}
         )
     )
     monkeypatch.setattr(
@@ -203,7 +203,7 @@ async def test_outgoing_api_failed_report_contract(monkeypatch):
         )
 
     assert reported.status_code == 200
-    assert reported.json()["status"] == "failed"
+    assert reported.json()["status"] == "submitted"
     assert reported.json()["failure_reason"] == "claim_attempt_failed"
     failed.assert_awaited_once_with(ACCOUNT_ID, INTENT_ID, "claim_attempt_failed")
     assert refused.status_code == 422

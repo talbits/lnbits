@@ -13,17 +13,14 @@ from lnbits.core.models import (
     ArkadeOutgoingIntentResponse,
     ArkadeReceiveAcknowledgement,
     ArkadeReceiveRequest,
-    ArkadeReconciliationResolveRequest,
-    ArkadeReconciliationResolveResponse,
     SimpleStatus,
 )
-from lnbits.core.models.arkade import ArkadeBackingStatus, ArkadeMaintenancePlan
+from lnbits.core.models.arkade import ArkadeBackingStatus
 from lnbits.core.services.arkade import (
     ArkadeEnrollmentError,
     ArkadeEnrollmentMigrationRequiredError,
     ArkadeOutgoingError,
     ArkadeReceiveError,
-    ArkadeReconciliationError,
     acknowledge_arkade_receive,
     authorize_arkade_outgoing,
     complete_enrollment,
@@ -33,12 +30,10 @@ from lnbits.core.services.arkade import (
     get_arkade_outgoing_intent_for_account,
     get_arkade_receive_request_for_account,
     list_arkade_submitted_outgoing_intents,
-    register_arkade_maintenance,
     release_arkade_outgoing_payment,
-    resolve_arkade_reconciliation,
     submit_arkade_lightning_intent,
 )
-from lnbits.decorators import check_admin, check_authenticated_account
+from lnbits.decorators import check_authenticated_account
 
 arkade_router = APIRouter(prefix="/api/v1/arkade", tags=["Arkade"])
 
@@ -52,22 +47,6 @@ async def api_arkade_backing(account: Account = Depends(check_authenticated_acco
     except (ArkadeReceiveError, ArkadeEnrollmentError) as exc:
         raise HTTPException(
             HTTPStatus.BAD_REQUEST, "ARKADE_BACKING_UNAVAILABLE"
-        ) from exc
-
-
-@arkade_router.post("/maintenance", response_model=SimpleStatus)
-async def api_arkade_maintenance(
-    data: ArkadeMaintenancePlan,
-    account: Account = Depends(check_authenticated_account),
-):
-    try:
-        await register_arkade_maintenance(account.id, data)
-        return SimpleStatus(success=True, message="Renewal registered")
-    except ArkadeOutgoingError as exc:
-        raise _public_outgoing_error(exc) from exc
-    except (ArkadeReceiveError, ArkadeEnrollmentError) as exc:
-        raise HTTPException(
-            HTTPStatus.BAD_REQUEST, "ARKADE_MAINTENANCE_UNAVAILABLE"
         ) from exc
 
 
@@ -107,20 +86,13 @@ def _public_outgoing_error(exc: ArkadeOutgoingError) -> HTTPException:
         "ARKADE_OUTGOING_IDEMPOTENCY_CONFLICT",
         "ARKADE_OUTGOING_INDEXER_INVALID",
         "ARKADE_OUTGOING_INDEXER_UNAVAILABLE",
-        "ARKADE_OUTGOING_INPUT_CONFLICT",
-        "ARKADE_OUTGOING_INPUT_UNAVAILABLE",
-        "ARKADE_OUTGOING_INPUT_UNREGISTERED",
-        "ARKADE_OUTGOING_INPUT_VALUE_MISMATCH",
         "ARKADE_OUTGOING_INPUTS_INVALID",
-        "ARKADE_OUTGOING_INPUTS_MISSING",
         "ARKADE_OUTGOING_NOT_ALLOWED",
         "ARKADE_OUTGOING_NOT_FOUND",
         "ARKADE_OUTGOING_OUTPUT_CONFLICT",
         "ARKADE_OUTGOING_OUTPUT_INVALID",
         "ARKADE_OUTGOING_INVALID_REQUEST",
         "ARKADE_OUTGOING_UNAVAILABLE",
-        "ARKADE_BACKING_DEFICIT",
-        "ARKADE_BACKING_RECONCILIATION_REQUIRED",
         "ARKADE_DESCRIPTOR_REENROLLMENT_REQUIRED",
         "ARKADE_INSUFFICIENT_FUNDS",
         "ARKADE_WALLET_NOT_OWNED",
@@ -288,26 +260,3 @@ async def api_arkade_lightning_fail(
         return await fail_arkade_lightning_intent(account.id, intent_id, data.reason)
     except ArkadeOutgoingError as exc:
         raise _public_outgoing_error(exc) from exc
-
-
-@arkade_router.post(
-    "/reconciliation/resolve",
-    response_model=ArkadeReconciliationResolveResponse,
-)
-async def api_arkade_reconciliation_resolve(
-    data: ArkadeReconciliationResolveRequest,
-    admin: Account = Depends(check_admin),
-):
-    """Clear a sticky reconciliation flag; the reason goes to the audit log."""
-    try:
-        previous, resolved = await resolve_arkade_reconciliation(
-            data.account_id, data.reason, actor_id=admin.id
-        )
-    except ArkadeReconciliationError as exc:
-        raise HTTPException(HTTPStatus.NOT_FOUND, str(exc)) from exc
-    return ArkadeReconciliationResolveResponse(
-        account_id=data.account_id,
-        previous_state=previous.state,
-        state=resolved.state,
-        last_error=resolved.last_error,
-    )

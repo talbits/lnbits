@@ -134,6 +134,8 @@ async def wallet_lightning_address_callback(
         extra=extra,
     )
     _, _, bolt11 = payment.lightning_identifiers
+    if not bolt11:
+        raise ValueError("Payment is missing Lightning BOLT11 invoice")
     invoice = parse_obj_as(LightningInvoice, LightningInvoice(bolt11))
     return LnurlPayActionResponse(pr=invoice, disposable=False)
 
@@ -213,6 +215,8 @@ async def _charge_for_lightning_address(wallet: Wallet) -> None:
         ),
     )
     _, _, bolt11 = invoice.lightning_identifiers
+    if not bolt11:
+        raise ValueError("Payment is missing Lightning BOLT11 invoice")
     try:
         await pay_invoice(
             wallet_id=wallet.source_wallet_id,

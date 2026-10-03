@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Literal
+from typing import Any, Literal
 
 from fastapi import Query
 from lnurl import LnurlWithdrawResponse
@@ -179,17 +179,14 @@ class Payment(BaseModel):
 
     @property
     def is_internal(self) -> bool:
-        return bool(self.checking_id) and (
-            self.checking_id.startswith("internal_")
-            or self.checking_id.startswith("fiat_")
+        return bool(
+            self.checking_id and self.checking_id.startswith(("internal_", "fiat_"))
         )
 
     @property
-    def lightning_identifiers(self) -> tuple[str, str, str]:
+    def lightning_identifiers(self) -> tuple[str | None, str | None, str | None]:
         if self.protocol != "lightning":
             raise ValueError("Payment is not a Lightning payment")
-        if not self.checking_id or not self.payment_hash or not self.bolt11:
-            raise ValueError("Payment is missing Lightning identifiers")
         return self.checking_id, self.payment_hash, self.bolt11
 
     # DEPRECATED: in v1.5.0, use service check_payment_status instead
@@ -323,6 +320,7 @@ class CreateInvoice(BaseModel):
     webhook: str | None = None
     bolt11: str | None = None
     arkade_address: str | None = Query(default=None, min_length=1, max_length=1023)
+    arkade_quote: dict[str, Any] | None = None
     lnurl_withdraw: LnurlWithdrawResponse | None = None
     fiat_provider: str | None = None
     labels: list[str] = []

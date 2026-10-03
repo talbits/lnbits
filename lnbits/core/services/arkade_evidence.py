@@ -14,6 +14,7 @@ from coincurve import PublicKeyXOnly
 from embit.compact import read_from as read_compact
 from embit.psbt import PSBT
 
+from ..models.arkade import ArkadeIndexerVtxo
 from .arkade import _TAPROOT_UNSPENDABLE_KEY, _tagged_hash
 
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -53,12 +54,6 @@ class ArkadeLightningEvidenceIntent:
 
 
 @dataclass(frozen=True)
-class ArkadeCheckpointPSBT:
-    checkpoint_txid: str
-    psbt_base64: str
-
-
-@dataclass(frozen=True)
 class ArkadeLightningEvidenceVerdict:
     status: ArkadeLightningEvidenceStatus
     ark_txid: str | None = None
@@ -69,10 +64,8 @@ class ArkadeLightningEvidenceVerdict:
 
 def verify_arkade_lightning_terminal_evidence(  # noqa: C901
     intent: ArkadeLightningEvidenceIntent,
-    indexer_vtxos: Sequence[object],
-    checkpoint_psbts: (
-        Mapping[str, str] | Sequence[ArkadeCheckpointPSBT] | Sequence[str]
-    ),
+    indexer_vtxos: Sequence[ArkadeIndexerVtxo],
+    checkpoint_psbts: Mapping[str, str],
     *,
     terminal_psbts: Mapping[str, str] | None = None,
     now: int | None = None,
@@ -80,7 +73,9 @@ def verify_arkade_lightning_terminal_evidence(  # noqa: C901
     """Classify a lockup using only public indexer VTXOs and virtual tx PSBTs."""
     try:
         _validate_intent(intent)
-        vtxos = [_vtxo(value, intent.lockup_script) for value in indexer_vtxos]
+        vtxos = list(indexer_vtxos)
+        for vtxo in vtxos:
+            _validate_vtxo(vtxo)
     except (AttributeError, TypeError, ValueError, KeyError):
         return _contradictory("malformed indexer or intent data")
 
@@ -101,9 +96,9 @@ def verify_arkade_lightning_terminal_evidence(  # noqa: C901
 
     if any(not v.is_spent and not v.spent_by for v in vtxos):
         return _pending("lockup remains open")
-    if any(not v.spent_by or not v.ark_txid for v in vtxos):
+    if any(not v.spent_by or not v.arkade_txid for v in vtxos):
         return _pending("spent lockup has not been fully indexed")
-    if len({v.ark_txid for v in vtxos}) != 1:
+    if len({v.arkade_txid for v in vtxos}) != 1:
         return _contradictory("conflicting terminal Ark txids")
     checkpoint_ids = [cast(str, v.spent_by) for v in vtxos]
     if len(set(checkpoint_ids)) != len(vtxos):
@@ -116,9 +111,11 @@ def verify_arkade_lightning_terminal_evidence(  # noqa: C901
     if psbts is None:
         return _pending("checkpoint PSBT not yet observed")
 
-    terminal_ids = [cast(str, v.ark_txid) for v in vtxos]
+    terminal_ids = [cast(str, v.arkade_txid) for v in vtxos]
     try:
-        terminal_map = _psbt_map(terminal_psbts or {}, terminal_ids)
+        terminal_map = _psbt_map(
+            terminal_psbts if terminal_psbts is not None else {}, terminal_ids
+        )
     except (TypeError, ValueError, KeyError):
         return _contradictory("malformed terminal evidence")
     if terminal_map is None:
@@ -150,7 +147,7 @@ def verify_arkade_lightning_terminal_evidence(  # noqa: C901
     if len(claims) > 1 or len(refunds) > 1:
         return _contradictory("multiple terminal spends")
 
-    ark_txid = next(iter({v.ark_txid for v in vtxos}))
+    ark_txid = next(iter({v.arkade_txid for v in vtxos}))
     if claims:
         return ArkadeLightningEvidenceVerdict(
             ArkadeLightningEvidenceStatus.CLAIMED,
@@ -165,19 +162,6 @@ def verify_arkade_lightning_terminal_evidence(  # noqa: C901
         refund_output=output,
         reason="valid matured refund leaf in public Ark evidence",
     )
-
-
-@dataclass(frozen=True)
-class _Vtxo:
-    txid: str
-    vout: int
-    amount_sat: int
-    script: str
-    is_spent: bool
-    spent_by: str | None
-    ark_txid: str | None
-    is_swept: bool
-    is_unrolled: bool
 
 
 @dataclass(frozen=True)
@@ -227,88 +211,34 @@ def _validate_intent(intent: ArkadeLightningEvidenceIntent) -> None:
         raise ValueError("invalid quote binding")
 
 
-def _vtxo(value: object, expected_script: str) -> _Vtxo:  # noqa: C901
-    def get(*names: str, default: object = None) -> object:
-        for name in names:
-            if isinstance(value, Mapping) and name in value:
-                return value[name]
-            if hasattr(value, name):
-                return getattr(value, name)
-        return default
-
-    txid = get("txid")
-    vout = get("vout")
-    if txid is None or vout is None:
-        outpoint = get("outpoint")
-        if not isinstance(outpoint, str):
-            raise ValueError("missing outpoint")
-        match = re.fullmatch(r"([0-9a-f]{64}):(?:vout)?([0-9]+)", outpoint)
-        if not match:
-            raise ValueError("invalid outpoint")
-        txid, vout = match.groups()
-        vout = int(vout)
-    script = get("script", "pk_script", "lockupScriptHex", default=expected_script)
-    amount = get("amount_sat", "value", "valueSats")
-    spent_by = get("spent_by", "spentBy", "spentByCheckpointTxid")
-    ark_txid = get("arkade_txid", "arkTxId", "arkTxid")
-    is_spent = get("is_spent", "isSpent", default=bool(spent_by))
-    if not isinstance(txid, str) or not _HEX64.fullmatch(txid):
-        raise ValueError("invalid VTXO txid")
-    if not isinstance(vout, int) or vout < 0:
-        raise ValueError("invalid VTXO vout")
-    if not isinstance(amount, int) or amount <= 0:
-        raise ValueError("invalid VTXO amount")
-    if not isinstance(script, str) or not _valid_script(script):
-        raise ValueError("invalid VTXO script")
-    for identifier in (spent_by, ark_txid):
-        if identifier is not None and (
-            not isinstance(identifier, str) or not _HEX64.fullmatch(identifier)
-        ):
+def _validate_vtxo(value: ArkadeIndexerVtxo) -> None:
+    if not isinstance(value, ArkadeIndexerVtxo):
+        raise TypeError("expected normalized indexer VTXO")
+    if not _HEX64.fullmatch(value.txid) or value.vout < 0:
+        raise ValueError("invalid VTXO outpoint")
+    if value.amount_sat <= 0 or not _valid_script(value.script):
+        raise ValueError("invalid VTXO amount or script")
+    for identifier in (value.spent_by, value.arkade_txid):
+        if identifier is not None and not _HEX64.fullmatch(identifier):
             raise ValueError("invalid terminal id")
-    spent_by = spent_by if isinstance(spent_by, str) else None
-    ark_txid = ark_txid if isinstance(ark_txid, str) else None
-    return _Vtxo(
-        txid,
-        vout,
-        amount,
-        script,
-        bool(is_spent),
-        spent_by,
-        ark_txid,
-        bool(get("is_swept", "isSwept", default=False)),
-        bool(get("is_unrolled", "isUnrolled", default=False)),
-    )
 
 
 def _psbt_map(
-    values: Mapping[str, str] | Sequence[ArkadeCheckpointPSBT] | Sequence[str],
+    values: Mapping[str, str],
     checkpoint_ids: Sequence[str],
 ) -> Mapping[str, str] | None:
-    if isinstance(values, Mapping):
-        if any(not isinstance(k, str) or not _HEX64.fullmatch(k) for k in values):
-            raise ValueError("invalid checkpoint id")
-        result = dict(values)
-    elif all(isinstance(item, ArkadeCheckpointPSBT) for item in values):
-        psbt_items = cast(Sequence[ArkadeCheckpointPSBT], values)
-        keys = [item.checkpoint_txid for item in psbt_items]
-        if len(keys) != len(set(keys)):
-            raise ValueError("duplicate checkpoint PSBT")
-        result = {item.checkpoint_txid: item.psbt_base64 for item in psbt_items}
-    elif all(isinstance(item, str) for item in values):
-        text_items = cast(Sequence[str], values)
-        if len(text_items) != len(checkpoint_ids):
-            raise ValueError("checkpoint PSBT count mismatch")
-        result = dict(zip(checkpoint_ids, text_items, strict=True))
-    else:
-        raise TypeError("unsupported checkpoint PSBT container")
-    if len(result) != len(values):
-        raise ValueError("duplicate checkpoint PSBT")
+    if not isinstance(values, Mapping):
+        raise TypeError("expected keyed PSBT evidence")
+    if any(not isinstance(k, str) or not _HEX64.fullmatch(k) for k in values):
+        raise ValueError("invalid checkpoint id")
+    if any(not isinstance(value, str) for value in values.values()):
+        raise TypeError("PSBT must be base64")
     expected = set(checkpoint_ids)
-    if set(result) - expected:
+    if set(values) - expected:
         raise ValueError("checkpoint evidence contains an extra spend")
-    if any(identifier not in result for identifier in expected):
+    if any(identifier not in values for identifier in expected):
         return None
-    return MappingProxyType(result)
+    return MappingProxyType(dict(values))
 
 
 def _parse_psbt(psbt_base64: str) -> PSBT:
@@ -344,7 +274,7 @@ def _valid_terminal_transaction(
 
 def _inspect_spend(  # noqa: C901
     intent: ArkadeLightningEvidenceIntent,
-    vtxo: _Vtxo,
+    vtxo: ArkadeIndexerVtxo,
     psbt_base64: str,
     terminal_psbt: PSBT,
     now: int | None,
@@ -565,7 +495,6 @@ def _contradictory(reason: str) -> ArkadeLightningEvidenceVerdict:
 
 
 __all__ = [
-    "ArkadeCheckpointPSBT",
     "ArkadeLightningEvidenceIntent",
     "ArkadeLightningEvidenceStatus",
     "ArkadeLightningEvidenceVerdict",

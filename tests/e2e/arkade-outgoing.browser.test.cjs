@@ -495,7 +495,9 @@ const makeLightningFixture = () => {
     solver_pubkey: quote.solver_pubkey,
     swap_rfq_id: quote.rfq_id,
     lockup_address: swap.address,
-    arkade_txid: state.status === 'submitted' ? 'ee'.repeat(32) : null,
+    arkade_txid: ['submitted', 'settled', 'refunded'].includes(state.status)
+      ? 'ee'.repeat(32)
+      : null,
     destination_kind: 'lightning',
     status: state.status,
     expires_at: new Date((now + 600) * 1000).toISOString()
@@ -545,7 +547,6 @@ const makeLightningFixture = () => {
           id,
           reason
         })
-        state.status = 'failed'
         return {data: intent()}
       }
     }
@@ -559,6 +560,7 @@ const makeLightningFixture = () => {
   }
   return {
     ...fixture,
+    store,
     state,
     requests,
     quote,
@@ -705,6 +707,39 @@ async function lightningBrowserChecks() {
   )
   assert.equal(lockedDuringRefetch.state.sendCount, 0)
 
+  const reportedFailure = makeLightningFixture()
+  await reportedFailure.window.ArkadeEnrollment.prepareLightningSend(
+    reportedFailure.lightningBolt11
+  )
+  await reportedFailure.window.ArkadeEnrollment.submitLightningSend(
+    reportedFailure.intentId,
+    {approved: true}
+  )
+  const plans = reportedFailure.store
+    .get('__indexeddb__')
+    .get('lnbits-arkade-lightning-v1')
+    .stores.get('plans').records
+  assert.equal(plans.get(reportedFailure.intentId).fundingState, 'submitted')
+  await reportedFailure.window.ArkadeEnrollment.__reportLightningSwapFailure(
+    accountId,
+    reportedFailure.swap,
+    new Error('claim temporarily unavailable')
+  )
+  assert.equal(reportedFailure.state.status, 'submitted')
+  assert.equal(plans.get(reportedFailure.intentId).fundingState, 'submitted')
+  await reportedFailure.window.ArkadeEnrollment.__dropLightningPlanForSwap(
+    accountId,
+    reportedFailure.swap.rfqId
+  )
+  assert.equal(plans.has(reportedFailure.intentId), true)
+  reportedFailure.state.status = 'settled'
+  await reportedFailure.window.ArkadeEnrollment.__dropLightningPlanForSwap(
+    accountId,
+    reportedFailure.swap.rfqId
+  )
+  assert.equal(plans.has(reportedFailure.intentId), false)
+  reportedFailure.window.ArkadeEnrollment.lock()
+
   const duplicate = makeLightningFixture()
   await duplicate.window.ArkadeEnrollment.prepareLightningSend(
     duplicate.lightningBolt11
@@ -740,59 +775,67 @@ async function main() {
   const w = renewal.window
   const binding = await w.ArkadeEnrollment.binding()
   w.ArkadeEnrollment.__setTestReady(binding, renewal.wallet, identity)
-  renewal.wallet.getVtxos = async () => [renewal.input]
-  let registered = null
-  let settled = false
-  w.LNbits.api.request = async (method, url, key, data) => {
-    if (method === 'POST') {
-      assert.equal(url, '/api/v1/arkade/maintenance')
-      assert.equal(data.output.amount_sat, 1000)
-      assert.match(data.signature, /^[0-9a-f]{128}$/)
-      registered = data
-      return {data: {success: true}}
+  renewal.wallet.getVtxoManager = async () => ({
+    getExpiringVtxos: async threshold => {
+      assert.equal(threshold, 3 * 24 * 60 * 60 * 1000)
+      return [renewal.input]
     }
-    return {
-      data: {
-        state: 'ok',
-        maintenance: null,
-        maintenance_inputs: settled
-          ? []
-          : [
-              {
-                txid: renewal.input.txid,
-                vout: renewal.input.vout,
-                amount_sat: 1000
-              }
-            ]
-      }
-    }
-  }
+  })
+  renewal.wallet.getAddress = async () => 'tark1wallet'
+  let settlement = null
+  let settlementCalls = 0
   renewal.wallet.settle = async params => {
-    assert.ok(registered, 'lineage is durable before settlement signing')
-    assert.equal(params.outputs[0].amount, 1000n)
-    assert.equal(params.outputs[0].address, registered.output.address)
-    assert.equal(params.inputs.length, 1)
-    settled = true
+    settlement = params
+    settlementCalls++
+    return 'ff'.repeat(32)
   }
   await assert.rejects(
-    w.ArkadeEnrollment.maintainVtxos({approved: false}),
+    w.ArkadeEnrollment.renewExpiringVtxos({approved: false}),
     /approval/
   )
-  assert.equal(registered, null)
-  await w.ArkadeEnrollment.maintainVtxos({approved: true})
-  assert.equal(settled, true)
-  // A fee change must fail before registering or signing another settlement.
-  settled = false
-  registered = null
+  assert.equal(settlement, null)
+  assert.equal(renewal.requests.length, 0)
+  assert.equal(
+    await w.ArkadeEnrollment.renewExpiringVtxos({approved: true}),
+    'ff'.repeat(32)
+  )
+  assert.equal(settlement.outputs[0].amount, 1000n)
+  assert.equal(settlement.outputs[0].address, 'tark1wallet')
+  assert.equal(settlement.inputs.length, 1)
+  assert.equal(settlementCalls, 1)
+  assert.equal(renewal.requests.length, 0)
+  // The exact full-value output also prevents a fee update between this check
+  // and SDK settlement from silently reducing the renewed balance.
   renewal.wallet.arkProvider.getInfo = async () => ({
     dust: 100,
     fees: {intentFee: {offchainInput: '1.0'}}
   })
   await assert.rejects(
-    w.ArkadeEnrollment.maintainVtxos({approved: true}),
+    w.ArkadeEnrollment.renewExpiringVtxos({approved: true}),
     /Fee-bearing/
   )
-  assert.equal(registered, null)
+  assert.equal(settlementCalls, 1)
+  assert.equal(renewal.requests.length, 0)
+
+  const lockedRenewal = makeFixture({inputValue: 1000})
+  const lockedBinding = await lockedRenewal.window.ArkadeEnrollment.binding()
+  lockedRenewal.window.ArkadeEnrollment.__setTestReady(
+    lockedBinding,
+    lockedRenewal.wallet,
+    identity
+  )
+  lockedRenewal.wallet.getVtxoManager = async () => ({
+    getExpiringVtxos: async () => [lockedRenewal.input]
+  })
+  let lockedSettleCalls = 0
+  lockedRenewal.wallet.getAddress = async () => 'tark1wallet'
+  lockedRenewal.wallet.settle = async () => lockedSettleCalls++
+  lockedRenewal.window.ArkadeEnrollment.lock()
+  await assert.rejects(
+    lockedRenewal.window.ArkadeEnrollment.renewExpiringVtxos({approved: true}),
+    /wallet is locked/
+  )
+  assert.equal(lockedSettleCalls, 0)
   const noChange = makeFixture({amountSat: 1_000, inputValue: 1_000})
   const prepared = await noChange.window.ArkadeEnrollment.prepareOutgoing(
     intentId,

@@ -262,7 +262,7 @@ include('components/lnbits-error.vue') %}
         </q-tooltip>
       </q-item-section>
     </q-item>
-    <q-item v-if="payment.arkade_address || payment.native_id">
+    <q-item v-if="payment.protocol === 'arkade'">
       <q-item-section>
         <q-item-label>Arkade</q-item-label>
         <q-item-label

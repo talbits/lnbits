@@ -525,9 +525,13 @@ async def test_check_transaction_status_and_payment_status(mocker: MockerFixture
 
     outgoing = await get_payment(success_id)
     outgoing.checking_id = "external-out"
+    outgoing.payment_hash = None
+    outgoing.bolt11 = None
     outgoing.amount = -2_000
     incoming = await get_payment(success_id)
     incoming.checking_id = "external-in"
+    incoming.payment_hash = None
+    incoming.bolt11 = None
     incoming.amount = 2_000
     funding_source = SimpleNamespace(
         get_payment_status=mocker.AsyncMock(return_value=PaymentSuccessStatus()),
@@ -540,6 +544,8 @@ async def test_check_transaction_status_and_payment_status(mocker: MockerFixture
 
     assert (await check_payment_status(outgoing)).success is True
     assert (await check_payment_status(incoming)).pending is True
+    funding_source.get_payment_status.assert_awaited_once_with("external-out")
+    funding_source.get_invoice_status.assert_awaited_once_with("external-in")
 
 
 @pytest.mark.anyio

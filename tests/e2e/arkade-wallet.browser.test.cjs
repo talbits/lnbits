@@ -25,6 +25,7 @@ let recoveryResult = {
 }
 let outgoingJournalCount = 0
 let listOutgoingCalls = 0
+let renewalCalls = 0
 global.LNbits = {
   api: {
     async payArkade(_wallet, _address, _amount, key) {
@@ -39,6 +40,9 @@ global.LNbits = {
     },
     async arkadeOutgoingIntent() {
       return {data: {status: 'released'}}
+    },
+    async request() {
+      throw new Error('backing offline')
     }
   },
   utils: {notifyApiError() {}, formatSat: String}
@@ -69,6 +73,11 @@ window.ArkadeEnrollment = {
     assert.deepEqual(approval, {approved: true})
     if (recoveryResult.status === 'settled') recoveryRecords = []
     return recoveryResult
+  },
+  async renewExpiringVtxos(approval) {
+    renewalCalls++
+    assert.deepEqual(approval, {approved: true})
+    return null
   }
 }
 vm.runInThisContext(
@@ -223,6 +232,17 @@ page.decodeRequest()
 page.parse.arkade.amount = 42
 
 ;(async () => {
+  page.arkadeAutoRenew = true
+  const notificationsBeforeBackingRefresh = notifications.length
+  await page.refreshArkadeBacking()
+  assert.equal(page.arkadeBacking, null)
+  assert.match(
+    page.arkadeBackingError,
+    /Sending still uses your wallet balance/
+  )
+  assert.equal(renewalCalls, 1)
+  assert.equal(notifications.length, notificationsBeforeBackingRefresh)
+  page.arkadeAutoRenew = false
   await page.payArkade()
   await page.payArkade()
   assert.equal(keys.length, 2)
@@ -573,6 +593,15 @@ async function paymentDetailsChecks() {
   const map = components['lnbits-payment-list'].methods.mapPayment.bind({
     utils: {formatDate: String, formatDateFrom: String, formatSat: String}
   })
+  for (const expiry of [null, undefined, 0]) {
+    const payment = map({amount: 0, expiry})
+    assert.equal(payment.expirydate, null)
+    assert.equal(payment.expirydateFrom, null)
+  }
+  const expiry = '2026-10-03T12:00:00Z'
+  const expiring = map({amount: 0, expiry})
+  assert.equal(expiring.expirydate, expiry)
+  assert.equal(expiring.expirydateFrom, expiry)
   const template = fs
     .readFileSync('lnbits/templates/components.vue', 'utf8')
     .split('<template id="lnbits-payment-details">')[1]
@@ -584,6 +613,7 @@ async function paymentDetailsChecks() {
       amount: 42000,
       fee: 0,
       status: 'success',
+      protocol: arkade ? 'arkade' : 'lightning',
       memo: 'test',
       payment_hash: arkade ? null : 'ab'.repeat(32),
       bolt11: arkade ? null : 'ln-invoice',

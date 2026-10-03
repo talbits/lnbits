@@ -294,51 +294,41 @@
       <q-card-section>
         <div class="text-h6">Arkade account backing</div>
         <div class="text-caption q-mb-sm">
-          Shared by all wallets in this account. Recorded balances do not
-          guarantee spendable backing.
+          Partial backing estimate shared by this account. It does not limit
+          payments, which use your recorded wallet balance.
         </div>
         <div v-if="arkadeBacking">
-          <div>
-            Available:
-            <span v-text="arkadeBacking.spendable_sat"></span> sats
+          <div v-if="arkadeBacking.coverage !== 'unknown'">
+            <div>
+              Observed spendable:
+              <span v-text="arkadeBacking.spendable_sat"></span> sats
+            </div>
+            <div>
+              Recorded account:
+              <span v-text="arkadeBackingLedgerSat"></span> sats
+            </div>
+            <div>
+              Recoverable:
+              <span v-text="arkadeBacking.recoverable_sat"></span> sats
+            </div>
+            <div v-if="arkadeBacking.expiring_sat">
+              Expiring within 3 days:
+              <span v-text="arkadeBacking.expiring_sat"></span> sats
+            </div>
           </div>
-          <div>
-            Recorded account:
-            <span v-text="arkadeBackingLedgerSat"></span> sats
+          <div v-else>Backing coverage is unknown.</div>
+          <div v-if="arkadeBacking.coverage === 'partial'" class="text-caption">
+            Some VTXOs may be outside this estimate.
           </div>
-          <div>
-            Recoverable:
-            <span v-text="arkadeBacking.recoverable_sat"></span> sats
-          </div>
-          <div v-if="arkadeBacking.expiring_sat">
-            Expiring within 3 days:
-            <span v-text="arkadeBacking.expiring_sat"></span> sats
-          </div>
-          <q-banner
-            v-if="arkadeBacking.maintenance"
-            rounded
-            class="bg-blue-1 text-black q-my-sm"
-          >
-            Recovery / renewal is awaiting batch verification. Refresh or resume
-            this operation; your recorded balance is preserved.
-          </q-banner>
-          <q-btn
-            v-if="
-              arkadeBacking.maintenance ||
-              arkadeBacking.maintenance_inputs.length
-            "
-            color="primary"
-            class="q-my-sm"
-            :loading="arkadeMaintenanceBusy"
-            :label="
-              arkadeBacking.maintenance
-                ? 'Resume recovery / renewal'
-                : 'Recover / renew funds'
-            "
-            @click="maintainArkadeVtxos(false)"
-          ></q-btn>
         </div>
-        <div v-else>Verifying account backing…</div>
+        <div v-else>Backing estimate unavailable.</div>
+        <q-btn
+          color="primary"
+          class="q-my-sm"
+          :loading="arkadeRenewalBusy"
+          label="Renew expiring / recoverable funds"
+          @click="renewArkadeVtxos(false)"
+        ></q-btn>
         <q-banner
           v-if="arkadeBackingError"
           rounded
@@ -359,7 +349,7 @@
             flat
             dense
             label="Refresh backing"
-            :disable="arkadeMaintenanceBusy"
+            :disable="arkadeRenewalBusy"
             @click="refreshArkadeBacking"
           ></q-btn>
           <q-space></q-space>
